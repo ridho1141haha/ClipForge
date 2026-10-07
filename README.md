@@ -18,8 +18,13 @@ Built with **Next.js 16**, **TypeScript**, **Tailwind CSS 4**, **shadcn/ui**, **
 ```
 YouTube URL
   → POST /api/youtube/meta            real metadata; duration via yt-dlp → innertube → oEmbed (or null + manual required)
-  → POST /api/source/prepare          async job: DOWNLOADING → TRANSCRIBING → COMPLETED (persists real duration + transcript + word timestamps)
+  → POST /api/source/prepare          async job (PRIMARY UI PATH): DOWNLOADING → TRANSCRIBING → COMPLETED
+                                      • resolves real metadata + fetches YouTube captions automatically
+                                      • prefers the word-offset ASR track ('orig') → wordTiming 'measured'
+                                      • persists duration + transcript + word timestamps into an owned Project
+                                      • failed jobs are retryable: POST /api/jobs/:id/retry (payload persisted)
   → POST /api/clips/analyze           transcript-grounded candidate detection
+                                      • belt-and-braces: auto-fetches captions here too when none supplied
         • Zod-validated AI output (+1 repair attempt)
         • hard timestamp clamps + word-timestamp snapping
         • context validation → PASS / EXTEND / REJECT / UNKNOWN
@@ -27,9 +32,11 @@ YouTube URL
         • dedupe (overlap + semantic) → rank → enforce requested count
         • transactional persistence + analysis metadata (model/provider/promptVersion/analysisVersion)
   → POST /api/clips/plan              transcript-locked edit plan (subtitles verified against transcript; deterministic rebuild on mismatch)
-  → POST /api/render-proxy/render     ffmpeg renderer (job-based, SSE progress): frame-accurate trim+concat → ASS burn-in → zoompan → 1080×1920
+  → POST /api/render-proxy/render     ffmpeg renderer (job-based, SSE progress, ffmpeg -progress granular stages): frame-accurate trim+concat → ASS burn-in → zoompan → 1080×1920
   → POST /api/export                  json (full plan + transcript + scores) · srt · vtt (real speech, output time) · csv · edl
 ```
+
+**Zero-input auto-grounding:** pasting a URL and hitting Auto-Clip runs the prepare job first — captions (with real word timestamps when the ASR track exists) are fetched automatically, so hooks are verbatim-verified with no manual paste. Availability is environment-dependent; degradation stays honest (`transcriptSource: 'none'`).
 
 ## Security model
 - Anonymous **session ownership**: every visitor gets an httpOnly `clipforge_sid` cookie; every `Project` row stores `ownerId`.
@@ -89,4 +96,4 @@ bash tests/clipforge-live.sh      # live API tests: duration honesty, transcript
 - ASR for uploaded files: run faster-whisper server-side and feed `words` into the analyze/plan endpoints (schema already supports word-level timestamps end-to-end).
 - Word-timestamp provenance is tracked (`wordTiming: 'measured' | 'estimated'`): json3/srv3 caption offsets and faster-whisper produce MEASURED timing; VTT-only sources and manual pastes are labeled honestly in the UI.
 
-## Status: **MVP+ (beta)** — the full pipeline (URL or upload → real duration → transcript with word timestamps → grounded AI analysis → server scoring → plan → frame-accurate render) is real and verified end-to-end. Remaining gaps: YouTube metadata/captions depend on the host IP not being bot-blocked (manual-duration + ASR-upload flows are first-class), and B-roll/SFX/music remain preview-only recommendations.
+## Status: **MVP+ (beta)** — the full pipeline (URL or upload → real duration → transcript with word timestamps → grounded AI analysis → server scoring → plan → frame-accurate render) is real and verified end-to-end, now with zero-input auto-grounding (YouTube captions fetched automatically when available, with retryable source-prep jobs and usage metering). Remaining gaps: YouTube metadata/captions depend on the host IP not being bot-blocked (manual-duration + ASR-upload flows are first-class, failed prepares are retryable), and B-roll/SFX/music remain preview-only recommendations.

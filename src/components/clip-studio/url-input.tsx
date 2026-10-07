@@ -38,6 +38,8 @@ export interface AnalyzeParams {
   words?: { word: string; start: number; end: number }[]
   projectId?: string
   preResolvedMeta?: Partial<YouTubeMeta> & { title: string }
+  /** skip the async prepare job (fallback after a prepare failure) */
+  skipPrepare?: boolean
 }
 
 interface Props {
@@ -467,8 +469,8 @@ export function UrlInput({ onAnalyze, loading, error }: Props) {
             >
               <div className="rounded-lg border border-amber-500/20 bg-amber-500/5 p-3">
                 <p className="mb-2 text-[10px] leading-snug text-muted-foreground">
-                  <strong className="text-amber-600 dark:text-amber-400">Why?</strong> ClipForge never guesses content or duration. Without a transcript the AI cannot verify hooks — candidates are marked UNVERIFIED.
-                  Paste the real transcript (YouTube → transcript feature → copy) so hooks, subtitles and timestamps are grounded in the actual spoken content.
+                  <strong className="text-amber-600 dark:text-amber-400">Auto-grounding:</strong> YouTube captions are fetched automatically when available (with word-level timestamps) — no paste needed.
+                  If captions are unavailable, paste the real transcript (YouTube → transcript feature → copy) so hooks, subtitles and timestamps stay grounded in the actual spoken content. Without any transcript the AI cannot verify hooks — candidates are marked UNVERIFIED.
                 </p>
                 <textarea
                   value={transcript}

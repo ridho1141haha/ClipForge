@@ -1,5 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { checkRateLimit } from '@/lib/validation'
+import { getOrCreateSessionId } from '@/lib/session'
+import { recordUsage } from '@/lib/usage'
 
 // Proxy from /api/render-proxy/[...path] to the ffmpeg-renderer mini-service at localhost:3003
 // Avoids CORS issues and keeps the mini-service internal.
@@ -31,13 +33,28 @@ export async function POST(
   const contentType = req.headers.get('content-type') ?? ''
   let body: BodyInit
   const headers: Record<string, string> = {}
+  let rawBody: string | null = null
   if (contentType.includes('multipart/form-data')) {
     // forward multipart as-is
     body = await req.blob()
     headers['content-type'] = contentType
   } else {
-    body = await req.text()
+    rawBody = await req.text()
+    body = rawBody
     headers['content-type'] = contentType || 'application/json'
+  }
+
+  // usage metering: a render START is the billable action (best-effort, never blocks the render)
+  if (targetPath === '/jobs' || targetPath === '/jobs/') {
+    try {
+      const ownerId = await getOrCreateSessionId()
+      let renderSeconds: number | undefined
+      try {
+        const parsed = JSON.parse(rawBody ?? '') as { output_duration?: number }
+        renderSeconds = isFinite(Number(parsed?.output_duration)) ? Number(parsed.output_duration) : undefined
+      } catch { /* body may be multipart; quantity=1 still recorded */ }
+      void recordUsage(ownerId, 'render', 1, { renderSeconds })
+    } catch { /* session issues must not block rendering */ }
   }
 
   try {

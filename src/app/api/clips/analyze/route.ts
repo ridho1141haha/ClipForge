@@ -3,6 +3,8 @@ import ZAI from 'z-ai-web-dev-sdk'
 import { db } from '@/lib/db'
 import { getOrCreateSessionId } from '@/lib/session'
 import { STYLE_PRESETS } from '@/lib/editplan'
+import { extractYouTubeId, resolveYoutubeTranscript } from '@/lib/media'
+import { recordUsage } from '@/lib/usage'
 import { sourceToOutputTime } from '@/lib/subtitles'
 import {
   AnalyzeResponseSchema,
@@ -199,12 +201,47 @@ export async function POST(req: NextRequest) {
         if (Array.isArray(parsed)) words = parsed
       } catch { /* corrupted JSON → treat as absent */ }
     }
-    // transcript: body wins, then project record, then synthesized from word timestamps
-    const transcript = ((body.transcript ?? '').trim() || project?.transcript?.trim() || (words.length > 0 ? words.map((w) => w.word).join(' ') : '')) as string
-    const transcriptSource = body.transcriptSource ?? project?.transcriptSource ?? (transcript ? 'manual' : 'none')
+
+    // ---------- AUTO-GROUNDING: fetch YouTube captions when no transcript supplied ----------
+    // When the caller provides no transcript/words (manual paste, ASR, project record),
+    // and the source is a YouTube URL, try real captions (yt-dlp) before falling back
+    // to ungrounded analysis. Availability is environment-dependent (bot-blocking):
+    // on failure we degrade exactly as before — honest 'none', never fabricated.
+    let autoCaptionsNote: string | undefined
+    const bodyTranscriptTrim = (body.transcript ?? '').trim()
+    if (!bodyTranscriptTrim && !project?.transcript && words.length === 0 && body.url) {
+      const ytId = extractYouTubeId(body.url)
+      if (ytId) {
+        try {
+          const langPref = language && language !== 'auto' ? `${language},en,id` : 'en,id'
+          const caps = await Promise.race([
+            resolveYoutubeTranscript(ytId, langPref),
+            new Promise<null>((resolve) => setTimeout(() => resolve(null), 75_000)),
+          ])
+          if (caps && caps.text.trim()) {
+            words = caps.words
+            autoCaptionsNote = caps.words.length > 0
+              ? `Auto-fetched transcript + ${caps.words.length} word timestamps from YouTube captions (${caps.language})`
+              : `Auto-fetched transcript from YouTube captions (${caps.language})`
+          }
+        } catch {
+          // captions unavailable (blocked/disabled) → proceed without transcript, unchanged
+        }
+      }
+    }
+
+    // transcript: body wins, then project record, then auto-fetched words, then synthesized from word timestamps
+    const transcript = (bodyTranscriptTrim || project?.transcript?.trim() || (words.length > 0 ? words.map((w) => w.word).join(' ') : '')) as string
+    const transcriptSource = body.transcriptSource
+      ?? (words.length > 0 && autoCaptionsNote ? 'youtube-captions' : undefined)
+      ?? project?.transcriptSource
+      ?? (transcript ? 'manual' : 'none')
     // word-timing provenance: explicit body flag > persisted project flag > honest default
     const wordTiming: 'measured' | 'estimated' | null =
-      body.wordTiming ?? (project?.wordTiming === 'measured' || project?.wordTiming === 'estimated' ? project.wordTiming : null) ?? (words.length > 0 ? 'estimated' : null)
+      body.wordTiming
+      ?? (project?.wordTiming === 'measured' || project?.wordTiming === 'estimated' ? project.wordTiming : null)
+      ?? (autoCaptionsNote ? 'measured' : null)
+      ?? (words.length > 0 ? 'estimated' : null)
     const hasTranscript = transcript.length > 0
 
     // ---------- LLM call ----------
@@ -345,6 +382,13 @@ Return the JSON object now.`
       })
     }
 
+    // usage metering (best-effort, never blocks the response)
+    void recordUsage(ownerId, 'analyze', 1, {
+      model: typeof analysisMeta?.model === 'string' ? analysisMeta.model : undefined,
+      projectId: body.projectId,
+      transcriptSource,
+    })
+
     return NextResponse.json({
       candidates: finalClips,
       platform,
@@ -363,6 +407,7 @@ Return the JSON object now.`
       transcriptSource,
       transcriptGrounded: hasTranscript,
       wordTiming,
+      autoGrounding: autoCaptionsNote,
       analysisMeta,
       meta: {
         serverScored: true,

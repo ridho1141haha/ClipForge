@@ -114,8 +114,25 @@ model SourceJob {
   errorCode    String? // e.g. YTDLP_BLOCKED, ASR_UNAVAILABLE
   errorMessage String?
   result       String? // JSON summary { duration, durationSource, transcriptSource, words }
+  payload      String? // original request payload (JSON) — enables retry-from-stage for prepare jobs
   createdAt    DateTime @default(now())
   updatedAt    DateTime @updatedAt
 
   @@index([ownerId])
+}
+
+// Usage metering (light, SaaS-ready): one row per billable engine action.
+// Enforcement points are the 4 already-rate-limited expensive routes
+// (analyze, transcribe, render-proxy, prepare) — see docs/SAAS-MIGRATION.md §7-8.
+model UsageEvent {
+  id        String   @id @default(cuid())
+  ownerId   String // session ownership (migrates to userId/workspace later)
+  kind      String // analyze | transcribe | render | prepare
+  // metered quantity: 1 per action; render seconds for renders; media seconds for transcribe
+  quantity  Float    @default(1)
+  meta      String? // JSON: { model?, mediaSeconds?, renderSeconds?, projectId? }
+  createdAt DateTime @default(now())
+
+  @@index([ownerId, createdAt])
+  @@index([kind])
 }

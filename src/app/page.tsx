@@ -93,6 +93,14 @@ export default function Home() {
   const [reanalyzeOpen, setReanalyzeOpen] = React.useState(false)
   const [reanalyzing, setReanalyzing] = React.useState(false)
 
+  // async prepare-job state (REAL stages: metadata → captions → project)
+  const [prepareStage, setPrepareStage] = React.useState<string | null>(null)
+  const [prepareProgress, setPrepareProgress] = React.useState<number | null>(null)
+  const [prepareError, setPrepareError] = React.useState<string | null>(null)
+  const prepareJobRef = React.useRef<string | null>(null)
+  const prepareJobUrlRef = React.useRef<string | null>(null)
+  const lastAnalyzeParamsRef = React.useRef<AnalyzeParams | null>(null)
+
   // sort & filter
   const [sort, setSort] = React.useState<SortKey>('default')
   const [filter, setFilter] = React.useState<FilterKey>('all')
@@ -168,6 +176,60 @@ export default function Home() {
   }, [refreshProjects])
 
   // ---- analyze flow ----
+  /**
+   * Async source preparation via the job pipeline: resolves REAL metadata +
+   * REAL captions (with word timestamps) into an owned Project, with live
+   * stage/progress surfaced to the UI. Reuses a failed job via /retry.
+   * Returns the job result, or null on failure (jobId kept in ref for retry).
+   */
+  const prepareSource = async (url: string, language: string, manualDuration?: number): Promise<Record<string, unknown> | null> => {
+    setPrepareStage('Queued…')
+    setPrepareProgress(1)
+    try {
+      // reuse the failed job (via /retry) when it belongs to the same URL;
+      // a different URL always starts a fresh job
+      const existingJob = prepareJobUrlRef.current === url ? prepareJobRef.current : null
+      const res = await fetch(existingJob ? `/api/jobs/${existingJob}/retry` : '/api/source/prepare', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ url, language, manualDuration }),
+      })
+      const data = await res.json()
+      if (!res.ok) throw new Error(data.error ?? 'Prepare failed')
+      const jobId: string = data.jobId
+      prepareJobRef.current = jobId
+      prepareJobUrlRef.current = url
+      // poll (max 3 min)
+      for (let i = 0; i < 120; i++) {
+        await new Promise((r) => setTimeout(r, 1500))
+        let job: Record<string, unknown>
+        try {
+          const jr = await fetch(`/api/jobs/${jobId}`)
+          const jd = await jr.json()
+          if (!jr.ok) throw new Error(jd.error ?? 'Job lost')
+          job = jd.job ?? {}
+        } catch {
+          continue // transient poll error — keep polling
+        }
+        setPrepareStage((job.stage as string) ?? '')
+        setPrepareProgress(typeof job.progress === 'number' ? job.progress : null)
+        if (job.status === 'COMPLETED') {
+          // job consumed — next video starts a fresh job
+          prepareJobRef.current = null
+          prepareJobUrlRef.current = null
+          return (job.result ?? {}) as Record<string, unknown>
+        }
+        if (job.status === 'FAILED') {
+          throw new Error((job.errorMessage as string) ?? 'Source preparation failed')
+        }
+      }
+      throw new Error('Source preparation timed out')
+    } finally {
+      setPrepareStage(null)
+      setPrepareProgress(null)
+    }
+  }
+
   const analyze = React.useCallback(
     async (
       url: string,
@@ -182,6 +244,7 @@ export default function Home() {
       words?: { word: string; start: number; end: number }[],
       preResolvedMeta?: Partial<YouTubeMeta> & { title: string },
       preSetProjectId?: string,
+      skipPrepare = false,
     ) => {
       setError(null)
       if (preSetProjectId) setProjectId(preSetProjectId)
@@ -194,6 +257,7 @@ export default function Home() {
         setSelectedIdx(null)
         setMultiSelected(new Set())
         setPlayStart(null)
+        setPrepareError(null)
         setTimeout(
           () => studioRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' }),
           80,
@@ -204,6 +268,7 @@ export default function Home() {
 
       // 1. fetch metadata (only if not already loaded)
       let localMeta: YouTubeMeta | null = meta
+      let prepProjectId: string | null = null
       if (preResolvedMeta) {
         // e.g. upload/ASR flow — duration + title measured locally, no YouTube call
         localMeta = {
@@ -221,6 +286,45 @@ export default function Home() {
           embedUrlAutoplay: '',
         }
         setMeta(localMeta)
+      } else if (!isReanalyze && !skipPrepare && !preSetProjectId && !projectId && !transcript?.trim() && !words?.length) {
+        // 0. ASYNC PREPARE (job pipeline): resolve REAL metadata + REAL captions
+        // (word timestamps) into an owned project, with live stage/progress UI.
+        // The analyze call then grounds from the prepared project.
+        try {
+          const prep = await prepareSource(url, language, manualDuration)
+          if (prep) {
+            prepProjectId = (prep.projectId as string) ?? null
+            if (prepProjectId) setProjectId(prepProjectId)
+            const ytId = (prep.youtubeId as string) ?? ''
+            localMeta = {
+              youtubeId: ytId,
+              url,
+              title: (prep.title as string) ?? 'YouTube video',
+              author: (prep.author as string) ?? null,
+              thumbnail: (prep.thumbnail as string) ?? '',
+              provider: 'YouTube',
+              duration: (prep.duration as number) ?? null,
+              durationSource: (prep.durationSource as string) ?? 'unavailable',
+              requiresManualDuration: !prep.duration,
+              description: null,
+              embedUrl: ytId ? `https://www.youtube.com/embed/${ytId}` : '',
+              embedUrlAutoplay: ytId ? `https://www.youtube.com/embed/${ytId}?autoplay=1` : '',
+            }
+            setMeta(localMeta)
+            const warns = (prep.warnings as string[] | undefined) ?? []
+            for (const w of warns.slice(0, 2)) {
+              toast({ title: 'Source preparation note', description: w })
+            }
+          }
+        } catch (e: any) {
+          setPrepareError(e.message ?? 'Source preparation failed')
+          setPhase('fetching') // keep the retry UI visible
+          toast({
+            title: 'Source preparation failed',
+            description: 'You can retry — YouTube blocking is often temporary.',
+          })
+          return
+        }
       } else if (!isReanalyze || !localMeta) {
         try {
           const res = await fetch('/api/youtube/meta', {
@@ -243,6 +347,14 @@ export default function Home() {
           })
           return
         }
+      }
+
+      if (!localMeta) {
+        // defensive: none of the resolution paths produced metadata
+        setError('Could not resolve video metadata — please try again.')
+        setPhase('idle')
+        setReanalyzing(false)
+        return
       }
 
       // 2. analyze clips
@@ -272,7 +384,7 @@ export default function Home() {
         setMeta(localMeta)
       }
       try {
-        const effProjectId = preSetProjectId ?? projectId
+        const effProjectId = preSetProjectId ?? prepProjectId ?? projectId
         const res = await fetch('/api/clips/analyze', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -284,7 +396,9 @@ export default function Home() {
             duration: effDuration,
             durationSource: manualDuration && manualDuration > 0 && localMeta.duration == null ? 'user-provided' : localMeta.durationSource ?? 'unknown',
             transcript,
-            transcriptSource: words ? 'asr' : transcript ? 'manual' : 'none',
+            // omit transcriptSource when we have nothing local — the prepared project's
+            // source (youtube-captions) must not be masked by a body 'none'
+            ...(words ? { transcriptSource: 'asr' as const } : transcript ? { transcriptSource: 'manual' as const } : {}),
             words,
             platform,
             style,
@@ -336,9 +450,12 @@ export default function Home() {
         setPlayStart(null)
         setPhase('done')
         const postCount = newClips.filter((c) => c.recommendation === 'POST').length
+        const autoGround = (result as { autoGrounding?: string })?.autoGrounding
         toast({
           title: `${newClips.length} clip candidates ready`,
-          description: `${postCount} recommended to POST · ${newClips.length - postCount} to skip`,
+          description: autoGround
+            ? `${autoGround} · ${postCount} recommended to POST`
+            : `${postCount} recommended to POST · ${newClips.length - postCount} to skip`,
         })
       } catch (e: any) {
         setError(e.message ?? 'AI analysis failed')
@@ -357,6 +474,7 @@ export default function Home() {
 
   const handleAnalyze = React.useCallback(
     (params: AnalyzeParams) => {
+      lastAnalyzeParamsRef.current = params
       setSourceTranscript(params.transcript ?? null)
       setSourceWords(params.words ?? null)
       return analyze(
@@ -372,6 +490,7 @@ export default function Home() {
         params.words,
         params.preResolvedMeta,
         params.projectId,
+        params.skipPrepare,
       )
     },
     [analyze],
@@ -385,6 +504,23 @@ export default function Home() {
     },
     [meta, analyze],
   )
+
+  // prepare-job retry: re-run the SAME analyze params (job reuse happens server-side)
+  const handleRetryPrepare = React.useCallback(() => {
+    const params = lastAnalyzeParamsRef.current
+    if (params) {
+      void handleAnalyze(params)
+    }
+  }, [handleAnalyze])
+  // fallback: analyze without a prepared transcript (old synchronous path)
+  const handleSkipPrepare = React.useCallback(() => {
+    const params = lastAnalyzeParamsRef.current
+    if (params) {
+      prepareJobRef.current = null
+      prepareJobUrlRef.current = null
+      void handleAnalyze({ ...params, transcript: params.transcript ?? '' , skipPrepare: true })
+    }
+  }, [handleAnalyze])
 
   // ---- clip actions ----
   const setClipStatus = (idx: number, status: 'approved' | 'rejected' | 'suggested') => {
@@ -1223,7 +1359,13 @@ export default function Home() {
                   exit={{ opacity: 0 }}
                   className="grid place-items-center py-16"
                 >
-                  <AnalyzingState />
+                  <AnalyzingState
+                    stageText={prepareStage}
+                    progress={prepareProgress}
+                    prepareError={prepareError}
+                    onRetryPrepare={handleRetryPrepare}
+                    onSkipPrepare={handleSkipPrepare}
+                  />
                 </motion.div>
               )}
 

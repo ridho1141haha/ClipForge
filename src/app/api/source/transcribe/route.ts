@@ -9,6 +9,7 @@ import { db } from '@/lib/db'
 import { getOrCreateSessionId } from '@/lib/session'
 import { checkRateLimit, rateLimitHeaders } from '@/lib/validation'
 import { probeMediaDuration } from '@/lib/media'
+import { recordUsage } from '@/lib/usage'
 
 const execFileAsync = promisify(execFile)
 
@@ -192,6 +193,9 @@ async function runTranscribeJob(
       words: asr.words.slice(0, 20_000), // client grounds analyze immediately (≈2h of speech)
       warnings: [],
     }
+    // usage metering (best-effort): media seconds transcribed
+    void recordUsage(ownerId, 'transcribe', duration, { mediaSeconds: duration, projectId: project.id, model: asr.model ?? 'tiny' })
+
     await setJob(jobId, {
       status: 'COMPLETED',
       stage: 'Transcription complete',

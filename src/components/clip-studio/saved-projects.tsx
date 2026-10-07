@@ -21,6 +21,7 @@ import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { Input } from '@/components/ui/input'
 import { fmtDuration, type Project } from '@/lib/youtube'
+import { UsagePanel } from '@/components/clip-studio/usage-panel'
 
 interface Props {
   projects: Project[]
@@ -134,6 +135,7 @@ export function SavedProjects({ projects, loading, onSelect, onDelete, onRefresh
             <span className="text-xs text-muted-foreground">analyzed</span>
           </div>
         )}
+        <UsagePanel />
 
         {/* search + sort */}
         <div className="ml-auto flex items-center gap-2">

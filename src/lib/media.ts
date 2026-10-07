@@ -123,7 +123,15 @@ async function ytDlpMeta(youtubeId: string): Promise<{ duration: number; title?:
 async function ytDlpCaptions(youtubeId: string, langPref = 'en,id'): Promise<{ json3: unknown; lang: string } | null> {
   const dir = mkdtempSync(join(tmpdir(), 'clipforge-caps-'))
   try {
-    const langs = `${langPref},*-orig,*-auto`
+    // NOTE: yt-dlp --sub-langs entries are PYTHON REGEX, not shell globs —
+    // `*-orig` is rejected outright ("Wrong regex for subtitlelangs") which
+    // silently killed caption download. Valid: `en.*`, `.*-orig`.
+    // ORDER MATTERS: the ASR 'orig' track (real per-word offsets) is requested
+    // FIRST — when YouTube 429s a later variant the best track is already on disk.
+    const langs = `.*-orig,en.*,${langPref}`
+    // IMPORTANT: a 429 on ONE language variant fails the whole yt-dlp process
+    // even though other tracks were already written — so never let a non-zero
+    // exit abort the fetch; decide from the files on disk instead.
     await runYtDlp(
       [
         '--js-runtimes', 'bun',
@@ -136,12 +144,52 @@ async function ytDlpCaptions(youtubeId: string, langPref = 'en,id'): Promise<{ j
         '-o', join(dir, 'subs'),
         `https://www.youtube.com/watch?v=${youtubeId}`,
       ],
-      35_000,
-    )
-    const files = readdirSync(dir).filter((f) => f.startsWith('subs') && (f.endsWith('.json3') || f.endsWith('.vtt') || f.endsWith('.srv3')))
+      45_000,
+    ).catch(() => {})
+    let files = readdirSync(dir).filter((f) => f.startsWith('subs') && (f.endsWith('.json3') || f.endsWith('.vtt') || f.endsWith('.srv3')))
+    // retry: some videos name tracks outside our patterns → accept any language as a last resort
+    if (files.length === 0) {
+      await runYtDlp(
+        [
+          '--js-runtimes', 'bun',
+          '--no-warnings',
+          '--skip-download',
+          '--write-subs',
+          '--write-auto-subs',
+          '--sub-langs', 'all',
+          '--sub-format', 'json3/vtt/srv3/best',
+          '--max-downloads', '1',
+          '-o', join(dir, 'subs'),
+          `https://www.youtube.com/watch?v=${youtubeId}`,
+        ],
+        45_000,
+      ).catch(() => {})
+      files = readdirSync(dir).filter((f) => f.startsWith('subs') && (f.endsWith('.json3') || f.endsWith('.vtt') || f.endsWith('.srv3')))
+    }
     if (files.length === 0) return null
-    // prefer json3 (word timings) > srv3 > vtt
-    files.sort((a, b) => rank(a) - rank(b))
+    // prefer json3 (word timings) > srv3 > vtt — and among json3 tracks,
+    // prefer the one that actually carries per-word tOffsetMs (the ASR
+    // 'en-orig' track) over word-offset-less manual tracks.
+    const offsetRatio = (f: string): number => {
+      if (!f.endsWith('.json3')) return -1
+      try {
+        const j = JSON.parse(readFileSync(join(dir, f), 'utf-8')) as { events?: { segs?: { tOffsetMs?: number }[] }[] }
+        const segs = (j.events ?? []).flatMap((e) => e.segs ?? [])
+        if (segs.length === 0) return 0
+        return segs.filter((s) => typeof s.tOffsetMs === 'number' && isFinite(s.tOffsetMs)).length / segs.length
+      } catch {
+        return 0
+      }
+    }
+    files.sort((a, b) => {
+      const ra = rank(a)
+      const rb = rank(b)
+      if (ra !== rb) return ra - rb
+      const oa = offsetRatio(a)
+      const ob = offsetRatio(b)
+      if (Math.abs(oa - ob) > 0.05) return ob - oa // more word offsets first
+      return a.localeCompare(b)
+    })
     const content = readFileSync(join(dir, files[0]), 'utf-8')
     const lang = files[0].match(/subs\.([\w-]+)/)?.[1] ?? 'unknown'
     if (files[0].endsWith('.json3')) {

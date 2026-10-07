@@ -344,6 +344,48 @@ console.log('\n== Karaoke: \\k word-highlight from REAL word timings ==')
   assert(ass.includes('{\\k50}alpha'), 'generateASS renders karaoke line', ass.split('\n').find((l) => l.startsWith('Dialogue: 0')) ?? '')
 }
 
+// ===========================================================================
+// Word-snap + speech strip (timeline/editor shared utils)
+// ===========================================================================
+{
+  console.log('\n== Word snap + speech strip (timeline polish) ==')
+  const { snapToWordBoundary, buildSpeechStrip } = await import('../src/lib/word-snap')
+  const words = [
+    { word: 'actually', start: 10.0, end: 10.6 },
+    { word: 'the', start: 11.2, end: 11.4 },
+    { word: 'lesson', start: 11.5, end: 12.2 },
+  ]
+  // snap to word onset
+  const onset = snapToWordBoundary(10.2, words)
+  assert(onset.time === 10.0 && onset.word === 'actually', 'snap to word onset', JSON.stringify(onset))
+  // snap to inter-word gap midpoint
+  const gap = snapToWordBoundary(10.85, words)
+  assert(Math.abs(gap.time - 10.9) < 0.011 && Boolean(gap.word?.includes('|')), 'snap to gap midpoint', JSON.stringify(gap))
+  // beyond maxDist → unchanged
+  const far = snapToWordBoundary(15.0, words)
+  assert(far.time === 15.0 && far.word === null, 'no snap beyond maxDist')
+  // too few words → unchanged
+  assert(snapToWordBoundary(10.2, [words[0]]).word === null, 'single word → no snap')
+  // non-finite guarded
+  assert(snapToWordBoundary(10.2, [{ word: 'x', start: NaN, end: 5 }]).word === null, 'non-finite word guarded')
+
+  // speech strip: buckets fully inside a word span = covered; gaps = empty
+  const strip = buildSpeechStrip(words, 20, 100) // 0.2s per bucket
+  assert(strip.length === 100, 'strip bucket count')
+  // bucket 51 covers 10.2-10.4 (inside 'actually' 10.0-10.6) → full coverage
+  assert(strip[51] > 0.99, 'bucket inside word span fully covered', String(strip[51]))
+  // buckets 53-55 cover 10.6-11.2 (gap between 'actually' and 'the') → empty
+  assert(strip[53] === 0 && strip[54] === 0 && strip[55] === 0, 'gap buckets empty', JSON.stringify([strip[53], strip[54], strip[55]]))
+  // partial coverage at word edge: bucket 50 covers 10.0-10.2, word ends 10.6? no — word starts 10.0 → full; use end edge: bucket 52 covers 10.4-10.6 → full
+  assert(strip[52] > 0.99, 'word end edge bucket covered', String(strip[52]))
+  // silence before/after speech
+  assert(strip[0] === 0 && strip[98] === 0 && strip[99] === 0, 'silence buckets empty')
+  // no words → all zeros
+  assert(buildSpeechStrip([], 20, 100).every((v) => v === 0), 'no words → empty strip')
+  // words clamped to duration bounds
+  assert(buildSpeechStrip([{ word: 'x', start: 19.5, end: 25 }, { word: 'y', start: -5, end: 1 }], 20, 10).every((v) => v >= 0 && v <= 1), 'strip values clamped 0..1')
+}
+
 console.log(`\n════════════════════════════════`)
 console.log(`RESULT: ${passed} passed, ${failed} failed`)
 process.exit(failed > 0 ? 1 : 0)

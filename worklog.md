@@ -188,3 +188,44 @@ Stage Summary:
   3) Timeline zoom/scrub polish in timeline.tsx + cut handles snapping to the same word-gap logic as clip-editor.
   4) Optional: renderer stage-level progress from ffmpeg `-progress` pipe for smoother UI.
 - Risks: none new. Known standing limits unchanged (YouTube IP-block in sandbox; B-roll/SFX/music preview-only; in-memory rate-limit store).
+
+---
+Task ID: cron-review-3 (webDevReview round 4)
+Agent: Z.ai Code (autonomous review)
+Task: QA + feature round — status assessment, agent-browser QA, then advance the job architecture & product surface (auto-grounding, retry, usage metering, timeline polish, renderer progress).
+
+Work Log:
+- STATUS ASSESSMENT: all services healthy; regression gates ALL GREEN before changes (unit 80/80, E2E 17/17, live 17/17); git clean @ 9a4ff10. Browser QA (agent-browser): landing stats, studio golden path (URL → manual transcript → analyze → 3 clips w/ verified badges, avg 83), AI Edit Plan dialog (score chips, transcript-locked subtitles w/ emphasis), Save to library (transactional toast), Library grid — ALL PASS, console clean. No product bugs found in existing flows.
+- 🔑 KEY DISCOVERY: YouTube caption download now WORKS from this sandbox IP (was bot-blocked in earlier rounds). `/api/source/prepare` (the async job pipeline) existed but had ZERO callers — orphaned. Decision: wire it in as the PRIMARY UI path for YouTube URLs without manual transcript.
+- 🐛 P0 BUG FIXED (pre-existing, caption fetch silently dead): yt-dlp `--sub-langs "en,id,*-orig,*-auto"` → yt-dlp rejects `*-orig` ("Wrong regex for subtitlelangs" — entries are PYTHON REGEX, not shell globs) → the whole caption command failed → transcriptSource always 'none' even when captions were downloadable. Nobody noticed because the path degraded honestly. Fixed pattern + added: (1) partial-failure tolerance — a 429 on ONE language variant must not abort the fetch when other tracks are already on disk (decide from files, never from exit code); (2) track-selection preference: among json3 files, prefer the one actually carrying per-word tOffsetMs (the ASR 'orig' track) over word-offset-less manual tracks → wordTiming 'measured'; (3) request order puts `.*-orig` FIRST so the best track survives partial rate-limit failures. VERIFIED: dQw4w9WgXcQ → transcriptSource 'youtube-captions', wordTiming 'measured', 291 words with real offsets.
+- NEW FEATURE — Zero-input auto-grounding (the biggest UX win since ASR):
+  • `/api/source/prepare` is now the primary path: pasting a URL + Auto-Clip runs the async prepare job FIRST (real stage/progress UI: "Resolving video metadata (yt-dlp → innertube → oEmbed)…" → "Fetching YouTube captions / transcript…" → "Saving source data…"), persists duration+transcript+words into an owned Project, then analyze grounds from the project. Result: hooks verbatim-verified with ZERO manual paste ("We're no strangers to love… verified in transcript" on a song video; provenance chips both green: duration · yt-dlp, transcript · YouTube captions).
+  • belt-and-braces: `/api/clips/analyze` ALSO auto-fetches captions (75s timeout guard) when no transcript/words supplied by any path (body/project/prepare) — direct API users get the same grounding; response carries `autoGrounding` note → toast.
+  • graceful degradation preserved: no captions → exactly the old honest 'none' behavior + fallback button.
+- NEW FEATURE — Retry-from-stage for failed jobs (job architecture P1):
+  • SourceJob.payload column persists the original request JSON at creation.
+  • prepare worker extracted to src/lib/jobs/prepare-worker.ts (shared by create + retry routes).
+  • POST /api/jobs/:id/retry — owner-scoped; only FAILED prepare jobs (409 otherwise; transcribe media is ephemeral → re-upload); merges optional manualDuration/manualTranscript overrides; resets state machine to QUEUED and re-runs. Verified: 202 on real FAILED job, 409 on COMPLETED, 404 cross-session.
+  • UI: failed prepare shows amber panel with "Retry prepare" (reuses the SAME job via /retry) + "Analyze without transcript" fallback; browser-verified with an invalid video id.
+- NEW FEATURE — Usage metering light (SaaS-migration §7-8 enforcement points):
+  • UsageEvent table (ownerId, kind analyze|prepare|transcribe|render, quantity, meta JSON) + src/lib/usage.ts (best-effort recordUsage — never fails the main flow) + GET /api/usage (totals, last-30d, last 20 events).
+  • Wired into all 4 expensive paths: analyze (model/transcriptSource), prepare (transcriptSource), transcribe (media seconds), render-proxy POST /jobs (render seconds when recipe parseable).
+  • UI: UsagePanel popover in Library header (per-kind cards, recent activity, SaaS note; lazy load). Browser-verified showing live counts.
+- NEW FEATURE — Renderer stage progress granularity: ffmpeg `-progress pipe:1 -nostats` on both encode paths (args placement VERIFIED: global options must precede URLs — appended-after emits nothing); stdout `out_time_us=` parsing (µs quirk handled) with regular cadence + stderr `time=` fallback retained. E2E re-verified 17/17 incl. durationOk.
+- NEW FEATURE — Timeline polish (uses MEASURED word data):
+  • speech-density strip (160 buckets, epsilon-guarded bucket math — float edge like 11.2/0.2=55.999… no longer fakes coverage) rendered under clips + "speech map · trim snaps to words" badge.
+  • trim-handle word snapping on drag (shared src/lib/word-snap.ts — clip-editor refactored onto the same util; single source of truth) + live snap hint ("start → speech: \"actually\"").
+  • functional 1×–4× zoom (previously dead state) with scrollable track + zoomed time scale; handle hover feedback.
+- Dev-env incident (documented): stale Prisma client after schema push → truncated .next dev chunks to force recompile → dev server required restart (recovered, all routes verified). Note for future rounds: after `db:push`, verify a route that touches the new column before deeper debugging.
+- Tests: +12 unit assertions (word-snap onset/gap/maxDist/single-word/non-finite; speech-strip coverage/gaps/silence/clamping). Final gates: unit 92/92 · golden E2E 17/17 · live 17/17 · tsc clean · eslint clean. Browser: golden auto-grounded flow, retry UI, usage panel, speech strip (160 bars) all verified; console clean.
+- README updated: pipeline diagram (prepare as primary path, retry, -progress), zero-input auto-grounding section, status line.
+
+Stage Summary:
+- The product now delivers grounded clips from a bare URL with zero manual steps when YouTube allows it, degrades honestly when it doesn't, and recovers with one click when it fails transiently.
+- Committed & pushed to origin/main.
+- Next round suggestions (priority order):
+  1) Proxy media download for YouTube sources (yt-dlp video download → local file → render without upload) — the URL flow still can't RENDER the source in this environment.
+  2) Auto-Edit preview integration with the prepare flow (feed real word data into the player).
+  3) Usage-based soft limits (configurable daily cap → 429 with friendly message) — table + endpoints already exist.
+  4) Exporter: burn-in LUTs/text overlays preview-only labeling cleanup; B-roll/SFX remain preview-only.
+- Risks: none new. Standing limits unchanged (sandbox IP rate-limits on YouTube timedtext endpoint — mitigated by partial-failure tolerance + retry; B-roll/SFX/music preview-only; in-memory rate-limit store).

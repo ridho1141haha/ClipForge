@@ -19,6 +19,7 @@ import { Badge } from '@/components/ui/badge'
 import { Switch } from '@/components/ui/switch'
 import { X, Plus, Magnet, AudioLines } from 'lucide-react'
 import { fmtTime, type SuggestedClip } from '@/lib/youtube'
+import { snapToWordBoundary, type WordT } from '@/lib/word-snap'
 
 interface Props {
   open: boolean
@@ -26,36 +27,6 @@ interface Props {
   clip: SuggestedClip | null
   duration: number
   onSave: (clip: SuggestedClip) => void
-}
-
-interface WordT { word: string; start: number; end: number }
-
-/**
- * Snap a boundary time to the nearest speech boundary from REAL word
- * timestamps: word onsets, word endings, and midpoints of inter-word gaps.
- * Returns the original time when nothing is within `maxDist` seconds —
- * snapping never moves a boundary somewhere speech does not support.
- */
-function snapToWordBoundary(t: number, words: WordT[], maxDist = 1.5): { time: number; word: string | null } {
-  if (words.length < 2) return { time: t, word: null }
-  const cands: { time: number; word: string }[] = []
-  words.forEach((w, i) => {
-    cands.push({ time: w.start, word: w.word })
-    cands.push({ time: w.end, word: w.word })
-    const next = words[i + 1]
-    if (next) cands.push({ time: (w.end + next.start) / 2, word: `…${w.word} | ${next.word}…` })
-  })
-  let best: { time: number; word: string | null } = { time: t, word: null }
-  let bestD = Infinity
-  for (const c of cands) {
-    const d = Math.abs(c.time - t)
-    if (d < bestD) {
-      bestD = d
-      best = { time: c.time, word: c.word }
-    }
-  }
-  if (bestD > maxDist || best.word === null) return { time: t, word: null }
-  return { time: Math.round(best.time * 10) / 10, word: best.word }
 }
 
 export function ClipEditor({ open, onOpenChange, clip, duration, onSave }: Props) {

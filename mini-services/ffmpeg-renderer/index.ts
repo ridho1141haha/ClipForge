@@ -103,11 +103,28 @@ function scaleAtTime(time: number, sorted: { time: number; scale: number }[]): n
   return 1
 }
 
-// Run a command, capturing stderr for progress parsing.
+// Run a command, capturing output for progress parsing.
 // Includes a hard timeout — a hung ffmpeg must never hang the job forever.
-function run(cmd: string[], cwd: string, job: RenderJob, stageLabel: string, stageStart: number, stageEnd: number, timeoutMs = 15 * 60_000): Promise<{ code: number; stdout: string; stderr: string }> {
+// When opts.progressPipe is set, `-progress pipe:1 -nostats` is appended and
+// stdout's machine-readable `out_time_us=` lines drive smooth, regular progress
+// updates (stderr time= parsing stays as a fallback for other commands).
+function run(
+  cmd: string[],
+  cwd: string,
+  job: RenderJob,
+  stageLabel: string,
+  stageStart: number,
+  stageEnd: number,
+  timeoutMs = 15 * 60_000,
+  opts?: { progressPipe?: boolean },
+): Promise<{ code: number; stdout: string; stderr: string }> {
   return new Promise((resolve) => {
-    const p = spawn(cmd[0], cmd.slice(1), { cwd })
+    // -progress/-nostats are GLOBAL options: they must precede input/output
+    // URLs (verified: appended after the output file emits nothing on stdout).
+    const args = opts?.progressPipe
+      ? [cmd[0], cmd[1] ?? '-nostdin', '-progress', 'pipe:1', '-nostats', ...cmd.slice(2)]
+      : cmd
+    const p = spawn(args[0], args.slice(1), { cwd })
     job.currentChild = p
     let stdout = ''
     let stderr = ''
@@ -116,20 +133,39 @@ function run(cmd: string[], cwd: string, job: RenderJob, stageLabel: string, sta
       timedOut = true
       try { p.kill('SIGKILL') } catch {}
     }, timeoutMs)
-    p.stdout.on('data', (d) => (stdout += d.toString()))
+
+    const reportTime = (sec: number) => {
+      const totalForStage = Math.max(1, job.recipeDuration || 10)
+      const stageProgress = Math.min(1, sec / totalForStage)
+      const overall = stageStart + stageProgress * (stageEnd - stageStart)
+      job.progress = Math.round(overall)
+      job.stage = stageLabel
+      broadcast(job)
+    }
+
+    p.stdout.on('data', (d) => {
+      const text = d.toString()
+      stdout += text
+      if (opts?.progressPipe) {
+        // -progress pipe:1 emits key=value blocks at a regular cadence
+        const m = text.match(/out_time_us=(\d+)/) || text.match(/out_time_ms=(\d+)/)
+        if (m) {
+          const us = parseInt(m[1], 10)
+          // legacy caveat: some ffmpeg builds emit microseconds in out_time_ms
+          const sec = m[0].startsWith('out_time_us') ? us / 1_000_000 : us / 1_000_000
+          if (isFinite(sec) && sec >= 0) reportTime(sec)
+        }
+      }
+    })
     p.stderr.on('data', (d) => {
       const text = d.toString()
       stderr += text
-      // Parse ffmpeg progress: time=00:00:05.12 → progress within stage
+      // Fallback parse: time=00:00:05.12 → progress within stage
+      if (opts?.progressPipe) return // stdout is authoritative in progress-pipe mode
       const m = text.match(/time=(\d+):(\d+):(\d+\.\d+)/)
       if (m) {
         const sec = parseInt(m[1]) * 3600 + parseInt(m[2]) * 60 + parseFloat(m[3])
-        const totalForStage = Math.max(1, job.recipeDuration || 10)
-        const stageProgress = Math.min(1, sec / totalForStage)
-        const overall = stageStart + stageProgress * (stageEnd - stageStart)
-        job.progress = Math.round(overall)
-        job.stage = stageLabel
-        broadcast(job)
+        reportTime(sec)
       }
     })
     p.on('close', (code) => {
@@ -249,7 +285,7 @@ async function processJob(jobId: string, file: File, recipe: RenderRecipe) {
     if (job.status === 'cancelled') return // cancelled before render started
     if (inputHasAudio) {
       const args = ['ffmpeg', '-nostdin', '-y', '-i', inputPath, '-filter_complex', fcParts.join(';'), '-map', '[vf]', '-map', '[ac]', '-c:v', 'libx264', '-preset', 'medium', '-crf', '20', '-c:a', 'aac', '-b:a', '128k', '-r', '30', outPath]
-      finalRes = await run(args, jobDir, job, 'Encoding H.264 + burning subtitles + zoom', 25, 92)
+      finalRes = await run(args, jobDir, job, 'Encoding H.264 + burning subtitles + zoom', 25, 92, 15 * 60_000, { progressPipe: true })
       if (job.status === 'cancelled') return
       if (finalRes.code !== 0) {
         throw new Error('ffmpeg render failed: ' + finalRes.stderr.slice(-600))
@@ -266,7 +302,7 @@ async function processJob(jobId: string, file: File, recipe: RenderRecipe) {
         '-c:v', 'libx264', '-preset', 'medium', '-crf', '20', '-c:a', 'aac', '-b:a', '128k', '-r', '30',
         '-shortest', outPath,
       ]
-      finalRes = await run(silentArgs, jobDir, job, 'Encoding (silent audio — source has no audio)', 25, 92)
+      finalRes = await run(silentArgs, jobDir, job, 'Encoding (silent audio — source has no audio)', 25, 92, 15 * 60_000, { progressPipe: true })
       if (job.status === 'cancelled') return
       if (finalRes.code !== 0) {
         throw new Error('ffmpeg render failed (silent-audio path): ' + finalRes.stderr.slice(-600))
