@@ -12,6 +12,10 @@ import {
   ChevronDown,
   Check,
   Languages,
+  Mic,
+  UploadCloud,
+  BadgeCheck,
+  Clock,
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -19,7 +23,7 @@ import { Label } from '@/components/ui/label'
 import { Slider } from '@/components/ui/slider'
 import { Badge } from '@/components/ui/badge'
 import { Textarea } from '@/components/ui/textarea'
-import { PLATFORMS, LANGUAGES } from '@/lib/youtube'
+import { PLATFORMS, LANGUAGES, type YouTubeMeta } from '@/lib/youtube'
 import { STYLE_PRESETS } from '@/lib/editplan'
 
 export interface AnalyzeParams {
@@ -31,12 +35,31 @@ export interface AnalyzeParams {
   language: string
   transcript?: string
   manualDuration?: number
+  words?: { word: string; start: number; end: number }[]
+  projectId?: string
+  preResolvedMeta?: Partial<YouTubeMeta> & { title: string }
 }
 
 interface Props {
   onAnalyze: (params: AnalyzeParams) => void
   loading: boolean
   error?: string | null
+}
+
+interface AsrState {
+  phase: 'idle' | 'uploading' | 'working' | 'done' | 'error'
+  uploadPct: number
+  jobStage: string
+  jobPct: number
+  jobId?: string
+  projectId?: string
+  title?: string
+  duration?: number
+  durationSource?: string
+  words?: { word: string; start: number; end: number }[]
+  wordCount?: number
+  error?: string
+  fileName?: string
 }
 
 export function UrlInput({ onAnalyze, loading, error }: Props) {
@@ -51,6 +74,9 @@ export function UrlInput({ onAnalyze, loading, error }: Props) {
   const [advancedOpen, setAdvancedOpen] = React.useState(false)
   const [transcript, setTranscript] = React.useState('')
   const [manualDuration, setManualDuration] = React.useState('')
+  const [asr, setAsr] = React.useState<AsrState>({ phase: 'idle', uploadPct: 0, jobStage: '', jobPct: 0 })
+  const asrFileRef = React.useRef<HTMLInputElement>(null)
+  const asrPollRef = React.useRef<number>(0)
   const styleRef = React.useRef<HTMLDivElement>(null)
   const langRef = React.useRef<HTMLDivElement>(null)
 
@@ -74,9 +100,11 @@ export function UrlInput({ onAnalyze, loading, error }: Props) {
 
   const submit = (e: React.FormEvent) => {
     e.preventDefault()
-    if (!url.trim() || loading) return
+    if (loading) return
+    const isAsr = asr.phase === 'done'
+    if (!url.trim() && !isAsr) return
     onAnalyze({
-      url: url.trim(),
+      url: isAsr && !url.trim() ? `upload://${asr.fileName ?? 'media'}` : url.trim(),
       platform,
       clipCount,
       style,
@@ -84,8 +112,86 @@ export function UrlInput({ onAnalyze, loading, error }: Props) {
       language,
       transcript: transcript.trim() || undefined,
       manualDuration: manualDuration ? Number(manualDuration) : undefined,
+      words: asr.phase === 'done' ? asr.words : undefined,
+      projectId: asr.phase === 'done' ? asr.projectId : undefined,
+      preResolvedMeta:
+        asr.phase === 'done'
+          ? {
+              title: asr.title ?? 'Uploaded media',
+              duration: asr.duration,
+              durationSource: asr.durationSource,
+              youtubeId: 'upload',
+            }
+          : undefined,
     })
   }
+
+  // ---- ASR upload flow (Phase 2: local media → faster-whisper word timestamps) ----
+  const startAsrUpload = (file: File) => {
+    if (asrPollRef.current) window.clearTimeout(asrPollRef.current)
+    setAsr({ phase: 'uploading', uploadPct: 0, jobStage: 'Uploading media…', jobPct: 0, fileName: file.name })
+    const fd = new FormData()
+    fd.append('file', file)
+    fd.append('title', file.name.replace(/\.[^.]+$/, ''))
+    fd.append('language', language)
+    const xhr = new XMLHttpRequest()
+    xhr.open('POST', '/api/source/transcribe')
+    xhr.upload.onprogress = (ev) => {
+      if (ev.lengthComputable) {
+        const pct = Math.round((ev.loaded / ev.total) * 100)
+        setAsr((s) => ({ ...s, uploadPct: pct }))
+      }
+    }
+    xhr.onload = () => {
+      try {
+        const data = JSON.parse(xhr.responseText)
+        if (xhr.status !== 202 && xhr.status !== 200) throw new Error(data.error ?? 'Upload failed')
+        setAsr((s) => ({ ...s, phase: 'working', jobId: data.jobId, jobStage: 'Queued…', jobPct: 1 }))
+        pollAsrJob(data.jobId)
+      } catch (err: unknown) {
+        setAsr((s) => ({ ...s, phase: 'error', error: err instanceof Error ? err.message : 'Upload failed' }))
+      }
+    }
+    xhr.onerror = () => setAsr((s) => ({ ...s, phase: 'error', error: 'Upload failed (network error)' }))
+    xhr.send(fd)
+  }
+
+  const pollAsrJob = (jobId: string) => {
+    const poll = async () => {
+      try {
+        const res = await fetch(`/api/jobs/${jobId}`)
+        const data = await res.json()
+        const job = data.job ?? {}
+        if (job.status === 'COMPLETED') {
+          const r = job.result ?? {}
+          setAsr((s) => ({
+            ...s,
+            phase: 'done',
+            jobStage: 'Transcription complete',
+            jobPct: 100,
+            projectId: r.projectId,
+            title: r.title,
+            duration: r.duration,
+            durationSource: r.durationSource,
+            words: r.words ?? [],
+            wordCount: r.wordCount ?? (r.words?.length ?? 0),
+          }))
+          return
+        }
+        if (job.status === 'FAILED') {
+          setAsr((s) => ({ ...s, phase: 'error', error: job.errorMessage ?? 'Transcription failed' }))
+          return
+        }
+        setAsr((s) => ({ ...s, jobStage: job.stage ?? s.jobStage, jobPct: job.progress ?? s.jobPct }))
+        asrPollRef.current = window.setTimeout(poll, 2000)
+      } catch {
+        asrPollRef.current = window.setTimeout(poll, 3000)
+      }
+    }
+    poll()
+  }
+
+  React.useEffect(() => () => { if (asrPollRef.current) window.clearTimeout(asrPollRef.current) }, [])
 
   const examples = [
     { label: 'Podcast', url: 'https://www.youtube.com/watch?v=aircAruvnKk' },
@@ -120,7 +226,7 @@ export function UrlInput({ onAnalyze, loading, error }: Props) {
             </div>
             <Button
               type="submit"
-              disabled={loading || !url.trim()}
+              disabled={loading || (!url.trim() && asr.phase !== 'done')}
               className="h-12 gap-2 rounded-xl px-6 text-base shadow-lg shadow-primary/30 sm:rounded-l-none"
             >
               {loading ? (
@@ -387,6 +493,92 @@ export function UrlInput({ onAnalyze, loading, error }: Props) {
                   <span className="text-[10px] text-muted-foreground">
                     {manualDuration ? `${Math.floor(Number(manualDuration) / 60)}m ${Math.round(Number(manualDuration) % 60)}s` : 'real duration via yt-dlp → innertube; never estimated'}
                   </span>
+                </div>
+
+                {/* ---- ASR upload flow ---- */}
+                <div className="mt-3 rounded-lg border border-violet-500/20 bg-violet-500/5 p-3">
+                  <div className="mb-2 flex items-center gap-1.5">
+                    <Mic className="h-3.5 w-3.5 text-violet-500" />
+                    <span className="text-xs font-semibold text-foreground">
+                      No transcript? Upload the media — server-side Whisper ASR
+                    </span>
+                    <span className="rounded bg-violet-500/15 px-1.5 py-0.5 text-[9px] font-bold text-violet-600 dark:text-violet-400">
+                      word-level timestamps
+                    </span>
+                  </div>
+                  <input
+                    ref={asrFileRef}
+                    type="file"
+                    accept="video/*,audio/*"
+                    className="hidden"
+                    onChange={(e) => {
+                      const f = e.target.files?.[0]
+                      if (f) startAsrUpload(f)
+                      e.target.value = ''
+                    }}
+                  />
+                  {asr.phase === 'idle' || asr.phase === 'error' ? (
+                    <div className="flex flex-wrap items-center gap-2">
+                      <Button
+                        type="button"
+                        size="sm"
+                        variant="outline"
+                        className="h-8 gap-1.5 border-violet-500/40 text-violet-600 hover:bg-violet-500/10 dark:text-violet-400"
+                        onClick={() => asrFileRef.current?.click()}
+                        disabled={loading}
+                      >
+                        <UploadCloud className="h-3.5 w-3.5" />
+                        Upload video / audio
+                      </Button>
+                      <span className="text-[10px] text-muted-foreground">
+                        MP4 · MOV · WebM · M4A · MP3 · WAV — max 500 MB. Duration is measured with ffprobe, speech is transcribed with faster-whisper.
+                      </span>
+                    </div>
+                  ) : (
+                    <div className="space-y-2">
+                      <div className="flex items-center justify-between text-[11px]">
+                        <span className="flex items-center gap-1.5 font-medium text-violet-600 dark:text-violet-400">
+                          {asr.phase === 'done' ? <BadgeCheck className="h-3.5 w-3.5" /> : <Loader2 className="h-3.5 w-3.5 animate-spin" />}
+                          {asr.phase === 'uploading' && `Uploading ${asr.fileName} — ${asr.uploadPct}%`}
+                          {asr.phase === 'working' && asr.jobStage}
+                          {asr.phase === 'done' && `${asr.fileName} — transcribed`}
+                        </span>
+                        <span className="font-mono tabular-nums text-muted-foreground">
+                          {asr.phase === 'uploading' ? `${asr.uploadPct}%` : asr.phase !== 'done' ? `${asr.jobPct}%` : ''}
+                        </span>
+                      </div>
+                      {asr.phase !== 'done' && (
+                        <div className="h-1.5 overflow-hidden rounded-full bg-muted">
+                          <div
+                            className="h-full rounded-full bg-gradient-to-r from-violet-500/60 via-violet-500 to-violet-500 transition-all"
+                            style={{ width: `${asr.phase === 'uploading' ? asr.uploadPct * 0.4 : 40 + asr.jobPct * 0.6}%` }}
+                          />
+                        </div>
+                      )}
+                      {asr.phase === 'done' && (
+                        <div className="flex flex-wrap items-center gap-1.5">
+                          <span className="inline-flex items-center gap-1 rounded bg-emerald-500/15 px-1.5 py-0.5 text-[10px] font-semibold text-emerald-600 dark:text-emerald-400">
+                            <BadgeCheck className="h-3 w-3" /> {asr.wordCount} words with timestamps
+                          </span>
+                          {asr.duration != null && (
+                            <span className="inline-flex items-center gap-1 rounded bg-muted px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground">
+                              <Clock className="h-3 w-3" /> {Math.floor(asr.duration / 60)}m {Math.round(asr.duration % 60)}s (ffprobe)
+                            </span>
+                          )}
+                          <span className="inline-flex items-center gap-1 rounded bg-violet-500/15 px-1.5 py-0.5 text-[10px] font-semibold text-violet-600 dark:text-violet-400">
+                            ASR grounded — hit Auto-Clip
+                          </span>
+                          <button
+                            type="button"
+                            className="ml-auto text-[10px] text-muted-foreground underline-offset-2 hover:underline"
+                            onClick={() => setAsr({ phase: 'idle', uploadPct: 0, jobStage: '', jobPct: 0 })}
+                          >
+                            reset
+                          </button>
+                        </div>
+                      )}
+                    </div>
+                  )}
                 </div>
               </div>
             </motion.div>

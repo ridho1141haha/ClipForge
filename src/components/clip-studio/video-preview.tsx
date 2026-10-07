@@ -2,7 +2,7 @@
 
 import * as React from 'react'
 import { motion } from 'framer-motion'
-import { Play, User, Clock, ExternalLink, Youtube, AlertCircle } from 'lucide-react'
+import { Play, User, Clock, ExternalLink, Youtube, AlertCircle, FileVideo } from 'lucide-react'
 import { fmtDuration, type YouTubeMeta } from '@/lib/youtube'
 
 interface Props {
@@ -32,17 +32,29 @@ export function VideoPreview({ meta, playStart }: Props) {
       transition={{ duration: 0.4 }}
       className="overflow-hidden rounded-2xl border border-border/80 bg-card shadow-xl"
     >
-      {/* Player */}
-      <div className="relative aspect-video w-full bg-black">
-        <iframe
-          key={iframeKey}
-          src={embedUrl}
-          title={meta.title}
-          className="h-full w-full"
-          allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share"
-          allowFullScreen
-        />
-      </div>
+      {/* Player — uploads have no YouTube embed; show a stylized placeholder */}
+      {meta.embedUrl ? (
+        <div className="relative aspect-video w-full bg-black">
+          <iframe
+            key={iframeKey}
+            src={embedUrl}
+            title={meta.title}
+            className="h-full w-full"
+            allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share"
+            allowFullScreen
+          />
+        </div>
+      ) : (
+        <div className="relative flex aspect-video w-full flex-col items-center justify-center gap-2 bg-gradient-to-br from-violet-950/60 via-card to-rose-950/40">
+          <div className="grid h-14 w-14 place-items-center rounded-2xl bg-violet-500/15 text-violet-400 ring-1 ring-violet-500/30">
+            <FileVideo className="h-7 w-7" />
+          </div>
+          <p className="text-sm font-semibold text-foreground">Local media — analyzed via ASR</p>
+          <p className="text-xs text-muted-foreground">
+            {meta.duration != null ? `${Math.floor(meta.duration / 60)}m ${Math.round(meta.duration % 60)}s` : ''} · duration measured by ffprobe · transcript by Whisper
+          </p>
+        </div>
+      )}
 
       {/* Meta */}
       <div className="space-y-3 p-4 sm:p-5">
@@ -67,6 +79,9 @@ export function VideoPreview({ meta, playStart }: Props) {
             rel="noreferrer"
             className="shrink-0 rounded-md p-1.5 text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
             aria-label="Open on YouTube"
+            onClick={(e) => {
+              if (!meta.url.startsWith('http')) e.preventDefault()
+            }}
           >
             <ExternalLink className="h-4 w-4" />
           </a>

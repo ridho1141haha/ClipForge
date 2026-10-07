@@ -187,8 +187,7 @@ export async function POST(req: NextRequest) {
       project = p
     }
 
-    // transcript: body wins, then project record
-    const transcript = ((body.transcript ?? '').trim() || project?.transcript?.trim() || '') as string
+    // words: body wins, then project record
     let words: TWord[] = Array.isArray(body.words)
       ? body.words.filter((w) => typeof w?.word === 'string' && isFinite(w?.start) && isFinite(w?.end)).map((w) => ({ word: w.word, start: Number(w.start), end: Number(w.end) }))
       : []
@@ -198,6 +197,8 @@ export async function POST(req: NextRequest) {
         if (Array.isArray(parsed)) words = parsed
       } catch { /* corrupted JSON → treat as absent */ }
     }
+    // transcript: body wins, then project record, then synthesized from word timestamps
+    const transcript = ((body.transcript ?? '').trim() || project?.transcript?.trim() || (words.length > 0 ? words.map((w) => w.word).join(' ') : '')) as string
     const transcriptSource = body.transcriptSource ?? project?.transcriptSource ?? (transcript ? 'manual' : 'none')
     const hasTranscript = transcript.length > 0
 

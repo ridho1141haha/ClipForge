@@ -10,7 +10,7 @@ const execFileAsync = promisify(execFile)
 // Types
 // ---------------------------------------------------------------------------
 
-export type DurationSource = 'yt-dlp' | 'innertube' | 'user-provided' | 'unavailable'
+export type DurationSource = 'yt-dlp' | 'innertube' | 'ffprobe' | 'user-provided' | 'unavailable'
 export type TranscriptSource = 'youtube-captions' | 'manual' | 'asr' | 'none'
 
 export interface WordTimestamp {

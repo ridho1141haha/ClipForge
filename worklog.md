@@ -106,3 +106,28 @@ Work Log (tests executed + exact results):
 Stage Summary:
 - Status: MVP+ (beta). Analysis pipeline real & verified end-to-end; render pipeline frame-accurate; security enforced; all exports honest.
 - Remaining limitations: (1) YouTube metadata blocked on this sandbox IP → manual duration/transcript flows are first-class there; (2) ASR (faster-whisper) for uploaded files not yet integrated (schema supports words end-to-end); (3) B-roll/SFX/music/animations remain preview-only recommendations (clearly labeled); (4) renderer extraction accuracy now exact but slower (single re-encode).
+
+---
+Task ID: cron-1 (webDevReview round 2)
+Agent: Z.ai Code (autonomous review)
+Task: Status assessment + QA; ASR integration (uploads → faster-whisper word timestamps); styling additions.
+
+Work Log:
+- Status assessment: services healthy (Next 200, renderer up), unit 48/48 + live 17/17 green before starting.
+- NEW FEATURE — real ASR for uploaded media (closes the last pipeline gap):
+  • scripts/asr-transcribe.py: faster-whisper tiny/int8 CPU worker, word_timestamps=True + VAD, JSON output {text, words[{word,start,end}], language, duration, model}, explicit error codes (ASR_UNAVAILABLE / NO_SPEECH / ASR_FAILED).
+  • POST /api/source/transcribe (multipart ≤500MB): ffprobe real duration (durationSource='ffprobe'), ffmpeg 16k mono extraction, ASR worker (10 min timeout), persists Project (transcriptSource='asr', transcriptWords) + ASR model metadata into analysisMeta; SourceJob states QUEUED→DOWNLOADING→TRANSCRIBING→COMPLETED/FAILED; rate-limited 6/min; owner-scoped.
+  • Verified with REAL speech (TTS-generated 38s English narration): 84 words with precise timestamps ("Welcome" 0→0.48s…), duration 38.1s via ffprobe; ASR words fed through /api/clips/analyze → verified hook (total 82.7, ctx=EXTEND).
+- Frontend upload flow (url-input.tsx): "Upload video / audio" in Advanced panel → XHR upload progress → job polling (DOWNLOADING/TRANSCRIBING stages shown) → done state shows word count + ffprobe duration chips → Auto-Clip consumes words+projectId+preResolvedMeta (no YouTube call). Auto-Clip button enabled for upload-mode.
+- Browser-verified end-to-end: real file input upload → "Running faster-whisper… 45%" → "84 words with timestamps" → Auto-Clip → 2 clips, "verified in transcript", "ctx pass", POST badges; Source Data Provenance panel: duration 38s·ffprobe + transcript Whisper ASR + 84 word timestamps.
+- BUG FIXED: analyze body used stale projectId state on first ASR run → transcript fallback never triggered → ungrounded result ("Unable to analyze without transcript"). Fixed via preSetProjectId ?? projectId; analyze API also synthesizes transcript from words when text absent (belt-and-braces).
+- STYLING/UX additions:
+  • SourceStatusPanel (new component): honest provenance chips (duration source / transcript source / word-timestamp count) + explicit rose warning when no transcript + "View transcript" entry point.
+  • TranscriptViewer dialog (new): full transcript, live search with hit count + <mark> highlighting, copy button, hoverable word-timestamp chips, thin scrollbars; works for ASR (words), manual paste (text) and project-loaded sources.
+  • video-preview.tsx: stylized "Local media — analyzed via ASR" placeholder card for uploads (no broken empty YouTube iframe); external link guarded for upload:// URLs.
+  • loadProject: upload projects render with Local upload provider + no embed.
+- QA after changes: tsc clean, eslint clean, unit 48/48, live 17/17, transcript search "memory" → 2 hits highlighted in UI.
+
+Stage Summary:
+- Pipeline is now closed end-to-end including uploads: file → ffprobe duration → Whisper word timestamps → transcript-grounded analysis → validated clips. transcriptSource='asr' is a first-class grounded source.
+- Remaining: PostgreSQL prep, shared rate-limit store, larger ASR models (base/small) as an option, renderer progress reporting granularity.

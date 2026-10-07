@@ -41,6 +41,7 @@ import {
   type FilterKey,
 } from '@/components/clip-studio/sort-filter-bar'
 import { ReanalyzePanel } from '@/components/clip-studio/reanalyze-panel'
+import { SourceStatusPanel, TranscriptViewer } from '@/components/clip-studio/source-status'
 import { ShortcutsHint } from '@/components/clip-studio/shortcuts-hint'
 import { EditPlanView } from '@/components/clip-studio/edit-plan-view'
 import { AutoEditPlayer } from '@/components/clip-studio/auto-edit-player'
@@ -80,6 +81,9 @@ export default function Home() {
   const [multiSelected, setMultiSelected] = React.useState<Set<number>>(new Set())
   const [playStart, setPlayStart] = React.useState<number | null>(null)
   const [projectId, setProjectId] = React.useState<string | null>(null)
+  const [sourceTranscript, setSourceTranscript] = React.useState<string | null>(null)
+  const [sourceWords, setSourceWords] = React.useState<{ word: string; start: number; end: number }[] | null>(null)
+  const [transcriptOpen, setTranscriptOpen] = React.useState(false)
   const [error, setError] = React.useState<string | null>(null)
   const [currentPlatform, setCurrentPlatform] = React.useState('shorts')
   const [currentStyle, setCurrentStyle] = React.useState('podcast')
@@ -174,8 +178,12 @@ export default function Home() {
       transcript?: string,
       manualDuration?: number,
       isReanalyze = false,
+      words?: { word: string; start: number; end: number }[],
+      preResolvedMeta?: Partial<YouTubeMeta> & { title: string },
+      preSetProjectId?: string,
     ) => {
       setError(null)
+      if (preSetProjectId) setProjectId(preSetProjectId)
       if (!isReanalyze) {
         setPhase('fetching')
         setMeta(null)
@@ -195,7 +203,24 @@ export default function Home() {
 
       // 1. fetch metadata (only if not already loaded)
       let localMeta: YouTubeMeta | null = meta
-      if (!isReanalyze || !localMeta) {
+      if (preResolvedMeta) {
+        // e.g. upload/ASR flow — duration + title measured locally, no YouTube call
+        localMeta = {
+          youtubeId: preResolvedMeta.youtubeId ?? 'upload',
+          url: preResolvedMeta.url ?? 'upload://local',
+          title: preResolvedMeta.title,
+          author: preResolvedMeta.author ?? null,
+          thumbnail: preResolvedMeta.thumbnail ?? '',
+          provider: 'Local upload',
+          duration: preResolvedMeta.duration ?? null,
+          durationSource: preResolvedMeta.durationSource ?? 'ffprobe',
+          requiresManualDuration: false,
+          description: null,
+          embedUrl: '',
+          embedUrlAutoplay: '',
+        }
+        setMeta(localMeta)
+      } else if (!isReanalyze || !localMeta) {
         try {
           const res = await fetch('/api/youtube/meta', {
             method: 'POST',
@@ -225,7 +250,7 @@ export default function Home() {
       // ClipForge never guesses a duration.
       const effDuration = manualDuration && manualDuration > 0 ? manualDuration : localMeta.duration
       if (!effDuration || effDuration <= 0) {
-        setError('Real video duration is unavailable (YouTube is blocking metadata from this server). Enter the duration manually in Advanced options, then analyze again.')
+        setError('Real video duration is unavailable (YouTube is blocking metadata from this server). Enter the duration manually in Advanced options, upload the media for ASR, then analyze again.')
         setPhase('idle')
         setReanalyzing(false)
         toast({
@@ -246,18 +271,20 @@ export default function Home() {
         setMeta(localMeta)
       }
       try {
+        const effProjectId = preSetProjectId ?? projectId
         const res = await fetch('/api/clips/analyze', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
-            projectId: projectId ?? undefined,
+            projectId: effProjectId ?? undefined,
             url: localMeta.url,
             title: localMeta.title,
             author: localMeta.author,
             duration: effDuration,
             durationSource: manualDuration && manualDuration > 0 && localMeta.duration == null ? 'user-provided' : localMeta.durationSource ?? 'unknown',
             transcript,
-            transcriptSource: transcript ? 'manual' : 'none',
+            transcriptSource: words ? 'asr' : transcript ? 'manual' : 'none',
+            words,
             platform,
             style,
             targetDuration,
@@ -298,7 +325,7 @@ export default function Home() {
           recommendation: c.recommendation,
           reason: c.reason,
           clipTranscript: c.transcriptExcerpt ?? c.clipTranscript ?? undefined,
-          clipWords: c.clipWords ?? undefined,
+          clipWords: c.clipWords ?? (words ? words.filter((w) => w.end > (c.start ?? 0) && w.start < (c.end ?? 0)) : undefined),
           hasPlan: false,
         }))
         setClips(newClips)
@@ -327,8 +354,24 @@ export default function Home() {
   )
 
   const handleAnalyze = React.useCallback(
-    (params: AnalyzeParams) =>
-      analyze(params.url, params.platform, params.clipCount, params.style, params.targetDuration, params.language, params.transcript, params.manualDuration, false),
+    (params: AnalyzeParams) => {
+      setSourceTranscript(params.transcript ?? null)
+      setSourceWords(params.words ?? null)
+      return analyze(
+        params.url,
+        params.platform,
+        params.clipCount,
+        params.style,
+        params.targetDuration,
+        params.language,
+        params.transcript,
+        params.manualDuration,
+        false,
+        params.words,
+        params.preResolvedMeta,
+        params.projectId,
+      )
+    },
     [analyze],
   )
 
@@ -853,22 +896,25 @@ export default function Home() {
       const data = await res.json()
       if (!res.ok) throw new Error(data.error)
       const proj = data.project
+      const isUpload = String(proj.youtubeId ?? '').startsWith('upload-')
       const loadedMeta: YouTubeMeta = {
         youtubeId: proj.youtubeId,
         url: proj.url,
         title: proj.title,
         author: proj.author,
         thumbnail: proj.thumbnail ?? '',
-        provider: 'YouTube',
+        provider: isUpload ? 'Local upload' : 'YouTube',
         duration: proj.duration ?? null,
         durationSource: proj.durationSource ?? 'unknown',
         requiresManualDuration: proj.duration == null,
         description: proj.description,
-        embedUrl: `https://www.youtube.com/embed/${proj.youtubeId}`,
-        embedUrlAutoplay: `https://www.youtube.com/embed/${proj.youtubeId}?autoplay=1&rel=0`,
+        embedUrl: isUpload ? '' : `https://www.youtube.com/embed/${proj.youtubeId}`,
+        embedUrlAutoplay: isUpload ? '' : `https://www.youtube.com/embed/${proj.youtubeId}?autoplay=1&rel=0`,
       }
       setMeta(loadedMeta)
       setProjectId(proj.id)
+      setSourceTranscript(proj.transcript ?? null)
+      setSourceWords(parseDb(proj.transcriptWords) ?? null)
       const loadedClips: SuggestedClip[] = (proj.clips ?? []).map((c: any) => ({
         id: c.id,
         title: c.title,
@@ -1187,7 +1233,7 @@ export default function Home() {
                   className="space-y-6"
                 >
                   {/* content summary banner */}
-                  {analyzeResult?.contentSummary && (
+                {analyzeResult?.contentSummary && (
                     <div className="flex items-start gap-3 rounded-xl border border-primary/20 bg-primary/5 p-4">
                       <div className="grid h-8 w-8 shrink-0 place-items-center rounded-lg bg-primary/10 text-primary">
                         <Sparkles className="h-4 w-4" />
@@ -1221,6 +1267,15 @@ export default function Home() {
                     currentCount={clips.length}
                     onReanalyze={handleReanalyze}
                     loading={reanalyzing}
+                  />
+
+                  {/* source data provenance */}
+                  <SourceStatusPanel
+                    meta={meta}
+                    analyzeResult={analyzeResult}
+                    transcript={sourceTranscript}
+                    words={sourceWords}
+                    onOpenTranscript={() => setTranscriptOpen(true)}
                   />
 
                   {/* stats bar */}
@@ -1510,6 +1565,14 @@ export default function Home() {
         clip={editClip}
         duration={analyzeResult?.estimatedDuration ?? meta?.duration ?? 0}
         onSave={saveClipFromEditor}
+      />
+      <TranscriptViewer
+        open={transcriptOpen}
+        onOpenChange={setTranscriptOpen}
+        title={meta?.title}
+        transcript={sourceTranscript}
+        words={sourceWords}
+        source={analyzeResult?.transcriptSource ?? meta?.durationSource}
       />
       <ExportDialog
         open={exportOpen}
