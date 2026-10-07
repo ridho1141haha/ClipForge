@@ -2,7 +2,7 @@
 
 import * as React from 'react'
 import { motion } from 'framer-motion'
-import { Play, User, Clock, ExternalLink, Youtube, AlertCircle, FileVideo, HardDrive } from 'lucide-react'
+import { Play, User, Clock, ExternalLink, Youtube, AlertCircle, FileVideo, HardDrive, RefreshCw, FolderX } from 'lucide-react'
 import { fmtDuration, type YouTubeMeta } from '@/lib/youtube'
 
 interface Props {
@@ -11,12 +11,45 @@ interface Props {
   /** Owner-scoped stream URL — when present, real downloaded source playback */
   mediaUrl?: string | null
   mediaSize?: number | null
+  /** Bump to force the <video> to reload (e.g. after a re-prepare re-downloads the file) */
+  mediaKey?: number
+  /** Called when the source file is confirmed missing on disk (HTTP 410 from /api/media) */
+  onMediaMissing?: () => void
+  /** True while the parent runs the re-prepare job — disables the heal button */
+  repreparing?: boolean
 }
 
-export function VideoPreview({ meta, playStart, mediaUrl, mediaSize }: Props) {
+export function VideoPreview({ meta, playStart, mediaUrl, mediaSize, mediaKey, onMediaMissing, repreparing }: Props) {
   const [iframeKey, setIframeKey] = React.useState(0)
   const [embedUrl, setEmbedUrl] = React.useState(meta.embedUrl)
   const videoRef = React.useRef<HTMLVideoElement | null>(null)
+  // 'ok' = playing/neutral; 'missing' = probed endpoint, file confirmed gone;
+  // 'error' = playback failed for a non-missing reason (generic message only)
+  const [probeState, setProbeState] = React.useState<'ok' | 'checking' | 'missing' | 'error'>('ok')
+
+  // reset the probe whenever the source (or reload key) changes
+  React.useEffect(() => {
+    setProbeState('ok')
+  }, [mediaUrl, mediaKey])
+
+  /**
+   * The <video> error event is ambiguous (code 4 covers missing, blocked,
+   * unsupported). Probe our own owner-scoped endpoint ONCE to learn the real
+   * reason: 410 = file missing on disk (evicted/removed) → offer auto-heal;
+   * 409 = state changed server-side → treat as missing too; anything else is
+   * a generic error. No speculative requests while playback is healthy.
+   */
+  const onVideoError = React.useCallback(async () => {
+    if (!mediaUrl || probeState === 'checking') return
+    setProbeState('checking')
+    try {
+      const r = await fetch(mediaUrl, { headers: { Range: 'bytes=0-1' } })
+      if (r.status === 410 || r.status === 409) setProbeState('missing')
+      else setProbeState('error')
+    } catch {
+      setProbeState('error')
+    }
+  }, [mediaUrl, probeState])
 
   React.useEffect(() => {
     // Seek to clip start when a clip is selected
@@ -44,9 +77,31 @@ export function VideoPreview({ meta, playStart, mediaUrl, mediaSize }: Props) {
       className="overflow-hidden rounded-2xl border border-border/80 bg-card shadow-xl"
     >
       {/* Player — real downloaded source > YouTube embed > upload placeholder */}
-      {mediaUrl ? (
+      {mediaUrl && probeState === 'missing' ? (
+        <div className="relative flex aspect-video w-full flex-col items-center justify-center gap-3 bg-gradient-to-br from-amber-950/40 via-card to-rose-950/30 p-6">
+          <div className="grid h-14 w-14 place-items-center rounded-2xl bg-amber-500/15 text-amber-400 ring-1 ring-amber-500/30">
+            <FolderX className="h-7 w-7" />
+          </div>
+          <p className="text-sm font-semibold text-foreground">Source file is missing on disk</p>
+          <p className="max-w-sm text-center text-xs leading-relaxed text-muted-foreground">
+            The cached source was removed (media cache policy or manual cleanup). Your clips, scores, and edit plans are all intact — re-prepare re-downloads the source and re-enables preview + direct rendering.
+          </p>
+          {onMediaMissing && (
+            <button
+              type="button"
+              onClick={onMediaMissing}
+              disabled={repreparing}
+              className="inline-flex items-center gap-2 rounded-lg bg-primary px-4 py-2 text-xs font-semibold text-primary-foreground shadow transition hover:bg-primary/90 disabled:cursor-not-allowed disabled:opacity-60"
+            >
+              {repreparing ? <RefreshCw className="h-3.5 w-3.5 animate-spin" /> : <RefreshCw className="h-3.5 w-3.5" />}
+              {repreparing ? 'Re-preparing… (downloading source)' : 'Re-prepare source'}
+            </button>
+          )}
+        </div>
+      ) : mediaUrl ? (
         <div className="relative aspect-video w-full bg-black">
           <video
+            key={mediaKey ?? 0}
             ref={videoRef}
             src={mediaUrl}
             controls
@@ -54,6 +109,7 @@ export function VideoPreview({ meta, playStart, mediaUrl, mediaSize }: Props) {
             playsInline
             className="h-full w-full"
             aria-label={`Source video: ${meta.title}`}
+            onError={onVideoError}
           />
           <div className="pointer-events-none absolute left-3 top-3 flex items-center gap-1 rounded-md bg-emerald-500/90 px-2 py-1 text-[10px] font-bold text-white shadow">
             <HardDrive className="h-3 w-3" />

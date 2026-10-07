@@ -26,6 +26,13 @@ import { outputDuration as planOutputDuration } from '@/lib/subtitles'
 import { fmtTime, fmtDuration } from '@/lib/youtube'
 import type { Cut } from '@/lib/subtitles'
 
+/** ms → m:ss (clock for elapsed / ETA readouts). */
+function fmtClock(ms: number): string {
+  const s = Math.max(0, Math.round(ms / 1000))
+  const m = Math.floor(s / 60)
+  return `${m}:${String(s % 60).padStart(2, '0')}`
+}
+
 interface Props {
   plan: EditPlan | null
   /** current project — enables the server-side source media (render without upload) */
@@ -52,9 +59,14 @@ export function UploadRender({ plan, projectId, projectMedia }: Props) {
   const [notice, setNotice] = React.useState<string | null>(null)
   const [cancelling, setCancelling] = React.useState(false)
   const [error, setError] = React.useState<string | null>(null)
+  const [timing, setTiming] = React.useState<{ elapsedMs: number; etaMs: number | null }>({ elapsedMs: 0, etaMs: null })
   const fileInputRef = React.useRef<HTMLInputElement>(null)
   const pollRef = React.useRef<number>(0)
   const stoppedRef = React.useRef(false)
+  // ETA tracker: rolling (time, progress) samples from REAL poll data — no fake
+  // countdown. ETA comes from the recent slope, clamped to sane bounds.
+  const samplesRef = React.useRef<{ t: number; p: number }[]>([])
+  const startRef = React.useRef<number>(0)
 
   // keep the default source in sync when the project state changes
   React.useEffect(() => {
@@ -110,6 +122,9 @@ export function UploadRender({ plan, projectId, projectMedia }: Props) {
     setNotice(null)
     setRenderedUrl(null)
     setRenderedInfo(null)
+    samplesRef.current = []
+    startRef.current = Date.now()
+    setTiming({ elapsedMs: 0, etaMs: null })
     try {
       const recipe = buildRenderRecipe(plan, 'upload')
       // CRITICAL: send the RENDERER recipe JSON (keep_ranges + subtitles_ass +
@@ -150,6 +165,25 @@ export function UploadRender({ plan, projectId, projectMedia }: Props) {
     }
   }
 
+  const recordSample = (p: number) => {
+    const now = Date.now()
+    const samples = samplesRef.current
+    samples.push({ t: now, p })
+    if (samples.length > 8) samples.shift()
+    const elapsedMs = now - startRef.current
+    // slope from the earliest sample at least 2s old (avoid divide-by-tiny noise)
+    let etaMs: number | null = null
+    const first = samples.find((s) => now - s.t >= 2000) ?? (samples.length >= 4 ? samples[0] : undefined)
+    if (first && now - first.t >= 2000 && p > first.p) {
+      const slope = (p - first.p) / (now - first.t) // % per ms
+      const remaining = Math.max(0, 100 - p)
+      const eta = remaining / slope
+      // clamp: 2s … 12 min (renders here are 20-60s outputs on a local box)
+      etaMs = Math.min(12 * 60_000, Math.max(2_000, eta))
+    }
+    setTiming({ elapsedMs, etaMs })
+  }
+
   const cancelRender = async () => {
     if (!jobId || cancelling) return
     setCancelling(true)
@@ -175,6 +209,7 @@ export function UploadRender({ plan, projectId, projectMedia }: Props) {
         const job = await res.json()
         setProgress(job.progress ?? 0)
         setStage(job.stage ?? '')
+        recordSample(job.progress ?? 0)
         if (job.status === 'done') {
           setPhase('done')
           setRenderedInfo({
@@ -238,6 +273,8 @@ export function UploadRender({ plan, projectId, projectMedia }: Props) {
     setError(null)
     setNotice(null)
     setCancelling(false)
+    samplesRef.current = []
+    setTiming({ elapsedMs: 0, etaMs: null })
   }
 
   const downloadRendered = () => {
@@ -555,15 +592,35 @@ export function UploadRender({ plan, projectId, projectMedia }: Props) {
               {/* shimmer overlay */}
               <div className="absolute inset-0 bg-gradient-to-r from-transparent via-white/20 to-transparent shimmer" />
             </div>
-            {/* stage steps */}
+            {/* elapsed + honest ETA (slope of real poll samples, shown once stable) */}
+            <div className="flex items-center justify-between text-[10px] text-muted-foreground tabular-nums">
+              <span>elapsed {fmtClock(timing.elapsedMs)}</span>
+              <span>
+                {timing.etaMs != null ? (
+                  <>≈ {fmtClock(timing.etaMs)} left</>
+                ) : (
+                  <span className="animate-pulse">estimating…</span>
+                )}
+              </span>
+            </div>
+            {/* stage steps — thresholds MATCH the renderer's real weights:
+                queued 0 → prepare 8 → encode 25–92 (ffmpeg progress pipe) →
+                finalize 95 → done 100. Labels renamed to what actually runs
+                (single-pass trim+concat+filters; there is no separate concat stage). */}
             <div className="flex items-center justify-between text-[10px] text-muted-foreground">
-              {[sourceMode === 'local' ? 'Queue' : 'Upload', 'Extract', 'Concat', 'Encode', 'Done'].map((s, i) => {
-                const thresholds = [0, 5, 35, 50, 100]
-                const active = progress >= thresholds[i]
-                const current = progress < (thresholds[i + 1] ?? 100)
+              {((): { label: string; at: number }[] => [
+                { label: sourceMode === 'local' ? 'Queue' : 'Upload', at: 0 },
+                { label: 'Prepare', at: 8 },
+                { label: 'Encode', at: 25 },
+                { label: 'Finalize', at: 93 },
+                { label: 'Done', at: 100 },
+              ])().map((s, i, arr) => {
+                const next = arr[i + 1]?.at ?? 101
+                const active = progress >= s.at
+                const current = progress < next
                 return (
                   <span
-                    key={s}
+                    key={s.label}
                     className={`flex items-center gap-1 ${
                       active ? 'text-primary' : 'text-muted-foreground/40'
                     }`}
@@ -575,7 +632,7 @@ export function UploadRender({ plan, projectId, projectMedia }: Props) {
                     ) : (
                       <span className="h-2.5 w-2.5 rounded-full border border-current" />
                     )}
-                    {s}
+                    {s.label}
                   </span>
                 )
               })}
@@ -600,6 +657,7 @@ export function UploadRender({ plan, projectId, projectMedia }: Props) {
                 <p className="text-sm font-semibold text-emerald-700 dark:text-emerald-400">Render complete!</p>
                 <p className="text-xs text-muted-foreground">
                   {renderedInfo && `${renderedInfo.width}×${renderedInfo.height} · ${fmtDuration(renderedInfo.duration)} · ${(renderedInfo.size / 1024 / 1024).toFixed(2)} MB`}
+                  {timing.elapsedMs > 0 && ` · rendered in ${fmtClock(timing.elapsedMs)}`}
                 </p>
               </div>
               {renderedInfo && !renderedInfo.durationOk && (

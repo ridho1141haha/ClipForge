@@ -83,6 +83,9 @@ export default function Home() {
   const [projectId, setProjectId] = React.useState<string | null>(null)
   // server-side source media state for the CURRENT project (render-without-upload)
   const [projectMedia, setProjectMedia] = React.useState<{ state?: string | null; size?: number | null; error?: string | null } | null>(null)
+  // bumped after a re-prepare re-downloads the source → forces <video> reload
+  const [mediaReloadKey, setMediaReloadKey] = React.useState(0)
+  const [repreparingMedia, setRepreparingMedia] = React.useState(false)
   const [sourceTranscript, setSourceTranscript] = React.useState<string | null>(null)
   const [sourceWords, setSourceWords] = React.useState<{ word: string; start: number; end: number }[] | null>(null)
   const [wordTiming, setWordTiming] = React.useState<'measured' | 'estimated' | 'mixed' | null>(null)
@@ -1036,6 +1039,67 @@ export default function Home() {
     }
   }
 
+  // ---- auto-heal: re-prepare the CURRENT project's source media (410 flow) ----
+  // The cached file can disappear (media-cache LRU eviction, manual cleanup).
+  // Re-preparing with projectId re-downloads the source INTO THE SAME PROJECT —
+  // clips, scores, and edit plans are untouched. The job's primary purpose is
+  // metadata + transcript; a media-download failure degrades honestly.
+  const handleReprepareMedia = React.useCallback(async () => {
+    if (!projectId || !meta?.url || repreparingMedia) return
+    setRepreparingMedia(true)
+    toast({ title: 'Re-preparing source', description: 'Re-downloading the source video — this can take a minute…' })
+    try {
+      const res = await fetch('/api/source/prepare', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ url: meta.url, projectId }),
+      })
+      const data = await res.json()
+      if (!res.ok) throw new Error(data.error ?? 'Re-prepare failed')
+      const jobId: string = data.jobId
+      // poll to completion (media download can be slow; same window as first prepare)
+      for (let i = 0; i < 900; i++) {
+        await new Promise((r) => setTimeout(r, 1500))
+        let job: Record<string, unknown>
+        try {
+          const jr = await fetch(`/api/jobs/${jobId}`)
+          const jd = await jr.json()
+          if (!jr.ok) throw new Error(jd.error ?? 'Job lost')
+          job = jd.job ?? {}
+        } catch {
+          continue // transient poll error — keep polling
+        }
+        if (job.status === 'COMPLETED') {
+          const result = (job.result as Record<string, unknown>) ?? {}
+          const lm = result.localMedia as { state?: string; sizeBytes?: number; error?: string } | undefined
+          setProjectMedia(lm ? { state: lm.state ?? null, size: lm.sizeBytes ?? null, error: lm.error ?? null } : null)
+          if (lm?.state === 'ready') {
+            setMediaReloadKey((k) => k + 1)
+            toast({
+              title: 'Source restored',
+              description: `Media re-downloaded (${((lm.sizeBytes ?? 0) / 1024 / 1024).toFixed(1)} MB) — preview and direct rendering are back.`,
+            })
+          } else {
+            toast({
+              title: 'Re-prepare finished, but the download failed',
+              description: `${lm?.error ?? 'Media download unavailable'} — you can still render via file upload.`,
+              variant: 'destructive',
+            })
+          }
+          return
+        }
+        if (job.status === 'FAILED') {
+          throw new Error((job.errorMessage as string) ?? 'Re-prepare job failed')
+        }
+      }
+      throw new Error('Re-prepare timed out')
+    } catch (e: any) {
+      toast({ title: 'Re-prepare failed', description: e.message, variant: 'destructive' })
+    } finally {
+      setRepreparingMedia(false)
+    }
+  }, [projectId, meta?.url, repreparingMedia, toast])
+
   // ---- load project ----
   const loadProject = async (p: Project) => {
     try {
@@ -1483,8 +1547,11 @@ export default function Home() {
                       <VideoPreview
                         meta={meta}
                         playStart={playStart}
-                        mediaUrl={projectId && projectMedia?.state === 'ready' ? `/api/media/${projectId}` : null}
+                        mediaUrl={projectId && projectMedia?.state === 'ready' ? `/api/media/${projectId}${mediaReloadKey ? `?v=${mediaReloadKey}` : ''}` : null}
                         mediaSize={projectMedia?.size ?? null}
+                        mediaKey={mediaReloadKey}
+                        onMediaMissing={meta?.url ? handleReprepareMedia : undefined}
+                        repreparing={repreparingMedia}
                       />
                       <Timeline
                         clips={clips}
@@ -1774,14 +1841,14 @@ export default function Home() {
       <AutoEditPlayer
         plan={currentPlan}
         youtubeId={meta?.youtubeId ?? ''}
-        mediaUrl={projectId && projectMedia?.state === 'ready' ? `/api/media/${projectId}` : null}
+        mediaUrl={projectId && projectMedia?.state === 'ready' ? `/api/media/${projectId}${mediaReloadKey ? `?v=${mediaReloadKey}` : ''}` : null}
         open={autoEditOpen}
         onClose={() => setAutoEditOpen(false)}
       />
       <RemotionPlayer
         plan={currentPlan}
         youtubeId={meta?.youtubeId ?? ''}
-        mediaUrl={projectId && projectMedia?.state === 'ready' ? `/api/media/${projectId}` : null}
+        mediaUrl={projectId && projectMedia?.state === 'ready' ? `/api/media/${projectId}${mediaReloadKey ? `?v=${mediaReloadKey}` : ''}` : null}
         open={remotionOpen}
         onClose={() => setRemotionOpen(false)}
       />

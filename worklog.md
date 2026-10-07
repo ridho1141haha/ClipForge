@@ -376,3 +376,30 @@ Stage Summary:
   3) Render progress realism: stage timings exist in logs; surface per-stage ETA in the UI (probe→extract→render→finalize weights).
   4) Cheap auto-heal: on media GET 410 (file missing), offer one-click re-prepare in the UI (state machinery already honest).
 - Risks: none new. Standing: YouTube egress is IP/heat dependent (honest degradation everywhere); in-memory burst limiter (soft limits are DB-backed); B-roll/SFX/music preview-only.
+
+---
+Task ID: cron-review-20261008-3 (webDevReview round 7)
+Agent: Z.ai Code (Principal Engineer)
+Task: Status assessment + browser QA + next-priority features: render progress realism (per-stage ETA) and media-410 auto-heal.
+
+Work Log:
+- BASELINE @ ece9ffe (clean tree, pushed to origin/main): tsc clean · eslint clean · unit 225/225 · dev server + renderer healthy. Fresh-browser console: 0 errors/warnings. All four round-5/6 priorities confirmed complete (players wired, PLOpsj6DVQ8 investigated + documented, LRU live, soft limits live).
+- 🆕 FEATURE A — render progress realism (upload-render.tsx):
+  • The old step indicator showed Queue/Extract/Concat/Encode/Done with hand-picked thresholds [0,5,35,50,100] that never matched the renderer's real weights — and there IS no separate concat stage (single-pass trim+concat+filters). Replaced with renderer-aligned stages: Queue/Upload (0) → Prepare (8) → Encode (25, driven by the ffmpeg -progress pipe 25→92) → Finalize (93) → Done (100).
+  • Honest ETA: rolling (time, progress) samples from REAL poll data (8-sample window, slope needs ≥2s span; no fake countdown before the slope is stable → animated "estimating…"), clamped 2s–12min; elapsed clock alongside. Live-verified: ETA counted down coherently (3:01 → 2:20 → 1:29 → 0:49 → done) during a real 2:39 render.
+  • Result card now shows total render time ("rendered in 2:39") — which exposed a truth: earlier notes quoting "46s" were the OUTPUT duration, not render time; renders genuinely take minutes (zoompan@1080x1920 + subtitle burn + medium preset). The ETA UI is exactly the honesty upgrade this needed.
+- 🆕 FEATURE B — media-410 auto-heal (video-preview.tsx + page.tsx):
+  • The <video> error event is ambiguous (code 4 = missing OR blocked OR unsupported). VideoPreview now probes its own owner-scoped endpoint ONCE on playback failure (Range GET): 410/409 → confirmed missing → amber heal card ("Source file is missing on disk — clips, scores, and edit plans are all intact"); anything else → generic error, no speculative requests while healthy.
+  • NEW handleReprepareMedia in page.tsx: POST /api/source/prepare { url, projectId } re-downloads the source INTO THE SAME PROJECT (clips/plans untouched), polls the job (~22min window), then updates projectMedia + bumps mediaReloadKey → ?v=N cache-buster + <video key> remount forces a fresh load; AutoEdit/Remotion players get the same busting URL. Honest failure toast (download failed → upload path still offered).
+  • FULL E2E VERIFIED IN BROWSER: golden path (URL → 4 clips → LOCAL SOURCE) → simulated LRU eviction (rm source.mp4) → project reload shows the amber heal card (broken player replaced, clips intact) → click "Re-prepare source" (button disables + spinner "Re-preparing… (downloading source)") → ~12s later toast "Source restored", LOCAL SOURCE · 32.3 MB badge back, <video> readyState 4 (3:33 duration, ?v=1), file physically back on disk.
+  • BONUS VERIFICATION: full render from the restored server source succeeded (1080×1920 · 36s · 24.62 MB · rendered in 2:39, real footage + burned hook subtitle) — the heal loop restores the COMPLETE render-ready state.
+- REGRESSION GATES (all after changes): tsc clean · eslint clean · unit 225/225 · golden E2E 17/17 · render-security 20/20 · url-render 17/17 (429-aware retry absorbed the shared burst window) · long-source scale 15/15 · live 17/17.
+
+Stage Summary:
+- Two UX-honesty gaps closed: the render progress UI now tells the truth (real stages + real ETA + total time), and a missing source file self-heals in one click instead of dead-ending on a broken player.
+- Next round suggestions (priority order):
+  1) Cover-frame picker: pick the Short's cover from plan keyframes (renderer extracts a JPG at a chosen timestamp — small honest renderer addition, real Shorts value).
+  2) Batch render queue: render all POST-flagged clips sequentially with per-clip progress (the pipeline + limits machinery already supports it; UI is the work).
+  3) Word-precision subtitle QA on a fetchable long source (PLOpsj6DVQ8 still video-flagged; IP heat rules: ≤1 probe/hour).
+  4) docs/ARCHITECTURE.md refresh (players/auto-heal/limits/LRU have evolved since it was written).
+- Risks: none new. Standing: YouTube egress IP/heat dependent; in-memory burst limiter (soft limits DB-backed); B-roll/SFX/music preview-only; render artifacts expire after 10 min.
