@@ -307,6 +307,43 @@ console.log('\n== P0-1: json3 word timing — measured vs estimated ==')
   assert(eq(s.words[1].start, 5.4), 'srv3 word offset honored (400ms)', `got ${s.words[1]?.start}`)
 }
 
+// ---------------------------------------------------------------------------
+console.log('\n== Karaoke: \\k word-highlight from REAL word timings ==')
+{
+  const { buildKaraokeText } = await import('../src/lib/render-recipe')
+  const mkRecipe = (cuts: { start: number; end: number; reason?: string }[] = []) => ({
+    clipId: 't', clipStart: 10, clipEnd: 20, duration: 10, youtubeId: 'x',
+    cuts: cuts.map((c) => ({ reason: 'test', ...c })), cameraKeyframes: [], subtitles: [], segments: [], visuals: [], soundEffects: [],
+    music: { recommended: false, style: 'none', intensity: 0, ducking_percent: 0 },
+    generatedHook: '', title: 't',
+  })
+  const words = [
+    { word: 'alpha', start: 10.0, end: 10.4 },
+    { word: 'beta', start: 10.5, end: 10.9 },
+    { word: 'gamma', start: 11.0, end: 11.4 },
+  ]
+  const block = { start: 10.0, end: 11.4, text: 'alpha beta gamma', emphasis_words: ['beta'], emphasis_type: 'bold', word_timings: words }
+  const r0 = mkRecipe()
+  const line = buildKaraokeText(block, r0)
+  assert(line !== null && line.startsWith('{\\k50}alpha ') && line.endsWith('{\\k40}gamma'), 'karaoke \\k durations = start deltas + last word span', `got ${line}`)
+  assert(line !== null && line.includes('{\\b1}{\\k50}beta{\\b0}'), 'emphasis word bolded inside karaoke', `got ${line}`)
+  // word boundary inside a cut → refuse to karaoke (never misrepresent speech)
+  const cutBlock = buildKaraokeText(block, mkRecipe([{ start: 10.2, end: 10.6, reason: 'x' }]))
+  assert(cutBlock === null, 'word boundary snapped by cut → no karaoke (plain fallback)')
+  // word outside block window → refuse
+  const outside = buildKaraokeText({ ...block, word_timings: [...words, { word: 'delta', start: 12.0, end: 12.4 }] }, r0)
+  assert(outside === null, 'word outside block window → no karaoke')
+  // non-monotonic → refuse
+  const nonMono = buildKaraokeText({ ...block, word_timings: [words[1], words[0], words[2]] }, r0)
+  assert(nonMono === null, 'non-monotonic timings → no karaoke')
+  // no timings → null (plain path unchanged)
+  assert(buildKaraokeText({ ...block, word_timings: undefined }, r0) === null, 'no word_timings → null (plain rendering)')
+  // end-to-end: generateASS emits the karaoke line for mapped output time
+  const { generateASS } = await import('../src/lib/render-recipe')
+  const ass = generateASS({ ...r0, subtitles: [block] })
+  assert(ass.includes('{\\k50}alpha'), 'generateASS renders karaoke line', ass.split('\n').find((l) => l.startsWith('Dialogue: 0')) ?? '')
+}
+
 console.log(`\n════════════════════════════════`)
 console.log(`RESULT: ${passed} passed, ${failed} failed`)
 process.exit(failed > 0 ? 1 : 0)

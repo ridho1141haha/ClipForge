@@ -47,6 +47,8 @@ export interface RenderRecipe {
     text: string
     emphasis_words: string[]
     emphasis_type?: string
+    /** real word timings inside the block (SOURCE time) — only present when verified */
+    word_timings?: { word: string; start: number; end: number }[]
   }[]
   // segments (absolute SOURCE timestamps)
   segments: { type: string; start: number; end: number; purpose: string }[]
@@ -300,8 +302,8 @@ WrapStyle: 0
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: Default,Inter,${fs},${primary},&H000000FF,${outline},&H64000000,1,0,0,0,100,100,0,0,1,3,2,2,80,80,120,1
-Style: Emphasis,Inter,${fs},&H0000E8FF,&H000000FF,${outline},&H64000000,1,1,0,0,100,100,0,0,1,3,2,2,80,80,120,1
+Style: Default,Inter,${fs},${primary},&H00969696,${outline},&H64000000,1,0,0,0,100,100,0,0,1,3,2,2,80,80,120,1
+Style: Emphasis,Inter,${fs},&H0000E8FF,&H00969696,${outline},&H64000000,1,1,0,0,100,100,0,0,1,3,2,2,80,80,120,1
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
@@ -312,7 +314,9 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
       const outStart = sourceToOutputTime(s.start, recipe.clipStart, recipe.cuts)
       const outEnd = sourceToOutputTime(s.end, recipe.clipStart, recipe.cuts)
       if (outEnd - outStart < 0.15) return null
-      const text = applyASSEmphasis(s.text, s.emphasis_words, s.emphasis_type)
+      // karaoke word-highlight when REAL word timings survived verification;
+      // plain emphasis rendering otherwise
+      const text = buildKaraokeText(s, recipe) ?? applyASSEmphasis(s.text, s.emphasis_words, s.emphasis_type)
       return `Dialogue: 0,${timeToAss(outStart)},${timeToAss(outEnd)},Default,,0,0,0,,${text}`
     })
     .filter((l): l is string => l !== null)
@@ -331,6 +335,51 @@ function escapeASS(text: string): string {
     .replace(/\{/g, '\\{')
     .replace(/\}/g, '\\}')
     .replace(/\n/g, '\\N')
+}
+
+/**
+ * Build a karaoke (\k) line from REAL word timings — the word-highlight effect
+ * standard in short-form captions: each word lights up exactly when spoken.
+ *
+ * \k durations are SEQUENTIAL (each segment runs from the previous tag), so
+ * fill durations are the deltas between consecutive mapped word STARTS — gaps
+ * between words are absorbed into the preceding word's fill and the line stays
+ * in sync with speech.
+ *
+ * Returns null (→ plain text fallback) when timings are absent, degenerate,
+ * non-monotonic, or any word boundary would be time-snapped by a cut — karaoke
+ * must never misrepresent WHEN a word was spoken.
+ */
+export function buildKaraokeText(
+  s: RenderRecipe['subtitles'][number],
+  recipe: RenderRecipe,
+): string | null {
+  const wt = s.word_timings
+  if (!wt || wt.length < 2) return null
+  for (const w of wt) {
+    if (!isFinite(w.start) || !isFinite(w.end) || w.end <= w.start) return null
+    if (w.start < s.start - 0.01 || w.end > s.end + 0.01) return null // outside block
+    if (isInCut(w.start, recipe.cuts).cut || isInCut(w.end, recipe.cuts).cut) return null // snapped by cut
+  }
+  for (let i = 1; i < wt.length; i++) {
+    if (wt[i].start < wt[i - 1].start) return null // not monotonic
+  }
+  const mapped = wt.map((w) => ({
+    word: w.word,
+    s: sourceToOutputTime(w.start, recipe.clipStart, recipe.cuts),
+    e: sourceToOutputTime(w.end, recipe.clipStart, recipe.cuts),
+  }))
+  const emph = s.emphasis_words ?? []
+  const parts: string[] = []
+  for (let i = 0; i < mapped.length; i++) {
+    const segEnd = i < mapped.length - 1 ? mapped[i + 1].s : mapped[i].e
+    const cs = Math.round((segEnd - mapped[i].s) * 100)
+    if (!isFinite(cs) || cs <= 0) return null
+    const isEmph = emph.some((e) => mapped[i].word.toLowerCase().includes(String(e).toLowerCase()))
+    const tag = `${isEmph ? '{\\b1}' : ''}{\\k${Math.min(9999, Math.max(1, cs))}}${escapeASS(mapped[i].word)}${isEmph ? '{\\b0}' : ''}`
+    parts.push(tag)
+  }
+  return parts.join(' ')
 }
 
 function applyASSEmphasis(text: string, words: string[], type?: string): string {

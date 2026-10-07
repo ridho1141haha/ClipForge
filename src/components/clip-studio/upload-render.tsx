@@ -19,7 +19,7 @@ import {
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { type EditPlan } from '@/lib/editplan'
-import { buildRenderRecipe } from '@/lib/render-recipe'
+import { buildRenderRecipe, buildRecipeJSON } from '@/lib/render-recipe'
 import { fmtTime, fmtDuration } from '@/lib/youtube'
 
 interface Props {
@@ -37,10 +37,13 @@ export function UploadRender({ plan }: Props) {
   const [stage, setStage] = React.useState('')
   const [jobId, setJobId] = React.useState<string | null>(null)
   const [renderedUrl, setRenderedUrl] = React.useState<string | null>(null)
-  const [renderedInfo, setRenderedInfo] = React.useState<{ size: number; duration: number; width: number; height: number } | null>(null)
+  const [renderedInfo, setRenderedInfo] = React.useState<{ size: number; duration: number; width: number; height: number; durationOk: boolean } | null>(null)
+  const [notice, setNotice] = React.useState<string | null>(null)
+  const [cancelling, setCancelling] = React.useState(false)
   const [error, setError] = React.useState<string | null>(null)
   const fileInputRef = React.useRef<HTMLInputElement>(null)
   const pollRef = React.useRef<number>(0)
+  const stoppedRef = React.useRef(false)
 
   const canRender = !!file && !!plan
 
@@ -71,13 +74,18 @@ export function UploadRender({ plan }: Props) {
     setProgress(0)
     setStage('Uploading…')
     setError(null)
+    setNotice(null)
     setRenderedUrl(null)
     setRenderedInfo(null)
     try {
       const recipe = buildRenderRecipe(plan, 'upload')
+      // CRITICAL: send the RENDERER recipe JSON (keep_ranges + subtitles_ass +
+      // OUTPUT-time camera keyframes + duration), NOT the raw RenderRecipe.
+      // The raw object has none of those — the renderer would silently render
+      // the full clip WITHOUT cuts and WITHOUT subtitles.
       const formData = new FormData()
       formData.append('video', file)
-      formData.append('recipe', JSON.stringify(recipe))
+      formData.append('recipe', buildRecipeJSON(recipe))
       // Use Next.js API proxy to avoid CORS — proxies to localhost:3003
       const res = await fetch('/api/render-proxy/render', {
         method: 'POST',
@@ -94,10 +102,26 @@ export function UploadRender({ plan }: Props) {
     }
   }
 
+  const cancelRender = async () => {
+    if (!jobId || cancelling) return
+    setCancelling(true)
+    try {
+      await fetch(`/api/render-proxy/jobs/${jobId}/cancel`, { method: 'POST' })
+      // poll loop will observe status 'cancelled' and wind down
+    } catch {
+      // cancel endpoint unavailable (old renderer?) — stop polling locally
+      stoppedRef.current = true
+      clearTimeout(pollRef.current)
+      setPhase('idle')
+      setNotice('Render cancelled.')
+      setCancelling(false)
+    }
+  }
+
   const pollJob = (id: string) => {
-    let stopped = false
+    stoppedRef.current = false
     const poll = async () => {
-      if (stopped) return
+      if (stoppedRef.current) return
       try {
         const res = await fetch(`/api/render-proxy/jobs/${id}`)
         const job = await res.json()
@@ -110,6 +134,7 @@ export function UploadRender({ plan }: Props) {
             duration: job.duration ?? 0,
             width: job.width ?? 1080,
             height: job.height ?? 1920,
+            durationOk: job.durationOk !== false,
           })
           // fetch the rendered file
           const dlRes = await fetch(`/api/render-proxy/jobs/${id}/download`)
@@ -123,13 +148,18 @@ export function UploadRender({ plan }: Props) {
           setError(job.error ?? 'Render failed')
           return
         }
+        if (job.status === 'cancelled') {
+          setPhase('idle')
+          setCancelling(false)
+          setNotice('Render cancelled — no partial file is kept.')
+          return
+        }
         pollRef.current = window.setTimeout(poll, 1000)
       } catch {
         pollRef.current = window.setTimeout(poll, 2000)
       }
     }
     poll()
-    ;(pollJob as any).stop = () => { stopped = true; clearTimeout(pollRef.current) }
   }
 
   React.useEffect(() => {
@@ -140,6 +170,8 @@ export function UploadRender({ plan }: Props) {
   }, [renderedUrl])
 
   const reset = () => {
+    stoppedRef.current = true
+    clearTimeout(pollRef.current)
     if (renderedUrl) URL.revokeObjectURL(renderedUrl)
     setFile(null)
     setPhase('idle')
@@ -149,6 +181,8 @@ export function UploadRender({ plan }: Props) {
     setRenderedUrl(null)
     setRenderedInfo(null)
     setError(null)
+    setNotice(null)
+    setCancelling(false)
   }
 
   const downloadRendered = () => {
@@ -271,7 +305,7 @@ export function UploadRender({ plan }: Props) {
           <div className="mt-3 space-y-1.5 rounded-md border border-sky-500/20 bg-sky-500/5 p-2.5 text-[10px] leading-relaxed">
             <p className="font-semibold text-sky-700 dark:text-sky-400">What the renderer actually applies to the MP4:</p>
             <p className="text-muted-foreground">
-              ✅ Cuts (removed sections) · ✅ Subtitle burn-in (transcript-grounded, output-time mapped) · ✅ Camera punch-in/zoom · ✅ 9:16 crop + scale · ✅ H.264 + AAC 1080×1920
+              ✅ Cuts (removed sections) · ✅ Subtitle burn-in (transcript-grounded, output-time mapped) · ✅ Karaoke word-highlight (when word timestamps are available) · ✅ Camera punch-in/zoom · ✅ 9:16 crop + scale · ✅ H.264 + AAC 1080×1920
             </p>
             <p className="font-semibold text-amber-600 dark:text-amber-400">Preview-only recommendations (NOT rendered into the MP4):</p>
             <p className="text-muted-foreground">
@@ -300,6 +334,17 @@ export function UploadRender({ plan }: Props) {
             </>
           )}
         </Button>
+        {phase === 'rendering' && jobId && (
+          <Button
+            variant="outline"
+            onClick={cancelRender}
+            disabled={cancelling}
+            className="gap-2 border-rose-500/40 text-rose-600 hover:bg-rose-500/10 dark:text-rose-400"
+          >
+            {cancelling ? <Loader2 className="h-4 w-4 animate-spin" /> : <X className="h-4 w-4" />}
+            {cancelling ? 'Cancelling…' : 'Cancel'}
+          </Button>
+        )}
         {file && phase !== 'rendering' && (
           <Button variant="ghost" onClick={reset} className="gap-2 text-muted-foreground">
             <X className="h-4 w-4" />
@@ -307,6 +352,21 @@ export function UploadRender({ plan }: Props) {
           </Button>
         )}
       </div>
+
+      {/* notice (cancel confirmations etc.) */}
+      <AnimatePresence>
+        {notice && !error && (
+          <motion.div
+            initial={{ opacity: 0, y: -4 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0 }}
+            className="flex items-center gap-2 rounded-lg border border-amber-500/30 bg-amber-500/10 p-3 text-sm text-amber-700 dark:text-amber-400"
+          >
+            <AlertCircle className="h-4 w-4 shrink-0" />
+            <span className="flex-1">{notice}</span>
+          </motion.div>
+        )}
+      </AnimatePresence>
 
       {/* error */}
       <AnimatePresence>
@@ -395,6 +455,11 @@ export function UploadRender({ plan }: Props) {
                   {renderedInfo && `${renderedInfo.width}×${renderedInfo.height} · ${fmtDuration(renderedInfo.duration)} · ${(renderedInfo.size / 1024 / 1024).toFixed(2)} MB`}
                 </p>
               </div>
+              {renderedInfo && !renderedInfo.durationOk && (
+                <Badge variant="outline" className="ml-auto border-amber-500/40 bg-amber-500/10 text-[10px] text-amber-700 dark:text-amber-400">
+                  duration deviates from plan — verify cuts
+                </Badge>
+              )}
             </div>
 
             {/* video preview */}

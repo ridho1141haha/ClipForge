@@ -16,7 +16,8 @@ import { Label } from '@/components/ui/label'
 import { Textarea } from '@/components/ui/textarea'
 import { Slider } from '@/components/ui/slider'
 import { Badge } from '@/components/ui/badge'
-import { X, Plus } from 'lucide-react'
+import { Switch } from '@/components/ui/switch'
+import { X, Plus, Magnet, AudioLines } from 'lucide-react'
 import { fmtTime, type SuggestedClip } from '@/lib/youtube'
 
 interface Props {
@@ -27,13 +28,47 @@ interface Props {
   onSave: (clip: SuggestedClip) => void
 }
 
+interface WordT { word: string; start: number; end: number }
+
+/**
+ * Snap a boundary time to the nearest speech boundary from REAL word
+ * timestamps: word onsets, word endings, and midpoints of inter-word gaps.
+ * Returns the original time when nothing is within `maxDist` seconds —
+ * snapping never moves a boundary somewhere speech does not support.
+ */
+function snapToWordBoundary(t: number, words: WordT[], maxDist = 1.5): { time: number; word: string | null } {
+  if (words.length < 2) return { time: t, word: null }
+  const cands: { time: number; word: string }[] = []
+  words.forEach((w, i) => {
+    cands.push({ time: w.start, word: w.word })
+    cands.push({ time: w.end, word: w.word })
+    const next = words[i + 1]
+    if (next) cands.push({ time: (w.end + next.start) / 2, word: `…${w.word} | ${next.word}…` })
+  })
+  let best: { time: number; word: string | null } = { time: t, word: null }
+  let bestD = Infinity
+  for (const c of cands) {
+    const d = Math.abs(c.time - t)
+    if (d < bestD) {
+      bestD = d
+      best = { time: c.time, word: c.word }
+    }
+  }
+  if (bestD > maxDist || best.word === null) return { time: t, word: null }
+  return { time: Math.round(best.time * 10) / 10, word: best.word }
+}
+
 export function ClipEditor({ open, onOpenChange, clip, duration, onSave }: Props) {
   const [draft, setDraft] = React.useState<SuggestedClip | null>(clip)
   const [tagInput, setTagInput] = React.useState('')
+  const [snapOn, setSnapOn] = React.useState(true)
+  const [snapHint, setSnapHint] = React.useState<string | null>(null)
 
   React.useEffect(() => {
     setDraft(clip ? { ...clip, tags: [...clip.tags] } : null)
     setTagInput('')
+    setSnapHint(null)
+    setSnapOn(true)
   }, [clip, open])
 
   if (!draft) return null
@@ -42,6 +77,22 @@ export function ClipEditor({ open, onOpenChange, clip, duration, onSave }: Props
     setDraft((d) => (d ? { ...d, ...patch } : d))
 
   const dur = draft.endTime - draft.startTime
+  const words: WordT[] = (draft.clipWords ?? []).filter((w) => isFinite(w.start) && isFinite(w.end))
+  const canSnap = snapOn && words.length >= 2
+
+  const applyStart = (raw: number) => {
+    const snapped = canSnap ? snapToWordBoundary(raw, words) : { time: raw, word: null }
+    const ns = Math.min(Math.round(snapped.time * 10) / 10, draft.endTime - 1)
+    update({ startTime: ns })
+    setSnapHint(snapped.word ? `start snapped to speech: “${snapped.word}”` : null)
+  }
+
+  const applyEnd = (raw: number) => {
+    const snapped = canSnap ? snapToWordBoundary(raw, words) : { time: raw, word: null }
+    const ne = Math.max(Math.round(snapped.time * 10) / 10, draft.startTime + 1)
+    update({ endTime: ne })
+    setSnapHint(snapped.word ? `end snapped to speech: “${snapped.word}”` : null)
+  }
 
   const addTag = () => {
     const t = tagInput.trim().replace(/^#/, '')
@@ -106,33 +157,61 @@ export function ClipEditor({ open, onOpenChange, clip, duration, onSave }: Props
           </div>
 
           {/* time range */}
-          <div className="grid grid-cols-2 gap-3">
-            <div className="space-y-1.5">
-              <Label className="text-xs">Start: {fmtTime(draft.startTime)}</Label>
-              <Slider
-                value={[draft.startTime]}
-                min={0}
-                max={Math.max(duration - 1, draft.startTime + 1)}
-                step={1}
-                onValueChange={(v) => {
-                  const ns = Math.min(v[0], draft.endTime - 1)
-                  update({ startTime: ns })
-                }}
-              />
+          <div className="space-y-2">
+            <div className="grid grid-cols-2 gap-3">
+              <div className="space-y-1.5">
+                <Label className="text-xs">Start: {fmtTime(draft.startTime)}</Label>
+                <Slider
+                  value={[draft.startTime]}
+                  min={0}
+                  max={Math.max(duration - 1, draft.startTime + 1)}
+                  step={0.1}
+                  onValueChange={(v) => applyStart(v[0])}
+                />
+              </div>
+              <div className="space-y-1.5">
+                <Label className="text-xs">End: {fmtTime(draft.endTime)}</Label>
+                <Slider
+                  value={[draft.endTime]}
+                  min={Math.max(draft.startTime + 1, 1)}
+                  max={duration}
+                  step={0.1}
+                  onValueChange={(v) => applyEnd(v[0])}
+                />
+              </div>
             </div>
-            <div className="space-y-1.5">
-              <Label className="text-xs">End: {fmtTime(draft.endTime)}</Label>
-              <Slider
-                value={[draft.endTime]}
-                min={Math.max(draft.startTime + 1, 1)}
-                max={duration}
-                step={1}
-                onValueChange={(v) => {
-                  const ne = Math.max(v[0], draft.startTime + 1)
-                  update({ endTime: ne })
-                }}
-              />
-            </div>
+
+            {/* word-boundary ruler (from REAL word timestamps) */}
+            {words.length >= 2 && (
+              <div className="rounded-md border border-border/50 bg-muted/20 px-3 py-2">
+                <div className="relative h-3" title="Speech density from real word timestamps">
+                  {words.map((w, i) => (
+                    <span
+                      key={i}
+                      className="absolute top-0 h-3 w-px bg-primary/45"
+                      style={{ left: `${Math.min(100, Math.max(0, ((w.start + w.end) / 2 - draft.startTime) / Math.max(dur, 0.001)) * 100)}%` }}
+                    />
+                  ))}
+                  {/* clip window edges */}
+                  <span className="absolute top-0 h-3 w-0.5 bg-emerald-500" style={{ left: 0 }} />
+                  <span className="absolute top-0 h-3 w-0.5 bg-rose-500" style={{ left: '100%' }} />
+                </div>
+                <div className="mt-1.5 flex items-center justify-between gap-2 text-[10px]">
+                  <span className="flex items-center gap-1 text-muted-foreground">
+                    <AudioLines className="h-3 w-3" />
+                    speech boundaries ({words.length} words)
+                  </span>
+                  <span className="flex items-center gap-1.5">
+                    <Magnet className={`h-3 w-3 ${canSnap ? 'text-primary' : 'text-muted-foreground/40'}`} />
+                    <span className="text-muted-foreground">snap to speech</span>
+                    <Switch checked={snapOn} onCheckedChange={setSnapOn} aria-label="Snap boundaries to speech" className="h-4 w-7 [&>span]:h-3 [&>span]:w-3" />
+                  </span>
+                </div>
+                {snapHint && (
+                  <p className="mt-1 text-[10px] font-medium text-primary">{snapHint}</p>
+                )}
+              </div>
+            )}
           </div>
           <div className="flex items-center justify-between rounded-md bg-muted/40 px-3 py-1.5 text-xs">
             <span className="text-muted-foreground">Duration</span>

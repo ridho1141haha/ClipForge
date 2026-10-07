@@ -263,6 +263,9 @@ Return the JSON object now. All timestamps must be absolute seconds within [${cl
       text: String(s.text ?? '').slice(0, 300),
       emphasis_words: (s.emphasis_words ?? []).slice(0, 5).map((w) => String(w).slice(0, 40)),
       emphasis_type: s.emphasis_type as SubtitleBlock['emphasis_type'],
+      // karaoke word timings ONLY when the AI text is exactly the real words in
+      // its own window — otherwise omitted (never fabricate word timing)
+      word_timings: alignWordTimings(String(s.text ?? ''), clipStart, clipEnd, clipWords, clampN(s.start, clipStart, clipEnd), clampN(s.end, clipStart, clipEnd)),
     })).filter((s) => s.end > s.start && s.text)
 
     let subtitlesSource: 'transcript' | 'deterministic' | 'none' = hasTranscript ? 'transcript' : 'none'
@@ -284,6 +287,8 @@ Return the JSON object now. All timestamps must be absolute seconds within [${cl
           text: b.words.map((w) => w.word).join(' '),
           emphasis_words: emphasis.filter((e) => b.words.some((w) => w.word.toLowerCase().includes(String(e).toLowerCase()))).slice(0, 3),
           emphasis_type: 'bold' as const,
+          // deterministic blocks are composed of real words by construction
+          word_timings: b.words.map((w) => ({ word: w.word, start: Math.round(w.start * 100) / 100, end: Math.round(w.end * 100) / 100 })),
         }))
         subtitlesSource = 'deterministic'
       } else if (verified.length < subtitles.length) {
@@ -406,3 +411,31 @@ Return the JSON object now. All timestamps must be absolute seconds within [${cl
 
 // silence unused-import lint if normalizeText becomes unnecessary later
 void normalizeText
+
+/**
+ * Attach REAL word timings to an AI-authored subtitle block — but ONLY when
+ * the block text is EXACTLY the words spoken inside its own window (punctuation
+ * and case ignored). Returns undefined otherwise: karaoke timing is never
+ * fabricated. `winStart`/`winEnd` are the clamped block bounds (SOURCE time).
+ */
+function alignWordTimings(
+  text: string,
+  clipStart: number,
+  clipEnd: number,
+  clipWords: TWord[],
+  winStart: number,
+  winEnd: number,
+): { word: string; start: number; end: number }[] | undefined {
+  if (!text.trim() || winEnd <= winStart || clipWords.length === 0) return undefined
+  const inWindow = clipWords
+    .filter((w) => w.end > winStart && w.start < winEnd)
+    .sort((a, b) => a.start - b.start)
+  if (inWindow.length < 2) return undefined
+  const windowText = normalizeText(inWindow.map((w) => w.word).join(' '))
+  if (!windowText || windowText !== normalizeText(text)) return undefined
+  return inWindow.map((w) => ({
+    word: w.word,
+    start: Math.round(Math.max(w.start, clipStart) * 100) / 100,
+    end: Math.round(Math.min(w.end, clipEnd) * 100) / 100,
+  }))
+}

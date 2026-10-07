@@ -106,10 +106,10 @@ async function main() {
       animations: [],
       sound_effects: [],
       music: { recommended: false, style: 'none', intensity: 0, ducking_percent: 0 },
-      // SOURCE-time subtitle blocks built from the real words
+      // SOURCE-time subtitle blocks built from the real words + karaoke timings
       subtitles: [
-        { start: sentence1[0] ? words[0].start : 0, end: words[sentence1.length - 1].end, text: sentence1.join(' '), emphasis_words: ['golden'], emphasis_type: 'bold' },
-        { start: words[sentence1.length].start, end: words[words.length - 1].end, text: sentence2.join(' '), emphasis_words: [], emphasis_type: 'bold' },
+        { start: sentence1[0] ? words[0].start : 0, end: words[sentence1.length - 1].end, text: sentence1.join(' '), emphasis_words: ['golden'], emphasis_type: 'bold', word_timings: words.slice(0, sentence1.length).map((w) => ({ word: w.word, start: w.start, end: w.end })) },
+        { start: words[sentence1.length].start, end: words[words.length - 1].end, text: sentence2.join(' '), emphasis_words: [], emphasis_type: 'bold', word_timings: words.slice(sentence1.length).map((w) => ({ word: w.word, start: w.start, end: w.end })) },
       ],
     },
   }
@@ -128,6 +128,7 @@ async function main() {
   const events = [...ass.matchAll(/Dialogue: \d+,([\d:.]+),([\d:.]+),/g)].map((m) => ({ s: assTimeToSec(m[1]), e: assTimeToSec(m[2]) }))
   assert(events.length >= 2, `ASS has events (${events.length})`)
   assert(events.every((ev) => ev.e <= EXPECTED_OUTPUT + 0.05), 'all ASS events end within output duration', JSON.stringify(events))
+  assert(ass.includes('\\k'), 'karaoke word-highlight (\\k tags) present in ASS (real word timings)', ass.split('\n').find((l) => l.startsWith('Dialogue: 0')) ?? '')
   writeFileSync('/tmp/clipforge-e2e.expected.ass', ass)
 
   console.log('\n== Golden E2E: render via ffmpeg-renderer mini-service ==')

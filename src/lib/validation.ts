@@ -238,6 +238,12 @@ export const EditPlanSchema = z.object({
           text: z.string(),
           emphasis_words: z.array(z.string()).default([]),
           emphasis_type: z.string().optional(),
+          // real word timestamps inside the block (SOURCE time) — optional;
+          // only trustworthy when the plan route verified the block text is
+          // composed of exactly these words
+          word_timings: z
+            .array(z.object({ word: z.string(), start: z.number(), end: z.number() }))
+            .optional(),
         }),
       )
       .default([]),

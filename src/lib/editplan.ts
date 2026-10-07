@@ -115,6 +115,12 @@ export interface SubtitleBlock {
   text: string
   emphasis_words: string[]
   emphasis_type?: EmphasisType
+  /**
+   * Real word timestamps inside this block (SOURCE time) — present ONLY when
+   * the block text is composed of exactly those words (never fabricated).
+   * Enables karaoke word-highlight rendering in the ASS burn-in.
+   */
+  word_timings?: { word: string; start: number; end: number }[]
 }
 
 export interface ClipCandidate {
