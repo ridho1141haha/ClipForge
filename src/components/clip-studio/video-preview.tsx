@@ -2,28 +2,39 @@
 
 import * as React from 'react'
 import { motion } from 'framer-motion'
-import { Play, User, Clock, ExternalLink, Youtube, AlertCircle, FileVideo } from 'lucide-react'
+import { Play, User, Clock, ExternalLink, Youtube, AlertCircle, FileVideo, HardDrive } from 'lucide-react'
 import { fmtDuration, type YouTubeMeta } from '@/lib/youtube'
 
 interface Props {
   meta: YouTubeMeta
   playStart?: number | null
+  /** Owner-scoped stream URL — when present, real downloaded source playback */
+  mediaUrl?: string | null
+  mediaSize?: number | null
 }
 
-export function VideoPreview({ meta, playStart }: Props) {
+export function VideoPreview({ meta, playStart, mediaUrl, mediaSize }: Props) {
   const [iframeKey, setIframeKey] = React.useState(0)
   const [embedUrl, setEmbedUrl] = React.useState(meta.embedUrl)
+  const videoRef = React.useRef<HTMLVideoElement | null>(null)
 
   React.useEffect(() => {
     // Seek to clip start when a clip is selected
     if (playStart != null && playStart >= 0) {
+      if (mediaUrl && videoRef.current) {
+        // real source: precise seek, no iframe reload
+        try {
+          videoRef.current.currentTime = playStart
+          videoRef.current.play().catch(() => {})
+        } catch {}
+      }
       setEmbedUrl(`${meta.embedUrl}?start=${Math.floor(playStart)}&rel=0&modestbranding=1`)
       setIframeKey((k) => k + 1)
     } else {
       setEmbedUrl(`${meta.embedUrl}?rel=0&modestbranding=1`)
       setIframeKey((k) => k + 1)
     }
-  }, [playStart, meta.embedUrl])
+  }, [playStart, meta.embedUrl, mediaUrl])
 
   return (
     <motion.div
@@ -32,8 +43,27 @@ export function VideoPreview({ meta, playStart }: Props) {
       transition={{ duration: 0.4 }}
       className="overflow-hidden rounded-2xl border border-border/80 bg-card shadow-xl"
     >
-      {/* Player — uploads have no YouTube embed; show a stylized placeholder */}
-      {meta.embedUrl ? (
+      {/* Player — real downloaded source > YouTube embed > upload placeholder */}
+      {mediaUrl ? (
+        <div className="relative aspect-video w-full bg-black">
+          <video
+            ref={videoRef}
+            src={mediaUrl}
+            controls
+            preload="metadata"
+            playsInline
+            className="h-full w-full"
+            aria-label={`Source video: ${meta.title}`}
+          />
+          <div className="pointer-events-none absolute left-3 top-3 flex items-center gap-1 rounded-md bg-emerald-500/90 px-2 py-1 text-[10px] font-bold text-white shadow">
+            <HardDrive className="h-3 w-3" />
+            LOCAL SOURCE
+            {mediaSize != null && mediaSize > 0 && (
+              <span className="font-medium opacity-90">· {(mediaSize / 1024 / 1024).toFixed(1)} MB</span>
+            )}
+          </div>
+        </div>
+      ) : meta.embedUrl ? (
         <div className="relative aspect-video w-full bg-black">
           <iframe
             key={iframeKey}

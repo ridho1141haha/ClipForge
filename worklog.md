@@ -323,3 +323,56 @@ Stage Summary:
 - The mission's #1 invariant is now true AND test-enforced: no user can read, stream, cancel, or download another user's render job — and random UUID secrecy is no longer the defense (DB-authorized at the public proxy).
 - The renderer no longer trusts any JSON: strict validated contract + resource limits; a fully-cut edit can no longer produce a phantom full-clip video at any layer.
 - Remaining honest gaps (deliberate, documented): in-memory rate-limit store; anonymous cookie sessions; render "retry" = re-submit recipe (new authorized job) rather than a persisted retry endpoint; render artifacts expire after 10 min (DB row keeps lifecycle); FACE_TRACK camera strategy documented as future seam (STATIC/CUSTOM keyframes implemented).
+
+---
+Task ID: cron-review-20261008 (in progress)
+Agent: Z.ai Code (Principal Engineer)
+Task: Status assessment + browser QA + next-priority development (media preview player, PLOpsj6DVQ8 retry, library LRU, usage soft limits).
+
+Work Log:
+- BASELINE @ 36043db: tsc clean · eslint clean · unit 169/169 · golden E2E 17/17 · renderer 3003 healthy · dev server healthy (fresh analyze 200 in dev.log). Browser QA (agent-browser): landing page loads, zero JS errors, zero console warnings.
+- PRIORITY 1 IMPLEMENTED: /api/media/[projectId] wired into ALL THREE players:
+  1. NEW src/hooks/use-html-media-player.ts — HTML5 <video> handle with the same interface as the YouTube hook (play/pause/seekTo/getCurrentTime/getDuration/setPlaybackRate/setMuted/getPlayerState/isReady) + error reporting (code 2/3/4 mapped to human messages).
+  2. VideoPreview (main studio panel): real downloaded source now streams in an HTML5 <video> with controls + "LOCAL SOURCE · N MB" badge; clip selection seeks the real media precisely (no iframe reload); falls back to YouTube embed / upload placeholder when no source.
+  3. AutoEditPlayer: dual-backend (real media vs YouTube iframe) — cut-skipping preview now runs on the REAL source; header badge "local source · real cut preview" vs "YouTube approximation"; media load failure falls back to YouTube with an honest warning card. ALSO FIXED: the mute button used to PAUSE playback — now a real mute toggle on both backends.
+  4. RemotionPlayer: when real media exists the composition renders TRUE keep-range preview — <Sequence> per keep range with <Video trimBefore/trimAfter>, i.e. cuts are physically removed in the browser preview using the SAME buildKeepRanges contract as the FFmpeg renderer (single strategy, preview == render). Output→source time mapping lives in NEW src/lib/keep-ranges.ts (mapKeepRanges / sourceTimeAtOutput / keepRangesOutputDuration) — unit-tested.
+  5. 16 new unit tests for keep-range mapping (round-trip, cut-outside-window, overlap merge, full-cut degenerate, identity); unit 169 → 185, all green; tsc + eslint clean.
+  6. media route doc-comment updated: status VERIFIED-unwired → WIRED (with the three consumers named).
+
+Stage Summary:
+- What you preview is now what renders: the browser preview and the FFmpeg renderer share one keep-range implementation.
+- Remaining in this round: PLOpsj6DVQ8 retry, library storage LRU, usage soft limits, full regression + browser QA of the new players with real media.
+
+---
+Task ID: cron-review-20261008-2 (webDevReview round 6)
+Agent: Z.ai Code (Principal Engineer)
+Task: Status assessment + agent-browser QA + continue the round-5 priorities (HTML5 keep-range preview was in-flight; PLOpsj6DVQ8 retry; library LRU; usage soft limits).
+
+Work Log:
+- BASELINE: previous round's player work was UNCOMMITTED in the tree. Verified first: tsc clean · eslint clean · unit 185/185 (incl. the 16 keep-range tests). Dev server + renderer (3003) healthy.
+- BROWSER QA of the uncommitted player work (agent-browser):
+  • VideoPreview: HTML5 <video> streams /api/media/<projectId> (readyState 4, time advancing), "LOCAL SOURCE · 32.3 MB" badge, zero iframes. ✔
+  • AutoEditPlayer: "local source · real cut preview" badge, real media playback with cut-skipping, live edit state (source time / camera scale / in-cut), mute button fixed (was pausing). ✔
+  • RemotionPlayer: 🐛 REAL BUG FOUND + FIXED — VisualCard called Remotion interpolate() with inputRange [0,10,30,30] (duplicated keyframe) → threw "inputRange must be strictly monotonically increasing" → ErrorBoundary blanked the ENTIRE preview for any plan that has B-roll visuals. Fixed with a valid fade-in (0→fadeIn frames, fps-aware, clamped) + comment explaining the Remotion constraint. Post-fix: real 9:16 footage renders with "real source · cuts removed" badge, subtitles with emphasis, segments/camera panels; playhead advances (verified with REAL CDP clicks — programmatic .click() has no user activation, a QA-methodology artifact worth remembering). ✔
+- PLOpsj6DVQ8 RETRY: still hard-blocked — now across ALL innertube clients (ANDROID/IOS 400, TVHTML5/MWEB LOGIN_REQUIRED, WEB_EMBEDDED ERROR) while the control video resolves fine → video-specific flag (very likely self-inflicted: our own scale tests hammered it). NEW yt-dlp also requires a JS runtime for extraction (--js-runtimes node/bun; downloadYoutubeMedia already passes --js-runtimes bun). DECISION: stopped probing (every retry adds heat); the system already degrades honestly via the first-class manual-duration path. A rapid-probe round made 5 unrelated videos temporarily bot-blocked too (IP heat) — documented as an operational lesson; media download re-verified working when the IP is cool.
+- 🆕 STORAGE HYGIENE (library LRU + delete cleanup):
+  • NEW src/lib/media-cache.ts — pure LRU eviction planner (planMediaCacheEviction: oldest-first until under cap, 10-min protect window for active downloads/renders, cap 0 = unlimited) + thin fs executor (pruneMediaCache evicts upload/yt/<id> dirs, updates .lru.json hints) + throttled touchMediaCache (1 write/min/id). Cap via CLIPFORGE_MEDIA_CACHE_MB (default 2048; documented in .env.example).
+  • Wired: prepare-worker touches LRU after a successful download then prunes and HONESTLY marks evicted projects localMediaState='unavailable' with an actionable message (no dangling paths); media GET route + render-proxy JSON mode touch LRU on real usage (throttled); project DELETE now removes upload/projects/<projectId>/ (uploaded originals — previously a leak) and upload/yt/<youtubeId>/ when no other project references the id.
+  • Live-verified end-to-end: fake cached dir → 206 range stream → .lru.json created on stream → DELETE removes the dir → media 404 after delete.
+- 🆕 USAGE-BASED SOFT LIMITS (friendly, honest, env-configurable):
+  • NEW src/lib/usage-limits.ts — per-kind daily caps (analyze 60 / prepare 30 / render 40 / transcribe 30 defaults; CLIPFORGE_DAILY_LIMIT_* envs; 0 = unlimited; garbage/negative → default), UTC-midnight reset window, DB-counted from UsageEvent (persists across restarts, unlike the burst limiter), fail-open on internal errors (limits must never take the engine down).
+  • Wired into ALL FOUR expensive routes with friendly 429s: analyze (before LLM spend), source/prepare + jobs retry (a retry is real engine work), render-proxy render (BOTH JSON + multipart paths), source/transcribe. 429 body: friendly message (what was hit, used/cap, exact reset time, what still works, self-host env escape hatch) + code/kind/used/cap/resetAt + X-RateLimit-* / Retry-After headers.
+  • UI: /api/usage now returns a `limits` block; UsagePanel renders per-kind daily meters (color-coded progress bars, amber at ≥80%, "resets in Nh Nm", amber trigger button + pulsing dot when near/at cap, explicit "you can keep editing/exporting/previewing" copy). Browser-verified rendering (1/60 · 1/30 · 0/30 · 0/40 with meters).
+  • REAL 429 PROVEN END-TO-END: seeded 60 analyze events for a fresh session → POST /api/clips/analyze → 429, Retry-After 22121, remaining 0, friendly message with reset time + env knob; probe events cleaned up after.
+- 🐛 TEST-ISOLATION FIX: url-render E2E hit the shared per-IP 6/min render burst limiter when run after the other render suites → now 429-aware (waits out Retry-After once, with an explanatory log line — the limiter working as designed is not a failure).
+- REGRESSION GATES (all after changes): tsc clean · eslint clean · unit 225/225 (+40: 19 media-cache, 21 usage-limits incl. UTC rollover/env semantics) · golden E2E 17/17 (20.000s 1080×1920 h264+aac non-silent) · render-security 20/20 · url-render 17/17 · long-source scale 15/15 · live 17/17. Fresh-browser console: ZERO errors/warnings; golden path re-verified (project restore → 4 clips → real media preview).
+
+Stage Summary:
+- The last round's in-flight player work is now committed, QA'd, and one real bug better (VisualCard crash); preview == render parity holds in all three players.
+- The library now polices its own disk usage honestly (LRU + explicit 'unavailable' states), and engine costs are soft-limited with a UX that explains itself instead of dead-ending.
+- Next round suggestions (priority order):
+  1) git push origin main (36043db + this round — push failed transiently before; retry first).
+  2) Word-precision subtitle QA on long sources: karaoke emphasis uses wordTiming — verify 'mixed' provenance degrades gracefully on a real 30min+ source (PLOpsj6DVQ8 remains video-flagged; use any fetchable long video).
+  3) Render progress realism: stage timings exist in logs; surface per-stage ETA in the UI (probe→extract→render→finalize weights).
+  4) Cheap auto-heal: on media GET 410 (file missing), offer one-click re-prepare in the UI (state machinery already honest).
+- Risks: none new. Standing: YouTube egress is IP/heat dependent (honest degradation everywhere); in-memory burst limiter (soft limits are DB-backed); B-roll/SFX/music preview-only.

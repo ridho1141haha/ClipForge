@@ -27,6 +27,21 @@ import {
   isDroppedByCuts,
   sourceToOutputTimeBounded,
 } from '../src/lib/subtitles'
+import {
+  planMediaCacheEviction,
+  mediaCacheCapBytes,
+  isSafeCacheId,
+  type CacheEntry,
+} from '../src/lib/media-cache'
+import {
+  parseDailyLimits,
+  evaluateDailyLimit,
+  startOfUtcDay,
+  nextUtcMidnight,
+  limitReachedMessage,
+  limitHeaders,
+  DEFAULT_DAILY_LIMITS,
+} from '../src/lib/usage-limits'
 
 let passed = 0
 let failed = 0
@@ -577,6 +592,151 @@ console.log('\n== Diversity: near-duplicate moments collapsed, distinct moments 
   const d = mk('D', 1800, 1845, 84, 'another angle on building a startup: it never gets easier but it keeps getting better')
   const out2 = dedupeAndRank([a, d], 2)
   assert(out2.length === 2, 'temporally distant similar excerpt NOT collapsed (different moment)')
+}
+
+// ===========================================================================
+// Preview keep-range mapping (real-source players — must match renderer)
+// ===========================================================================
+{
+  console.log('\n== Preview keep-range mapping (lib/keep-ranges) ==')
+  const { mapKeepRanges, sourceTimeAtOutput, keepRangesOutputDuration } = await import('../src/lib/keep-ranges')
+
+  // basic mapping: clip 10..50, one cut 20..30 → keep [10,20],[30,50], out 10+20=30
+  const kr = mapKeepRanges(10, 50, [{ start: 20, end: 30 }])
+  assert(kr.length === 2, 'two keep ranges around one cut', JSON.stringify(kr))
+  assert(kr[0].srcStart === 10 && kr[0].srcEnd === 20 && kr[0].outStart === 0, 'first range starts at clip start (out 0)')
+  assert(kr[1].srcStart === 30 && kr[1].srcEnd === 50 && kr[1].outStart === 10, 'second range output offset = first length')
+  assert(Math.abs(keepRangesOutputDuration(kr) - 30) < 0.001, 'output duration = 30 (kept only)')
+
+  // output→source round trip
+  assert(sourceTimeAtOutput(kr, 0) === 10, 'output 0s → source 10s')
+  assert(sourceTimeAtOutput(kr, 5) === 15, 'output 5s → source 15s')
+  assert(sourceTimeAtOutput(kr, 10) === 30, 'output 10s → source 30s (jumped the cut)')
+  assert(sourceTimeAtOutput(kr, 29.9) === 49.9, 'output 29.9s → source 49.9s')
+  assert(sourceTimeAtOutput(kr, 99) === 50, 'output beyond end clamps to last range end')
+
+  // cut outside the window is ignored; overlapping cuts merged by buildKeepRanges
+  const kr2 = mapKeepRanges(0, 60, [{ start: 100, end: 200 }, { start: 10, end: 20 }, { start: 15, end: 25 }])
+  assert(kr2.length === 2, 'out-of-window cut ignored, overlapping cuts merged', JSON.stringify(kr2))
+  assert(kr2[1].srcStart === 25 && kr2[1].outStart === 10, 'ranges: [0,10]+[25,60] with correct offsets')
+
+  // full cut → no ranges → mapping degenerates safely
+  const kr3 = mapKeepRanges(10, 50, [{ start: 0, end: 100 }])
+  assert(kr3.length === 0, 'full cut → zero keep ranges (renderer parity)')
+  assert(sourceTimeAtOutput(kr3, 5) === 0, 'empty mapping → 0 (no crash)')
+  assert(keepRangesOutputDuration(kr3) === 0, 'empty output duration 0')
+
+  // no cuts → identity mapping
+  const kr4 = mapKeepRanges(30, 90, [])
+  assert(kr4.length === 1 && kr4[0].srcStart === 30 && kr4[0].outStart === 0, 'no cuts → single identity range')
+  assert(sourceTimeAtOutput(kr4, 12) === 42, 'identity: output 12 → source 42')
+}
+
+// ---- media cache LRU eviction planner (pure) ----
+console.log('\n== Media cache: LRU eviction planner ==')
+{
+  const MB = 1024 * 1024
+  const now = 1_000_000_000
+  const entries: CacheEntry[] = [
+    { id: 'old', sizeBytes: 100 * MB, lastUsed: now - 10 * 60_000 }, // 10 min old
+    { id: 'mid', sizeBytes: 100 * MB, lastUsed: now - 5 * 60_000 }, // 5 min old
+    { id: 'new', sizeBytes: 100 * MB, lastUsed: now - 1 * 60_000 }, // 1 min old
+  ]
+
+  // under cap → no eviction
+  const plan0 = planMediaCacheEviction(entries, 400 * MB, now)
+  assert(plan0.evictIds.length === 0 && plan0.projectedBytes === 300 * MB, 'under cap → no eviction')
+
+  // over cap → oldest first, stop as soon as under cap
+  const plan1 = planMediaCacheEviction(entries, 250 * MB, now)
+  assert(JSON.stringify(plan1.evictIds) === JSON.stringify(['old']), 'over cap → evict oldest only (LRU order)', JSON.stringify(plan1))
+  assert(plan1.projectedBytes === 200 * MB, 'projected bytes = 200MB after eviction')
+
+  // deep over cap, default 10-min protect window: 'mid'/'new' are protected →
+  // only 'old' (exactly at the boundary = NOT protected) is evicted
+  const plan2 = planMediaCacheEviction(entries, 120 * MB, now)
+  assert(JSON.stringify(plan2.evictIds) === JSON.stringify(['old']), 'deep over cap + protect window → only unprotected evicted', JSON.stringify(plan2.evictIds))
+  assert(plan2.projectedBytes === 200 * MB, 'projected = 200MB (protected entries remain)')
+
+  // shorter protect window (6 min): 'old' (10 min) evictable, 'mid' (5 min) protected
+  const plan3 = planMediaCacheEviction(entries, 120 * MB, now, 6 * 60_000)
+  assert(JSON.stringify(plan3.evictIds) === JSON.stringify(['old']), '6-min protect → only 10-min-old evicted', JSON.stringify(plan3))
+
+  // no protection (protectMs=0) → strict LRU until under cap
+  const plan6 = planMediaCacheEviction(entries, 120 * MB, now, 0)
+  assert(JSON.stringify(plan6.evictIds) === JSON.stringify(['old', 'mid']), 'protectMs=0 → strict LRU order', JSON.stringify(plan6.evictIds))
+  assert(plan6.projectedBytes === 100 * MB, 'protectMs=0 → projected 100MB')
+
+  // zero/negative cap semantics: 0 = unlimited (never evict)
+  const plan4 = planMediaCacheEviction(entries, 0, now)
+  assert(plan4.evictIds.length === 0, 'cap=0 → unlimited (no eviction)')
+
+  // impossible: cap smaller than one protected file → evict nothing, plan is honest
+  const plan5 = planMediaCacheEviction([{ id: 'hot', sizeBytes: 500 * MB, lastUsed: now }], 100 * MB, now)
+  assert(plan5.evictIds.length === 0 && plan5.projectedBytes === 500 * MB, 'protected entry never evicted even when over cap')
+
+  // env parsing
+  assert(mediaCacheCapBytes({}) === 2048 * MB, 'default cap 2048MB')
+  assert(mediaCacheCapBytes({ CLIPFORGE_MEDIA_CACHE_MB: '512' }) === 512 * MB, 'env cap 512MB')
+  assert(mediaCacheCapBytes({ CLIPFORGE_MEDIA_CACHE_MB: '0' }) === 0, 'env cap 0 → unlimited')
+  assert(mediaCacheCapBytes({ CLIPFORGE_MEDIA_CACHE_MB: 'garbage' }) === 2048 * MB, 'garbage env → default cap')
+  assert(mediaCacheCapBytes({ CLIPFORGE_MEDIA_CACHE_MB: '-5' }) === 2048 * MB, 'negative env → default cap')
+
+  // id safety (ids become filesystem paths)
+  assert(isSafeCacheId('dQw4w9WgXcQ'), 'safe id accepted')
+  assert(!isSafeCacheId('../etc'), 'traversal id rejected')
+  assert(!isSafeCacheId(''), 'empty id rejected')
+  assert(!isSafeCacheId('a b'), 'id with space rejected')
+}
+
+// ---- usage soft limits (pure parts) ----
+console.log('\n== Usage soft limits: daily caps ==')
+{
+  const MB = 1024 * 1024 // (unused here, keeps the block self-contained)
+
+  // env parsing
+  assert(JSON.stringify(parseDailyLimits({})) === JSON.stringify(DEFAULT_DAILY_LIMITS), 'no env → defaults')
+  const custom = parseDailyLimits({ CLIPFORGE_DAILY_LIMIT_ANALYZE: '10', CLIPFORGE_DAILY_LIMIT_RENDER: '0' })
+  assert(custom.analyze === 10, 'env override honored (analyze=10)')
+  assert(custom.render === 0, 'env 0 → unlimited (render)')
+  assert(custom.prepare === DEFAULT_DAILY_LIMITS.prepare, 'unset kinds keep defaults')
+  const bad = parseDailyLimits({ CLIPFORGE_DAILY_LIMIT_ANALYZE: 'garbage', CLIPFORGE_DAILY_LIMIT_PREPARE: '-3' })
+  assert(bad.analyze === DEFAULT_DAILY_LIMITS.analyze && bad.prepare === DEFAULT_DAILY_LIMITS.prepare, 'garbage/negative env → defaults')
+
+  // UTC day boundaries
+  const d = new Date('2026-02-11T15:42:17Z')
+  assert(startOfUtcDay(d) === Date.UTC(2026, 1, 11), 'startOfUtcDay truncates to UTC midnight')
+  assert(nextUtcMidnight(d) === Date.UTC(2026, 1, 12), 'nextUtcMidnight = next day 00:00 UTC')
+  const edge = new Date('2026-02-11T00:00:00.000Z')
+  assert(startOfUtcDay(edge) === nextUtcMidnight(edge) - 24 * 3600_000, 'edge: exactly midnight → day starts now, resets in 24h')
+  const yearEnd = new Date('2026-12-31T23:59:59Z')
+  assert(nextUtcMidnight(yearEnd) === Date.UTC(2027, 0, 1), 'year rollover handled')
+
+  // evaluateDailyLimit semantics
+  const now = new Date('2026-02-11T15:00:00Z')
+  const e1 = evaluateDailyLimit(5, 10, now)
+  assert(e1.allowed && e1.remaining === 5, 'under cap → allowed, remaining 5')
+  const e2 = evaluateDailyLimit(10, 10, now)
+  assert(!e2.allowed && e2.used === 10 && e2.remaining === 0, 'at cap → blocked, remaining 0')
+  assert(e2.resetAt === Date.UTC(2026, 1, 12), 'resetAt = next UTC midnight')
+  const e3 = evaluateDailyLimit(999, 0, now)
+  assert(e3.allowed && e3.cap === 0, 'cap 0 → unlimited → allowed')
+  const e4 = evaluateDailyLimit(10.5, 11, now)
+  assert(e4.allowed && e4.remaining === 0.5, 'fractional usage (ASR minutes): remaining 0.5')
+
+  // friendly 429 message is actionable and honest
+  const msg = limitReachedMessage({ ...e2, kind: 'analyze' as const })
+  assert(msg.includes('60/10') === false && msg.includes('10/10'), 'message shows used/cap', msg)
+  assert(msg.includes('reset') && msg.includes('UTC'), 'message states reset time')
+  assert(msg.includes('CLIPFORGE_DAILY_LIMIT_ANALYZE'), 'message names the env knob (self-host escape hatch)')
+  assert(msg.includes('keep editing'), 'message states what still works (soft, not a dead end)')
+
+  // headers
+  const h = limitHeaders(e2)
+  assert(h['X-RateLimit-Limit'] === '10' && h['X-RateLimit-Remaining'] === '0', 'limit headers correct')
+  assert(Number(h['Retry-After']) > 0, 'Retry-After positive when blocked')
+  const hOpen = limitHeaders(e3)
+  assert(hOpen['X-RateLimit-Limit'] === undefined, 'unlimited → no limit header')
 }
 
 console.log(`\n════════════════════════════════`)

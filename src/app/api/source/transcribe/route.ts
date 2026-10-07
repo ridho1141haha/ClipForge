@@ -10,6 +10,7 @@ import { getOrCreateSessionId } from '@/lib/session'
 import { checkRateLimit, rateLimitHeaders } from '@/lib/validation'
 import { probeMediaDuration } from '@/lib/media'
 import { recordUsage } from '@/lib/usage'
+import { checkDailyUsageLimit, limitHeaders, limitReachedMessage } from '@/lib/usage-limits'
 
 const execFileAsync = promisify(execFile)
 
@@ -39,6 +40,16 @@ export async function POST(req: NextRequest) {
   }
   try {
     const ownerId = await getOrCreateSessionId()
+
+    // ---------- daily soft limit (persisted usage, friendly 429) ----------
+    const daily = await checkDailyUsageLimit(ownerId, 'transcribe')
+    if (!daily.allowed) {
+      return NextResponse.json(
+        { error: limitReachedMessage({ ...daily, kind: 'transcribe' }), code: 'DAILY_LIMIT_REACHED', kind: 'transcribe', used: daily.used, cap: daily.cap, resetAt: daily.resetAt },
+        { status: 429, headers: { ...headers, ...limitHeaders(daily) } },
+      )
+    }
+
     const form = await req.formData()
     const file = form.get('file') as File | null
     const title = String(form.get('title') ?? '').trim()

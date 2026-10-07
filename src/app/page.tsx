@@ -1480,7 +1480,12 @@ export default function Home() {
                   <div className="grid gap-6 lg:grid-cols-[minmax(0,1fr)_minmax(0,1.2fr)]">
                     {/* left: preview + timeline */}
                     <div className="space-y-4">
-                      <VideoPreview meta={meta} playStart={playStart} />
+                      <VideoPreview
+                        meta={meta}
+                        playStart={playStart}
+                        mediaUrl={projectId && projectMedia?.state === 'ready' ? `/api/media/${projectId}` : null}
+                        mediaSize={projectMedia?.size ?? null}
+                      />
                       <Timeline
                         clips={clips}
                         duration={analyzeResult?.estimatedDuration ?? meta.duration ?? 0}
@@ -1763,15 +1768,20 @@ export default function Home() {
           setRemotionOpen(true)
         }}
       />
+      {/* Real-source preview: when the project's source media is downloaded,
+          the Auto-Edit / Remotion previews stream it via the owner-scoped media
+          endpoint instead of the YouTube iframe approximation. */}
       <AutoEditPlayer
         plan={currentPlan}
         youtubeId={meta?.youtubeId ?? ''}
+        mediaUrl={projectId && projectMedia?.state === 'ready' ? `/api/media/${projectId}` : null}
         open={autoEditOpen}
         onClose={() => setAutoEditOpen(false)}
       />
       <RemotionPlayer
         plan={currentPlan}
         youtubeId={meta?.youtubeId ?? ''}
+        mediaUrl={projectId && projectMedia?.state === 'ready' ? `/api/media/${projectId}` : null}
         open={remotionOpen}
         onClose={() => setRemotionOpen(false)}
       />

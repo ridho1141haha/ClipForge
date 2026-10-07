@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from 'next/server'
 import { db } from '@/lib/db'
 import { getOrCreateSessionId } from '@/lib/session'
 import { checkRateLimit, rateLimitHeaders } from '@/lib/validation'
+import { checkDailyUsageLimit, limitHeaders, limitReachedMessage } from '@/lib/usage-limits'
 import { runPrepareJob } from '@/lib/jobs/prepare-worker'
 
 export const dynamic = 'force-dynamic'
@@ -52,6 +53,15 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string
     }
     if (job.status !== 'FAILED') {
       return NextResponse.json({ error: `Job is ${job.status}, not FAILED — only failed jobs can be retried` }, { status: 409, headers })
+    }
+
+    // ---------- daily soft limit (a retry is real engine work — metered) ----------
+    const daily = await checkDailyUsageLimit(ownerId, 'prepare')
+    if (!daily.allowed) {
+      return NextResponse.json(
+        { error: limitReachedMessage({ ...daily, kind: 'prepare' }), code: 'DAILY_LIMIT_REACHED', kind: 'prepare', used: daily.used, cap: daily.cap, resetAt: daily.resetAt },
+        { status: 429, headers: { ...headers, ...limitHeaders(daily) } },
+      )
     }
 
     const body = (await req.json().catch(() => ({}))) as RetryBody

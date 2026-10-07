@@ -6,6 +6,7 @@ import { Player, type PlayerRef } from '@remotion/player'
 import {
   AbsoluteFill,
   Sequence,
+  Video,
   useCurrentFrame,
   useVideoConfig,
   interpolate,
@@ -23,10 +24,12 @@ import {
   Type,
   Volume2,
   Film,
+  HardDrive,
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { buildRenderRecipe, scaleAtTime } from '@/lib/render-recipe'
+import { mapKeepRanges, sourceTimeAtOutput, type KeepRange } from '@/lib/keep-ranges'
 import type { EditPlan, EditSegment } from '@/lib/editplan'
 import { fmtTime } from '@/lib/youtube'
 
@@ -35,12 +38,15 @@ interface Props {
   onClose: () => void
   plan: EditPlan | null
   youtubeId: string
+  /** Owner-scoped stream URL — when present the Remotion composition renders
+   *  a TRUE keep-range preview (cuts actually removed) from the real source. */
+  mediaUrl?: string | null
 }
 
 // Convert absolute source timestamps to relative-to-clip frames
 const FPS = 30
 
-export function RemotionPlayer({ open, onClose, plan, youtubeId }: Props) {
+export function RemotionPlayer({ open, onClose, plan, youtubeId, mediaUrl }: Props) {
   const recipe = React.useMemo(() => (plan ? buildRenderRecipe(plan, youtubeId) : null), [plan, youtubeId])
   const playerRef = React.useRef<PlayerRef>(null)
   const [isPlaying, setIsPlaying] = React.useState(false)
@@ -84,6 +90,7 @@ export function RemotionPlayer({ open, onClose, plan, youtubeId }: Props) {
   const inputProps = {
     recipe,
     youtubeId,
+    mediaUrl: mediaUrl ?? null,
   }
 
   return (
@@ -110,6 +117,12 @@ export function RemotionPlayer({ open, onClose, plan, youtubeId }: Props) {
               {recipe.title.slice(0, 35)}
             </Badge>
             <span className="text-[10px] text-muted-foreground">· 1080×1920 · 9:16</span>
+            {mediaUrl && (
+              <Badge className="border-emerald-500/40 bg-emerald-500/10 text-emerald-600 text-[10px] dark:text-emerald-400">
+                <HardDrive className="h-3 w-3" />
+                real source · cuts removed
+              </Badge>
+            )}
           </div>
           <Button size="sm" variant="ghost" onClick={onClose} className="h-7 text-xs">
             <X className="h-3.5 w-3.5" />
@@ -279,11 +292,26 @@ export function RemotionPlayer({ open, onClose, plan, youtubeId }: Props) {
 // ---- Remotion Composition ----
 // Renders the clip as a 9:16 vertical video with all edit plan effects applied
 
-const ClipComposition: React.FC<{ recipe: any; youtubeId: string }> = ({ recipe, youtubeId }) => {
+const ClipComposition: React.FC<{ recipe: any; youtubeId: string; mediaUrl: string | null }> = ({
+  recipe,
+  youtubeId,
+  mediaUrl,
+}) => {
   const frame = useCurrentFrame()
   const { fps, durationInFrames } = useVideoConfig()
-  const t = frame / fps // relative time within clip
-  const absTime = recipe.clipStart + t // absolute time in source video
+  const t = frame / fps // relative time within clip (OUTPUT time)
+
+  // Output→source mapping: without real media the output timeline is the raw
+  // clip window (the iframe cannot skip mid-clip cuts); with real media the
+  // keep ranges are physically concatenated, so map output time into source time.
+  const keepRanges = React.useMemo(
+    () => (mediaUrl ? mapKeepRanges(recipe.clipStart, recipe.clipEnd, recipe.cuts ?? []) : null),
+    [mediaUrl, recipe.clipStart, recipe.clipEnd, recipe.cuts],
+  )
+  let absTime = recipe.clipStart + t
+  if (keepRanges && keepRanges.length > 0) {
+    absTime = sourceTimeAtOutput(keepRanges, t)
+  }
 
   // camera scale at current time
   const scale = scaleAtTime(absTime, recipe.cameraKeyframes ?? [])
@@ -302,7 +330,8 @@ const ClipComposition: React.FC<{ recipe: any; youtubeId: string }> = ({ recipe,
 
   return (
     <AbsoluteFill style={{ backgroundColor: '#000' }}>
-      {/* YouTube video (scaled for punch-in) */}
+      {/* Real source video with cuts physically removed (keep-range sequences),
+          or the YouTube iframe approximation when no local media exists. */}
       <div
         style={{
           width: '100%',
@@ -312,17 +341,26 @@ const ClipComposition: React.FC<{ recipe: any; youtubeId: string }> = ({ recipe,
           transition: 'transform 0.05s linear',
         }}
       >
-        <iframe
-          src={`https://www.youtube.com/embed/${youtubeId}?start=${Math.floor(recipe.clipStart)}&end=${Math.ceil(recipe.clipEnd)}&autoplay=0&mute=1&controls=0&modestbranding=1&rel=0&loop=1&playsinline=1`}
-          width="100%"
-          height="100%"
-          style={{
-            border: 0,
-            pointerEvents: 'none',
-            objectFit: 'cover',
-          }}
-          allow="autoplay; encrypted-media"
-        />
+        {mediaUrl && keepRanges && keepRanges.length > 0 ? (
+          <KeepRangeSequences
+            mediaUrl={mediaUrl}
+            keepRanges={keepRanges}
+            fps={fps}
+            durationInFrames={durationInFrames}
+          />
+        ) : (
+          <iframe
+            src={`https://www.youtube.com/embed/${youtubeId}?start=${Math.floor(recipe.clipStart)}&end=${Math.ceil(recipe.clipEnd)}&autoplay=0&mute=1&controls=0&modestbranding=1&rel=0&loop=1&playsinline=1`}
+            width="100%"
+            height="100%"
+            style={{
+              border: 0,
+              pointerEvents: 'none',
+              objectFit: 'cover',
+            }}
+            allow="autoplay; encrypted-media"
+          />
+        )}
       </div>
 
       {/* Hook title card */}
@@ -345,6 +383,46 @@ const ClipComposition: React.FC<{ recipe: any; youtubeId: string }> = ({ recipe,
         duration={recipe.duration}
       />
     </AbsoluteFill>
+  )
+}
+
+/**
+ * Physically concatenates the keep ranges on the output timeline — this is the
+ * SAME keep_ranges contract the FFmpeg renderer consumes, applied to a live
+ * preview. Each range is a <Sequence> whose <Video> is trimmed to the source
+ * segment, so play/scrub/loop are cut-accurate.
+ */
+const KeepRangeSequences: React.FC<{
+  mediaUrl: string
+  keepRanges: KeepRange[]
+  fps: number
+  durationInFrames: number
+}> = ({ mediaUrl, keepRanges, fps, durationInFrames }) => {
+  // pre-compute frame boundaries so consecutive sequences leave no gaps
+  const seqs = React.useMemo(() => {
+    const list: { from: number; length: number; trimBefore: number; trimAfter: number }[] = []
+    let acc = 0
+    for (const r of keepRanges) {
+      const length = Math.max(1, Math.round((r.srcEnd - r.srcStart) * fps))
+      list.push({ from: acc, length, trimBefore: Math.round(r.srcStart * fps), trimAfter: Math.round(r.srcEnd * fps) })
+      acc += length
+    }
+    return list
+  }, [keepRanges, fps])
+  return (
+    <>
+      {seqs.map((s, i) => (
+        <Sequence key={i} from={s.from} durationInFrames={Math.min(s.length, Math.max(1, durationInFrames - s.from))}>
+          <Video
+            src={mediaUrl}
+            trimBefore={s.trimBefore}
+            trimAfter={s.trimAfter}
+            style={{ width: '100%', height: '100%', objectFit: 'cover' }}
+            pauseWhenBuffering
+          />
+        </Sequence>
+      ))}
+    </>
   )
 }
 
@@ -410,7 +488,15 @@ const SegmentBadge: React.FC<{ type: string }> = ({ type }) => {
 }
 
 const VisualCard: React.FC<{ visual: any; frame: number; fps: number }> = ({ visual, frame, fps }) => {
-  const opacity = interpolate(frame, [0, 10, 30, 30], [0, 1, 1, 1], { extrapolateRight: 'clamp' })
+  // Remotion's interpolate() requires STRICTLY monotonic inputRange — a duplicated
+  // keyframe ([..., 30, 30]) throws and the ErrorBoundary blanks the whole preview.
+  // Fade in over 10 frames, then hold. A short visual still fades in fully as long
+  // as its Sequence is >= 10 frames (plan validation guarantees >= 0.5s segments).
+  const fadeIn = Math.min(10, Math.max(1, Math.floor(fps / 3)))
+  const opacity = interpolate(frame, [0, fadeIn], [0, 1], {
+    extrapolateRight: 'clamp',
+    extrapolateLeft: 'clamp',
+  })
   return (
     <AbsoluteFill
       style={{

@@ -3,6 +3,7 @@ import { db } from '@/lib/db'
 import { getOrCreateSessionId } from '@/lib/session'
 import { checkRateLimit, rateLimitHeaders } from '@/lib/validation'
 import { extractYouTubeId } from '@/lib/media'
+import { checkDailyUsageLimit, limitHeaders, limitReachedMessage } from '@/lib/usage-limits'
 import { runPrepareJob } from '@/lib/jobs/prepare-worker'
 
 export const dynamic = 'force-dynamic'
@@ -50,6 +51,15 @@ export async function POST(req: NextRequest) {
       if (!project || project.ownerId !== ownerId) {
         return NextResponse.json({ error: 'Project not found' }, { status: 404, headers })
       }
+    }
+
+    // ---------- daily soft limit (persisted usage, friendly 429) ----------
+    const daily = await checkDailyUsageLimit(ownerId, 'prepare')
+    if (!daily.allowed) {
+      return NextResponse.json(
+        { error: limitReachedMessage({ ...daily, kind: 'prepare' }), code: 'DAILY_LIMIT_REACHED', kind: 'prepare', used: daily.used, cap: daily.cap, resetAt: daily.resetAt },
+        { status: 429, headers: { ...headers, ...limitHeaders(daily) } },
+      )
     }
 
     // payload persisted → the job can be retried from its failure point later

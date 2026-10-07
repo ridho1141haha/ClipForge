@@ -1,6 +1,9 @@
 import { NextRequest, NextResponse } from 'next/server'
+import { rmSync } from 'fs'
+import { join } from 'path'
 import { db } from '@/lib/db'
 import { getOrCreateSessionId } from '@/lib/session'
+import { isSafeYouTubeId } from '@/lib/media'
 
 export const dynamic = 'force-dynamic'
 export const runtime = 'nodejs'
@@ -78,9 +81,27 @@ export async function DELETE(
   try {
     const ownerId = await getOrCreateSessionId()
     const { id } = await ctx.params
-    const existing = await db.project.findFirst({ where: { id, ownerId }, select: { id: true } })
+    const existing = await db.project.findFirst({
+      where: { id, ownerId },
+      select: { id: true, youtubeId: true, localMedia: true },
+    })
     if (!existing) return NextResponse.json({ error: 'Not found' }, { status: 404 })
     await db.project.delete({ where: { id } })
+
+    // ---- storage hygiene (best-effort, never fails the delete) ----
+    // 1. Uploaded originals live in upload/projects/<projectId>/ — remove them.
+    // 2. If no other project references this youtubeId, its shared cached
+    //    source in upload/yt/<youtubeId>/ is orphaned — remove it too.
+    try {
+      rmSync(join(process.cwd(), 'upload', 'projects', id), { recursive: true, force: true })
+      if (existing.youtubeId && isSafeYouTubeId(existing.youtubeId)) {
+        const stillReferenced = await db.project.count({ where: { youtubeId: existing.youtubeId } })
+        if (stillReferenced === 0) {
+          rmSync(join(process.cwd(), 'upload', 'yt', existing.youtubeId), { recursive: true, force: true })
+        }
+      }
+    } catch { /* disk cleanup is best-effort */ }
+
     return NextResponse.json({ ok: true })
   } catch (e) {
     const message = e instanceof Error ? e.message : 'Unknown error'

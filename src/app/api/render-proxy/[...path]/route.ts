@@ -8,6 +8,8 @@ import { checkRateLimit } from '@/lib/validation'
 import { getOrCreateSessionId } from '@/lib/session'
 import { recordUsage } from '@/lib/usage'
 import { mediaMimeForExt, resolveLocalMediaPath } from '@/lib/media'
+import { touchMediaCache } from '@/lib/media-cache'
+import { checkDailyUsageLimit, limitHeaders, limitReachedMessage } from '@/lib/usage-limits'
 
 // Proxy from /api/render-proxy/[...path] to the ffmpeg-renderer mini-service at localhost:3003
 // Avoids CORS issues and keeps the mini-service internal (never publicly exposed).
@@ -210,12 +212,26 @@ export async function POST(
       return NextResponse.json({ error: 'Recipe JSON exceeds the 1 MB limit', code: 'RECIPE_TOO_LARGE' }, { status: 413 })
     }
     const ownerId = await getOrCreateSessionId()
+
+    // ---------- daily soft limit (persisted usage, friendly 429) ----------
+    const daily = await checkDailyUsageLimit(ownerId, 'render')
+    if (!daily.allowed) {
+      return NextResponse.json(
+        { error: limitReachedMessage({ ...daily, kind: 'render' }), code: 'DAILY_LIMIT_REACHED', kind: 'render', used: daily.used, cap: daily.cap, resetAt: daily.resetAt },
+        { status: 429, headers: limitHeaders(daily) },
+      )
+    }
+
     const project = await db.project.findFirst({
       where: { id: projectIdForRecord, ownerId },
-      select: { localMedia: true, localMediaState: true, localMediaSize: true, title: true },
+      select: { localMedia: true, localMediaState: true, localMediaSize: true, title: true, youtubeId: true },
     })
     if (!project) {
       return NextResponse.json({ error: 'Project not found' }, { status: 404 })
+    }
+    // rendering from the cached source is an LRU touch (throttled, best-effort)
+    if (project.youtubeId && project.localMedia?.startsWith('upload/yt/')) {
+      touchMediaCache(project.youtubeId)
     }
     if (project.localMediaState !== 'ready' || !project.localMedia) {
       return NextResponse.json(
@@ -269,10 +285,17 @@ export async function POST(
     headers['content-type'] = contentType || 'application/json'
   }
 
-  // usage metering for the multipart passthrough path (recipe not parsed here)
+  // usage metering + daily soft limit for the multipart passthrough path (recipe not parsed here)
   if (isRenderStart && !recipeJson) {
     try {
       const ownerId = await getOrCreateSessionId()
+      const daily = await checkDailyUsageLimit(ownerId, 'render')
+      if (!daily.allowed) {
+        return NextResponse.json(
+          { error: limitReachedMessage({ ...daily, kind: 'render' }), code: 'DAILY_LIMIT_REACHED', kind: 'render', used: daily.used, cap: daily.cap, resetAt: daily.resetAt },
+          { status: 429, headers: limitHeaders(daily) },
+        )
+      }
       void recordUsage(ownerId, 'render', 1, {})
     } catch { /* never block rendering */ }
   }

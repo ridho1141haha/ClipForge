@@ -185,11 +185,24 @@ async function main() {
   })
   assert(neg2.status === 404, 'foreign session render → 404 (ownership enforced)', String(neg2.status))
 
-  const renderStart = await api(A, '/api/render-proxy/render', {
+  // render start — burst-rate-limit aware: the per-IP 6/min render window is
+  // shared across suites (golden + security + this one run back-to-back), so a
+  // 429 here is the limiter WORKING; wait out the window and retry once.
+  let renderStart = await api(A, '/api/render-proxy/render', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ recipe: recipeJson, projectId }),
   })
+  if (renderStart.status === 429) {
+    const retryAfter = Number(renderStart.res.headers.get('retry-after')) || 60
+    console.log(`  ℹ️  burst rate limit hit — waiting ${retryAfter}s (limiter working as designed)`)
+    await new Promise((r) => setTimeout(r, Math.min(120, retryAfter) * 1000))
+    renderStart = await api(A, '/api/render-proxy/render', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ recipe: recipeJson, projectId }),
+    })
+  }
   assert(renderStart.status === 200 && renderStart.body?.id, 'project-source render job accepted', JSON.stringify(renderStart.body))
 
   // poll the render via the proxy

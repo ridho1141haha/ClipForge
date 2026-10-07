@@ -1,5 +1,6 @@
 import { db } from '@/lib/db'
 import { downloadYoutubeMedia, extractYouTubeId, resolveYoutubeMeta, resolveYoutubeTranscript } from '@/lib/media'
+import { pruneMediaCache, touchMediaCache } from '@/lib/media-cache'
 import { recordUsage } from '@/lib/usage'
 
 /**
@@ -101,6 +102,7 @@ export async function runPrepareJob(jobId: string, opts: PreparePayload) {
         })
         localMediaState = 'ready'
         localMedia = { relativePath: dl.relativePath, sizeBytes: dl.sizeBytes, mimeType: dl.mimeType }
+        touchMediaCache(meta.youtubeId)
       } catch (e) {
         // NEVER fail the job for a media download problem — analysis still works
         localMediaState = 'failed'
@@ -169,6 +171,20 @@ export async function runPrepareJob(jobId: string, opts: PreparePayload) {
     }
     // usage metering (best-effort, never fails the job)
     void recordUsage(ownerId, 'prepare', 1, { projectId: project.id, transcriptSource })
+
+    // cache hygiene (best-effort, after the download): enforce the LRU cap and
+    // honestly mark projects whose cached source was evicted
+    try {
+      const pruned = pruneMediaCache()
+      if (pruned.evicted.length > 0) {
+        for (const evictedId of pruned.evicted) {
+          await db.project.updateMany({
+            where: { youtubeId: evictedId, localMediaState: 'ready' },
+            data: { localMediaState: 'unavailable', localMediaError: 'Cached source evicted by media cache policy (least-recently-used). Re-prepare or upload to render.' },
+          })
+        }
+      }
+    } catch { /* hygiene must never fail the job */ }
 
     await setPrepareJob(jobId, {
       status: 'COMPLETED',

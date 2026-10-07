@@ -12,6 +12,8 @@ import {
   VolumeX,
   Sparkles,
   Zap,
+  HardDrive,
+  AlertTriangle,
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Slider } from '@/components/ui/slider'
@@ -29,17 +31,27 @@ import {
 } from '@/lib/render-recipe'
 import type { EditPlan } from '@/lib/editplan'
 import { useYouTubePlayer } from '@/hooks/use-youtube-player'
+import { useHtmlMediaPlayer } from '@/hooks/use-html-media-player'
 
 interface Props {
   plan: EditPlan | null
   youtubeId: string
+  /** Owner-scoped stream URL (/api/media/[projectId]) — when present the
+   *  preview plays the REAL downloaded source instead of the YouTube iframe. */
+  mediaUrl?: string | null
   open: boolean
   onClose: () => void
 }
 
-export function AutoEditPlayer({ plan, youtubeId, open, onClose }: Props) {
+export function AutoEditPlayer({ plan, youtubeId, mediaUrl, open, onClose }: Props) {
   const recipe = React.useMemo(() => (plan ? buildRenderRecipe(plan, youtubeId) : null), [plan, youtubeId])
-  const player = useYouTubePlayer('auto-edit-player', open ? youtubeId : null)
+
+  // --- dual player backends ---
+  const media = useHtmlMediaPlayer(open && mediaUrl ? mediaUrl : null)
+  const usingMedia = !!mediaUrl && !media.handle.error
+  const yt = useYouTubePlayer('auto-edit-player', open && youtubeId && !usingMedia ? youtubeId : null)
+  const player = usingMedia ? media.handle : yt
+
   const [playing, setPlaying] = React.useState(false)
   const [currentTime, setCurrentTime] = React.useState(0)
   const [rate, setRate] = React.useState(1)
@@ -48,6 +60,12 @@ export function AutoEditPlayer({ plan, youtubeId, open, onClose }: Props) {
   const [sfxPlayed, setSfxPlayed] = React.useState<Set<string>>(new Set())
   const [lastCutTime, setLastCutTime] = React.useState<number | null>(null)
   const audioCtxRef = React.useRef<AudioContext | null>(null)
+
+  // Effect: apply mute to the active backend (real mute — not pause)
+  React.useEffect(() => {
+    if (!open) return
+    player.setMuted?.(muted)
+  }, [open, muted, usingMedia, player.isReady])
 
   // Poll current time at 30fps
   React.useEffect(() => {
@@ -197,6 +215,16 @@ export function AutoEditPlayer({ plan, youtubeId, open, onClose }: Props) {
             <Badge variant="secondary" className="text-[10px]">
               {recipe.title.slice(0, 40)}
             </Badge>
+            {usingMedia ? (
+              <Badge className="border-emerald-500/40 bg-emerald-500/10 text-emerald-600 text-[10px] dark:text-emerald-400">
+                <HardDrive className="h-3 w-3" />
+                local source · real cut preview
+              </Badge>
+            ) : (
+              <Badge className="border-amber-500/40 bg-amber-500/10 text-amber-600 text-[10px] dark:text-amber-400" title="The downloaded source file is unavailable — previewing an approximation via the YouTube embed">
+                YouTube approximation
+              </Badge>
+            )}
           </div>
           <Button size="sm" variant="ghost" onClick={onClose} className="h-7 text-xs">
             Close
@@ -210,7 +238,7 @@ export function AutoEditPlayer({ plan, youtubeId, open, onClose }: Props) {
               className="relative mx-auto aspect-video max-h-[60vh] w-full overflow-hidden"
               style={{ aspectRatio: '9 / 16', maxWidth: 'calc((60vh) * 9 / 16)' }}
             >
-              {/* The iframe is scaled to simulate punch-in */}
+              {/* The iframe / video is scaled to simulate punch-in */}
               <div
                 style={{
                   transform: `scale(${currentScale})`,
@@ -220,7 +248,22 @@ export function AutoEditPlayer({ plan, youtubeId, open, onClose }: Props) {
                   height: '100%',
                 }}
               >
-                <div id="auto-edit-player" className="h-full w-full" />
+                {usingMedia ? (
+                  <video
+                    {...media.videoProps}
+                    className="h-full w-full object-cover object-center"
+                    controls={false}
+                    playsInline
+                    preload="auto"
+                    disablePictureInPicture
+                    onSeeked={() => {
+                      // after a programmatic seek past a cut, resume playback
+                      if (playing) media.handle.play()
+                    }}
+                  />
+                ) : (
+                  <div id="auto-edit-player" className="h-full w-full" />
+                )}
               </div>
 
               {/* overlay: subtitle */}
@@ -288,6 +331,16 @@ export function AutoEditPlayer({ plan, youtubeId, open, onClose }: Props) {
                   </motion.div>
                 )}
               </AnimatePresence>
+
+              {/* media load failure (fallback active) — explain honestly */}
+              {mediaUrl && media.handle.error && (
+                <div className="absolute inset-x-3 top-3 flex items-start gap-2 rounded-lg border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-400">
+                  <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+                  <span>
+                    Local source unavailable ({media.handle.error}) — fell back to the YouTube embed.
+                  </span>
+                </div>
+              )}
 
               {/* "skipping cut" indicator */}
               {!inClip && started && (
@@ -385,16 +438,8 @@ export function AutoEditPlayer({ plan, youtubeId, open, onClose }: Props) {
                     size="icon"
                     variant="ghost"
                     className="h-9 w-9"
-                    onClick={() => {
-                      if (!player.isReady) return
-                      if (muted) {
-                        player.play?.()
-                        setMuted(false)
-                      } else {
-                        player.pause?.()
-                        setMuted(true)
-                      }
-                    }}
+                    onClick={() => setMuted((m) => !m)}
+                    title={muted ? 'Unmute' : 'Mute'}
                   >
                     {muted ? <VolumeX className="h-4 w-4" /> : <Volume2 className="h-4 w-4" />}
                   </Button>

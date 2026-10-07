@@ -5,6 +5,7 @@ import { getOrCreateSessionId } from '@/lib/session'
 import { STYLE_PRESETS } from '@/lib/editplan'
 import { extractYouTubeId, resolveYoutubeTranscript } from '@/lib/media'
 import { recordUsage } from '@/lib/usage'
+import { checkDailyUsageLimit, limitHeaders, limitReachedMessage } from '@/lib/usage-limits'
 import {
   AnalyzeResponseSchema,
   ClipCandidateSchema,
@@ -157,6 +158,15 @@ export async function POST(req: NextRequest) {
   try {
     const ownerId = await getOrCreateSessionId()
     const body = (await req.json()) as AnalyzeBody
+
+    // ---------- daily soft limit (persisted usage, friendly 429) ----------
+    const daily = await checkDailyUsageLimit(ownerId, 'analyze')
+    if (!daily.allowed) {
+      return NextResponse.json(
+        { error: limitReachedMessage({ ...daily, kind: 'analyze' }), code: 'DAILY_LIMIT_REACHED', kind: 'analyze', used: daily.used, cap: daily.cap, resetAt: daily.resetAt },
+        { status: 429, headers: limitHeaders(daily) },
+      )
+    }
 
     // ---------- input validation (Phase 3) ----------
     const title = (body.title ?? '').trim()

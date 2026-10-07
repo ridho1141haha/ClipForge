@@ -37,6 +37,8 @@ export interface YouTubePlayerHandle {
   getDuration: () => number
   setPlaybackRate: (rate: number) => void
   getPlayerState: () => number
+  /** Real mute toggle (the old mute button incorrectly paused playback) */
+  setMuted: (muted: boolean) => void
   isReady: boolean
 }
 
@@ -113,6 +115,10 @@ export function useYouTubePlayer(
       getDuration: () => player?.getDuration?.() ?? 0,
       setPlaybackRate: (rate: number) => player?.setPlaybackRate?.(rate),
       getPlayerState: () => player?.getPlayerState?.() ?? -1,
+      setMuted: (muted: boolean) => {
+        if (muted) player?.mute?.()
+        else player?.unMute?.()
+      },
       isReady,
     }),
     [player, isReady],

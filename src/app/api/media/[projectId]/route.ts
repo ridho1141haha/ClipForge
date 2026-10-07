@@ -4,6 +4,7 @@ import type { ReadStream } from 'node:fs'
 import { db } from '@/lib/db'
 import { getOrCreateSessionId } from '@/lib/session'
 import { mediaMimeForExt, resolveLocalMediaPath } from '@/lib/media'
+import { touchMediaCache } from '@/lib/media-cache'
 
 export const dynamic = 'force-dynamic'
 export const runtime = 'nodejs'
@@ -11,10 +12,12 @@ export const runtime = 'nodejs'
 /**
  * GET /api/media/[projectId] — stream the owning session's project source media.
  *
- * Status: VERIFIED backend endpoint (owner-scoped, path-contained, Range/206).
- * NOT yet wired into a UI player — the Auto-Edit preview still uses the
- * YouTube iframe. Wiring an HTML5 keep-range preview player to this endpoint
- * is a planned next step; the contract below is final:
+ * Status: WIRED. Consumed by (1) VideoPreview (main studio panel, HTML5
+ * <video> with native Range seeking), (2) AutoEditPlayer (cut-skipping
+ * keep-range preview with punch-in/subtitle overlays), and (3) RemotionPlayer
+ * (true keep-range composition — cuts physically removed, same contract the
+ * FFmpeg renderer consumes). All three fall back to the YouTube iframe
+ * approximation when the project has no streamable source.
  *
  * Security / honesty rules:
  *  - owner-scoped: a foreign session gets 404 (id existence is never disclosed)
@@ -40,10 +43,14 @@ export async function GET(
     }
     const project = await db.project.findFirst({
       where: { id, ownerId },
-      select: { localMedia: true, localMediaState: true, localMediaSize: true, title: true },
+      select: { localMedia: true, localMediaState: true, localMediaSize: true, title: true, youtubeId: true },
     })
     if (!project) {
       return NextResponse.json({ error: 'Project not found' }, { status: 404 })
+    }
+    // real usage is the strongest LRU signal — touch the cache hint (throttled)
+    if (project.youtubeId && project.localMedia?.startsWith('upload/yt/')) {
+      touchMediaCache(project.youtubeId)
     }
     if (project.localMediaState !== 'ready' || !project.localMedia) {
       return NextResponse.json(
