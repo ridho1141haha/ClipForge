@@ -131,3 +131,32 @@ Work Log:
 Stage Summary:
 - Pipeline is now closed end-to-end including uploads: file → ffprobe duration → Whisper word timestamps → transcript-grounded analysis → validated clips. transcriptSource='asr' is a first-class grounded source.
 - Remaining: PostgreSQL prep, shared rate-limit store, larger ASR models (base/small) as an option, renderer progress reporting granularity.
+
+---
+Task ID: audit-round-2 (P0 audit + fixes)
+Agent: Z.ai Code (lead architect / senior full-stack)
+Task: Fresh audit of current source (source of truth = code) per P0 list: word timestamps, clip detection chain, source→output mapping, renderer, golden E2E; then repo hygiene, P1 light (cancel/contract), P2 SaaS migration doc.
+
+Work Log:
+- AUDIT FINDINGS (all confirmed by reading code, not worklog):
+  1) media.ts parseJson3 estimated word timing even when json3 carries real per-word tOffsetMs (read then discarded); no measured/estimated provenance anywhere. srv3 files were preferred over vtt but parsed with the VTT parser (always 0 events — latent dead path).
+  2) analyze route: without transcript, contextRisk trusted the LLM (Boolean(c.context_risk)); context_safety uncapped; contextStatus=UNKNOWN.
+  3) subtitles.ts: totalCutDuration() returned KEPT sum and outputDuration() returned REMOVED (swapped) — currently unused elsewhere (landmine); mappings bounded to Number.MAX_SAFE_INTEGER; isDroppedByCuts kept 80%-covered events (comment≠code); render-recipe.ts had a second divergent droppedByCuts.
+  4) ffmpeg-renderer: silent-audio fallback condition had `|| true` (masked ANY failure with a silent render); filter order ass→zoompan→scale→crop distorted 16:9→9:16 whenever camera keyframes existed and zoomed subtitles; codec-check throw swallowed by catch{}; no run() timeout; no duration verification; no cancel.
+  5) repo hygiene: .env + db/custom.db tracked in git; dead top-level lib/ + hooks/ duplicates tracked.
+- FIXES IMPLEMENTED (all wired into real execution paths):
+  - parseJson3 rewritten: word start = tStartMs+tOffsetMs, end = next word start/event end; srv3 XML parser with ac-as/t word offsets added; wordTiming 'measured'|'estimated' computed (≥80% segs) and propagated: ResolvedTranscript → /api/source/prepare (persisted Project.wordTiming) → analyze route (body/project/default-estimated) → analysisMeta + API response → page.tsx state → SourceStatusPanel chip (warn amber "estimated" vs green "measured").
+  - analyze: !hasTranscript → contextStatus='NO_TRANSCRIPT', contextRisk=true, context_safety capped ≤5 (POST impossible without transcript — server authority).
+  - subtitles.ts: totalCutDuration=removed, outputDuration=kept (keptDuration helper); outputToSourceTime gained clipEnd bound (default MAX_SAFE for compat); sourceToOutputTimeBounded added; unified isDroppedByCuts rule (drop when <50% survives or <50ms); render-recipe.ts dedupe removed → uses canonical rule; buildZoompanFilter passes clipEnd.
+  - renderer: probeHasAudio() decides path ONCE (ffprobe); silent path ONLY for genuinely audio-less inputs, single attempt; filter order fixed scale→crop→zoompan→ass in BOTH mini-service and generateFFmpegScript (no distortion, subs fixed-size, burned last); codec+1080x1920 checks now FAIL the job (resolution check added); durationOk flag (±1.5s) surfaced in job/SSE; run() hard timeout (15min render / 30s probe) with SIGKILL; POST /jobs/:id/cancel → CANCELLED state, kills child, catch-block guard preserves state.
+  - generateASS: generated hook overlay {\an8} top-center (was colliding with bottom subtitles 0-3s); WrapStyle 0 (long lines wrap instead of clipping).
+- GOLDEN E2E (tests/e2e-render.ts, new): synthetic 40s 1280x720 testsrc2+sine fixture → EditPlan(clip 5–35, cut 15–25, punch-in 1.0→1.18, transcript words) → buildRenderRecipe/buildRecipeJSON/generateASS → POST to renderer → poll → download → assertions: job done, durationOk, output exists, duration 20s±0.75, 1080x1920 h264, aac stream, audio NOT silent (volumedetect), ASS events ≤ output duration, keep ranges exact. 16/16 PASS. Visual frame verification: t=1 (hook top + subtitle bottom, no collision), t=13 (post-cut, zoom active, correct 9:16 crop, no distortion).
+- REPO HYGIENE: git rm --cached .env db/custom.db (local files kept); deleted tracked dead duplicates top-level lib/ (11 files) + hooks/ (5 files) — nothing imports them (@/* → src/*); .gitignore += db/*.db, /upload/, download artifacts; added .env.example.
+- P1: RenderRecipe ARCHITECTURE CONTRACT documented in render-recipe.ts header (EditPlan→buildRenderRecipe→Renderer; renderer never imports UI/AI/DB; UI never builds ffmpeg; recipe JSON camera keyframes are OUTPUT-time; renderer swappable). CANCELLED job state + cancel endpoint added. AssetRef decision: documented as future seam in docs/SAAS-MIGRATION.md §4, deliberately NOT implemented (one storage backend exists; seams already narrow).
+- P2: docs/SAAS-MIGRATION.md written (auth, workspaces, SQLite→Postgres, storage+AssetRef, durable jobs w/ stage checkpoints, render workers, billing/usage enforcement points = the 4 already-rate-limited expensive routes, observability, public-deploy security checklist).
+- README updated: test matrix (73 unit / 16 e2e / 17 live), wordTiming honesty note, status line corrected (ASR no longer a gap).
+
+Stage Summary:
+- Verification (all green): unit 73/73 · golden E2E render 16/16 (+frame inspection) · live API 17/17 · tsc clean · eslint clean · browser: page renders, console clean.
+- Committed 1d102fc and pushed to origin/main.
+- Honest remaining limitations: (1) YouTube player endpoints bot-blocked from this sandbox IP → captions E2E for the 'measured' json3 path verified via unit tests on real-format fixtures, not against live YouTube; (2) renderer progress granularity still per-stage; (3) B-roll/SFX/music remain preview-only recommendations; (4) shared rate-limit store still in-memory (documented).
