@@ -160,3 +160,31 @@ Stage Summary:
 - Verification (all green): unit 73/73 · golden E2E render 16/16 (+frame inspection) · live API 17/17 · tsc clean · eslint clean · browser: page renders, console clean.
 - Committed 1d102fc and pushed to origin/main.
 - Honest remaining limitations: (1) YouTube player endpoints bot-blocked from this sandbox IP → captions E2E for the 'measured' json3 path verified via unit tests on real-format fixtures, not against live YouTube; (2) renderer progress granularity still per-stage; (3) B-roll/SFX/music remain preview-only recommendations; (4) shared rate-limit store still in-memory (documented).
+
+---
+Task ID: cron-review-2 (webDevReview round 3)
+Agent: Z.ai Code (autonomous review)
+Task: QA + feature round — verify stability, then advance product quality features.
+
+Work Log:
+- Status assessment: services healthy; regression gates ALL GREEN before starting (unit 73/73, E2E 16/16, live 17/17, browser console clean).
+- 🔴 CRITICAL BUG FOUND & FIXED (upload-render.tsx): the UI path sent the RAW RenderRecipe object (JSON.stringify(recipe)) instead of buildRecipeJSON(recipe). The raw object has NO keep_ranges, NO subtitles_ass, SOURCE-time camera keyframes → the renderer silently fell back to rendering the FULL clip window WITHOUT cuts and WITHOUT subtitles whenever a user rendered via the Upload tab. The golden E2E + prior live tests used buildRecipeJSON via scripts, so this UI-only path bug was invisible to the suites. Fixed: UI now sends the renderer-contract JSON. Lesson recorded: contract boundary (recipe JSON) is the ONLY valid wire format to the renderer.
+- NEW FEATURE — Karaoke word-highlight subtitles (uses MEASURED word timestamps):
+  • EditPlanSchema + SubtitleBlock type: optional word_timings[] (SOURCE time).
+  • plan route: deterministic rebuild blocks always carry real word timings; AI-authored blocks get them ONLY when normalized block text === normalized join of real words in its window (alignWordTimings helper) — never fabricated.
+  • generateASS: new buildKaraokeText() emits sequential \k tags; fill duration = delta between consecutive mapped word STARTS (gaps absorbed → stays in sync with speech); emphasis words bolded inline; REFUSES karaoke when any word boundary would be cut-snapped, timings degenerate/non-monotonic/outside block → plain-text fallback. SecondaryColour dimmed (&H00969696) for the unfilled state.
+  • VERIFIED VISUALLY: frame @t=1.2s shows spoken words bright, unspoken words dim (karaoke fill working in real render).
+- NEW FEATURE — Render cancel in UI (upload-render.tsx): Cancel button → POST /api/render-proxy/jobs/:id/cancel; poll handles 'cancelled' state (no partial file kept); amber notice banner; durationOk=false → warning badge "duration deviates from plan".
+- NEW FEATURE — Clip editor word snapping (clip-editor.tsx): sliders now 0.1s step; word-boundary ruler visualizes real word positions inside the clip; "snap to speech" toggle (default on when ≥2 words) snaps boundaries to word onsets/endings/gap midpoints within 1.5s; live hint shows which word was snapped ("start snapped to speech: 'actually'").
+- Tests added: +7 karaoke unit assertions (durations math, bold emphasis, cut-snap refusal, window refusal, non-monotonic refusal, no-timings fallback, generateASS integration); golden E2E fixture now carries word_timings + asserts \k in ASS (16→17 assertions).
+- Regression after changes: unit 80/80 · golden E2E 17/17 · live 17/17 · tsc clean · eslint clean · browser renders, console clean.
+- Committed 4884a7c, pushed to origin/main.
+
+Stage Summary:
+- Project state: STABLE and advancing. Core engine reliability preserved (all honesty gates intact: karaoke only from measured timing, never fabricated).
+- Next round suggestions (priority order):
+  1) Usage metering light (UsageEvent table + record analyze/transcribe/render seconds) — enforcement points documented in docs/SAAS-MIGRATION.md §7-8.
+  2) Retry-from-stage for failed SourceJobs (download↔transcribe checkpointing).
+  3) Timeline zoom/scrub polish in timeline.tsx + cut handles snapping to the same word-gap logic as clip-editor.
+  4) Optional: renderer stage-level progress from ffmpeg `-progress` pipe for smoother UI.
+- Risks: none new. Known standing limits unchanged (YouTube IP-block in sandbox; B-roll/SFX/music preview-only; in-memory rate-limit store).
