@@ -314,7 +314,37 @@ export function normalizeText(s: string): string {
     .trim()
 }
 
-/** Check if spoken hook exists in transcript (fuzzy). Empty transcript = NOT verified. */
+/**
+ * Order-preserving subsequence test: every hook word must appear in the
+ * transcript stream in the same relative order (gaps allowed).
+ */
+function isOrderedSubsequence(hookWords: string[], transcriptWords: string[]): boolean {
+  let ti = 0
+  for (const hw of hookWords) {
+    while (ti < transcriptWords.length && transcriptWords[ti] !== hw) ti++
+    if (ti >= transcriptWords.length) return false
+    ti++ // consume
+  }
+  return true
+}
+
+/**
+ * Confidence threshold at which a hook may be marked VERIFIED.
+ * A bare 3-gram appearing anywhere is deliberately NOT enough any more.
+ */
+export const HOOK_VERIFY_THRESHOLD = 0.8
+
+/**
+ * Verify a spoken hook against a transcript — STRICT tiers:
+ *  1.0  exact normalized phrase contained in the transcript
+ *  0.95 contiguous ≥6-word run of the hook found verbatim
+ *  0.90 contiguous 5-word run
+ *  0.85 contiguous 4-word run AND ≥80% of hook tokens present
+ *  0.80 contiguous 3-word run AND ≥90% coverage, OR ≥95% coverage with all
+ *       words present in order (reconstruction from the actual word stream)
+ *  Anything weaker does NOT match (confidence reported for diagnostics only).
+ * Empty transcript = NOT verified, ever.
+ */
 export function validateHookAgainstTranscript(
   hook: string,
   transcript: string | null | undefined,
@@ -323,19 +353,44 @@ export function validateHookAgainstTranscript(
   const hookNorm = normalizeText(hook)
   if (!hookNorm) return { match: false, confidence: 0 }
   const transcriptNorm = normalizeText(transcript)
-  if (transcriptNorm.includes(hookNorm)) return { match: true, confidence: 1 }
   const hookWords = hookNorm.split(' ').filter(Boolean)
-  if (hookWords.length >= 4) {
-    const firstFour = hookWords.slice(0, 4).join(' ')
-    if (transcriptNorm.includes(firstFour)) return { match: true, confidence: 0.85 }
-    const lastFour = hookWords.slice(-4).join(' ')
-    if (transcriptNorm.includes(lastFour)) return { match: true, confidence: 0.85 }
+  if (hookWords.length === 0) return { match: false, confidence: 0 }
+  if (transcriptNorm.includes(hookNorm)) return { match: true, confidence: 1 }
+
+  // longest contiguous run of the hook's words found verbatim in the transcript
+  let bestRun = 0
+  for (let len = Math.min(hookWords.length, 12); len >= 3; len--) {
+    let found = false
+    for (let i = 0; i + len <= hookWords.length; i++) {
+      if (transcriptNorm.includes(hookWords.slice(i, i + len).join(' '))) {
+        found = true
+        break
+      }
+    }
+    if (found) {
+      bestRun = len
+      break
+    }
   }
-  for (let i = 0; i <= hookWords.length - 3; i++) {
-    const window = hookWords.slice(i, i + 3).join(' ')
-    if (transcriptNorm.includes(window)) return { match: true, confidence: 0.7 }
+
+  // token coverage: fraction of hook words present anywhere in the transcript
+  const tWords = new Set(transcriptNorm.split(' ').filter(Boolean))
+  const covered = hookWords.filter((w) => tWords.has(w)).length
+  const coverage = covered / hookWords.length
+
+  if (bestRun >= 6) return { match: true, confidence: 0.95 }
+  if (bestRun >= 5) return { match: true, confidence: 0.9 }
+  if (bestRun >= 4 && coverage >= 0.8) return { match: true, confidence: 0.85 }
+  if (bestRun >= 3 && coverage >= 0.9) return { match: true, confidence: 0.8 }
+  if (
+    hookWords.length >= 5 &&
+    coverage >= 0.95 &&
+    isOrderedSubsequence(hookWords, transcriptNorm.split(' ').filter(Boolean))
+  ) {
+    return { match: true, confidence: 0.8 }
   }
-  return { match: false, confidence: 0 }
+  // diagnostic-only confidence (never reaches HOOK_VERIFY_THRESHOLD)
+  return { match: false, confidence: bestRun >= 3 ? 0.5 : coverage >= 0.6 ? 0.4 : 0 }
 }
 
 // ---- Context validation (Phase 7) ----
@@ -425,7 +480,9 @@ export function checkContext(input: ContextCheckInput): ContextCheckResult {
   const idxLast = sorted.indexOf(lastWord)
   const nextWord = idxLast < sorted.length - 1 ? sorted[idxLast + 1] : null
   const endsClean = nextWord ? nextWord.start - lastWord.end >= 0.5 : true
-  const endsMidPunct = !/[.!?…]$/.test(normalizeText(lastWord.word)) === false
+  // punctuation must be tested on the RAW word — normalizeText strips it, and
+  // testing a stripped string for punctuation is always false (real bug)
+  const endsMidPunct = /[.!?…]["')\]]?$/.test(lastWord.word.trim())
   const midSentence = !endsClean && !endsMidPunct
   if (midSentence && nextWord) {
     let newEnd = end

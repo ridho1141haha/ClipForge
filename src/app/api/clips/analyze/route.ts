@@ -5,7 +5,6 @@ import { getOrCreateSessionId } from '@/lib/session'
 import { STYLE_PRESETS } from '@/lib/editplan'
 import { extractYouTubeId, resolveYoutubeTranscript } from '@/lib/media'
 import { recordUsage } from '@/lib/usage'
-import { sourceToOutputTime } from '@/lib/subtitles'
 import {
   AnalyzeResponseSchema,
   ClipCandidateSchema,
@@ -16,6 +15,7 @@ import {
   dedupeAndRank,
   determineRecommendation,
   extractJsonObject,
+  HOOK_VERIFY_THRESHOLD,
   recalcTotal,
   rateLimitHeaders,
   validateHookAgainstTranscript,
@@ -162,15 +162,6 @@ export async function POST(req: NextRequest) {
     const title = (body.title ?? '').trim()
     if (!title) return NextResponse.json({ error: 'Title is required' }, { status: 400, headers: rlHeaders })
 
-    const duration = Number(body.duration)
-    if (!isFinite(duration) || duration <= 0) {
-      // P1 fix: never fall back to a fake default like 720 — fail explicitly
-      return NextResponse.json(
-        { error: 'Real video duration is required. Fetch metadata first or enter the duration manually — ClipForge does not guess durations.' },
-        { status: 400, headers: rlHeaders },
-      )
-    }
-
     const platform = body.platform && PLATFORM_TARGET[body.platform] ? body.platform : DEFAULT_PLATFORM
     const style = body.style ?? DEFAULT_STYLE
     const clipCount = Math.max(3, Math.min(10, body.clipCount ?? 6))
@@ -181,8 +172,16 @@ export async function POST(req: NextRequest) {
         ? Math.max(minLen, Math.min(maxLen, body.targetDuration))
         : Math.round((minLen + maxLen) / 2)
 
-    // ---------- ownership check when persisting ----------
-    let project: { id: string; transcript: string | null; transcriptWords: string | null; transcriptSource: string; wordTiming: string | null } | null = null
+    // ---------- ownership check: load the project BEFORE trusting any source data ----------
+    let project: {
+      id: string
+      duration: number | null
+      durationSource: string | null
+      transcript: string | null
+      transcriptWords: string | null
+      transcriptSource: string
+      wordTiming: string | null
+    } | null = null
     if (body.projectId) {
       const p = await db.project.findUnique({ where: { id: body.projectId } })
       if (!p || p.ownerId !== ownerId) {
@@ -191,15 +190,36 @@ export async function POST(req: NextRequest) {
       project = p
     }
 
-    // words: body wins, then project record
-    let words: TWord[] = Array.isArray(body.words)
-      ? body.words.filter((w) => typeof w?.word === 'string' && isFinite(w?.start) && isFinite(w?.end)).map((w) => ({ word: w.word, start: Number(w.start), end: Number(w.end) }))
-      : []
-    if (words.length === 0 && project?.transcriptWords) {
+    // REAL duration: the server-stored value (prepare/ASR/probe) is authoritative.
+    // The client value only fills the gap when nothing real is stored yet (manual
+    // duration on a first analysis). A fake default like 720 is NEVER applied.
+    const storedDuration =
+      project && typeof project.duration === 'number' && isFinite(project.duration) && project.duration > 0
+        ? project.duration
+        : null
+    const duration = storedDuration ?? Number(body.duration)
+    if (!isFinite(duration) || duration <= 0) {
+      // never fall back to a fake default like 720 — fail explicitly
+      return NextResponse.json(
+        { error: 'Real video duration is required. Run source preparation, fetch metadata, or enter the duration manually — ClipForge does not guess durations.' },
+        { status: 400, headers: rlHeaders },
+      )
+    }
+    const durationSource = storedDuration != null ? project!.durationSource ?? 'stored' : body.durationSource ?? 'unknown'
+
+    // words: the SERVER record wins (prepared captions/ASR data); the client body
+    // only fills the gap when the project has no stored word timestamps.
+    let words: TWord[] = []
+    if (project?.transcriptWords) {
       try {
         const parsed = JSON.parse(project.transcriptWords) as TWord[]
-        if (Array.isArray(parsed)) words = parsed
+        if (Array.isArray(parsed) && parsed.length > 0) words = parsed
       } catch { /* corrupted JSON → treat as absent */ }
+    }
+    if (words.length === 0 && Array.isArray(body.words)) {
+      words = body.words
+        .filter((w) => typeof w?.word === 'string' && isFinite(w?.start) && isFinite(w?.end))
+        .map((w) => ({ word: w.word, start: Number(w.start), end: Number(w.end) }))
     }
 
     // ---------- AUTO-GROUNDING: fetch YouTube captions when no transcript supplied ----------
@@ -230,16 +250,18 @@ export async function POST(req: NextRequest) {
       }
     }
 
-    // transcript: body wins, then project record, then auto-fetched words, then synthesized from word timestamps
-    const transcript = (bodyTranscriptTrim || project?.transcript?.trim() || (words.length > 0 ? words.map((w) => w.word).join(' ') : '')) as string
-    const transcriptSource = body.transcriptSource
+    // transcript: SERVER record wins → client manual paste → auto-fetched caption words
+    const transcript = ((project?.transcript?.trim()) || bodyTranscriptTrim || (words.length > 0 ? words.map((w) => w.word).join(' ') : '')) as string
+    const transcriptSource =
+      (project?.transcript?.trim() && project.transcriptSource !== 'none' ? project.transcriptSource : undefined)
+      ?? (bodyTranscriptTrim ? body.transcriptSource ?? 'manual' : undefined)
       ?? (words.length > 0 && autoCaptionsNote ? 'youtube-captions' : undefined)
       ?? project?.transcriptSource
       ?? (transcript ? 'manual' : 'none')
-    // word-timing provenance: explicit body flag > persisted project flag > honest default
+    // word-timing provenance: persisted project flag wins, then explicit body flag, then honest default
     const wordTiming: 'measured' | 'estimated' | null =
-      body.wordTiming
-      ?? (project?.wordTiming === 'measured' || project?.wordTiming === 'estimated' ? project.wordTiming : null)
+      (project?.wordTiming === 'measured' || project?.wordTiming === 'estimated' ? project.wordTiming : null)
+      ?? body.wordTiming
       ?? (autoCaptionsNote ? 'measured' : null)
       ?? (words.length > 0 ? 'estimated' : null)
     const hasTranscript = transcript.length > 0
@@ -333,7 +355,7 @@ Return the JSON object now.`
         analyzedAt: new Date().toISOString(),
         transcriptSource,
         wordTiming,
-        durationSource: body.durationSource ?? 'unknown',
+        durationSource,
       }
       analysisMeta = meta
       const pid = project.id
@@ -496,13 +518,30 @@ function processCandidate(c: AICandidate, idx: number, ctx: ProcessCtx): Process
     contextRisk = true
   }
 
-  // spoken hook: verbatim-from-transcript requirement
+  // transcript excerpt + clip-local words (grounded data for plan/export).
+  // Computed BEFORE hook verification so the hook can be checked against the
+  // clip's own word window first.
+  const clipWords = sortedWords.filter((w) => w.end > start && w.start < end)
+  const transcriptExcerpt = clipWords.length > 0
+    ? clipWords.map((w) => w.word).join(' ')
+    : hasTranscript
+      ? excerptFromText(transcript, start, end, duration)
+      : ''
+
+  // spoken hook: verbatim-from-transcript requirement, verified at a STRICT
+  // threshold (HOOK_VERIFY_THRESHOLD). A bare 3-word n-gram is not enough.
   const hookRaw = String(c.spoken_hook ?? c.hook ?? '').trim()
   let spokenHook = hookRaw.slice(0, 300)
   let hookVerified = false
   if (hasTranscript && spokenHook) {
-    const v = validateHookAgainstTranscript(spokenHook, transcript)
-    hookVerified = v.match && v.confidence >= 0.7
+    // window-first: the quote must come from INSIDE the clip's own word window;
+    // fall back to the full transcript (stricter tiers still apply)
+    const windowText = clipWords.map((w) => w.word).join(' ')
+    const inWindow = windowText ? validateHookAgainstTranscript(spokenHook, windowText) : null
+    const v = inWindow && inWindow.match && inWindow.confidence >= HOOK_VERIFY_THRESHOLD
+      ? inWindow
+      : validateHookAgainstTranscript(spokenHook, transcript)
+    hookVerified = v.match && v.confidence >= HOOK_VERIFY_THRESHOLD
     if (!hookVerified) spokenHook = '' // never present a fabricated quote as verified
   } else if (!hasTranscript) {
     hookVerified = false
@@ -511,14 +550,6 @@ function processCandidate(c: AICandidate, idx: number, ctx: ProcessCtx): Process
       spokenHook = ''
     }
   }
-
-  // transcript excerpt + clip-local words (grounded data for plan/export)
-  const clipWords = sortedWords.filter((w) => w.end > start && w.start < end)
-  const transcriptExcerpt = clipWords.length > 0
-    ? clipWords.map((w) => w.word).join(' ')
-    : hasTranscript
-      ? excerptFromText(transcript, start, end, duration)
-      : ''
 
   // Phase 5: server-side scoring — the model's total/recommendation are ignored
   const rawScores = {
@@ -570,6 +601,3 @@ function excerptFromText(transcript: string, start: number, end: number, duratio
   const to = Math.ceil((end / dur) * transcript.length)
   return transcript.slice(Math.max(0, from - 200), Math.min(transcript.length, to + 200)).replace(/\s+/g, ' ').trim()
 }
-
-// output-time helper re-export used by tests
-export const __testHelpers = { sourceToOutputTime }

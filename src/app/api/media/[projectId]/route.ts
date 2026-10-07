@@ -11,9 +11,10 @@ export const runtime = 'nodejs'
 /**
  * GET /api/media/[projectId] — stream the owning session's project source media.
  *
- * Purpose: the Auto-Edit preview plays the REAL downloaded/persisted source
- * (keep-range skipping, punch-in, subtitles) instead of the YouTube iframe
- * approximation — same ownership model as every other project route.
+ * Status: VERIFIED backend endpoint (owner-scoped, path-contained, Range/206).
+ * NOT yet wired into a UI player — the Auto-Edit preview still uses the
+ * YouTube iframe. Wiring an HTML5 keep-range preview player to this endpoint
+ * is a planned next step; the contract below is final:
  *
  * Security / honesty rules:
  *  - owner-scoped: a foreign session gets 404 (id existence is never disclosed)
@@ -25,11 +26,18 @@ export const runtime = 'nodejs'
  */
 export async function GET(
   req: NextRequest,
-  ctx: { params: Promise<{ id: string }> },
+  ctx: { params: Promise<{ projectId: string }> },
 ) {
   try {
     const ownerId = await getOrCreateSessionId()
-    const { id } = await ctx.params
+    // NOTE: the dynamic segment is named [projectId] — the params key MUST be
+    // `projectId`. Destructuring any other name yields `undefined`, and Prisma
+    // silently drops `undefined` filters, which would stream the FIRST owned
+    // project's media regardless of the requested id.
+    const { projectId: id } = await ctx.params
+    if (!id) {
+      return NextResponse.json({ error: 'Project id is required' }, { status: 400 })
+    }
     const project = await db.project.findFirst({
       where: { id, ownerId },
       select: { localMedia: true, localMediaState: true, localMediaSize: true, title: true },

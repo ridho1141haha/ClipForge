@@ -78,6 +78,15 @@ console.log('\n== Test B: transcript-grounded hooks ==')
   assert(!v3.match && v3.confidence === 0, 'empty transcript → NOT verified (never fake)')
   const v4 = validateHookAgainstTranscript('the future of, artificial intelligence!', transcript)
   assert(v4.match, 'punctuation-insensitive matching')
+  // STRICT tiers — a bare 3-gram anywhere is NO LONGER enough (mission P0 #6):
+  const v5 = validateHookAgainstTranscript('we talk about anything else entirely', transcript)
+  assert(!v5.match, '3-gram hit + low coverage → NOT verified (was wrongly 0.7 before)', `conf=${v5.confidence}`)
+  const v6 = validateHookAgainstTranscript('show today we talk about cooking', transcript)
+  assert(v6.match && v6.confidence >= 0.85, '5-word contiguous run + coverage → verified', `conf=${v6.confidence}`)
+  const v7 = validateHookAgainstTranscript('welcome show today talk future matters', transcript)
+  assert(v7.match && v7.confidence >= 0.8, 'ordered-subsequence reconstruction (100% coverage, in order) → verified', `conf=${v7.confidence}`)
+  const v8 = validateHookAgainstTranscript('welcome future show talk', transcript)
+  assert(!v8.match || v8.confidence < 0.8, 'scrambled word order + gaps → not confidently verified', `conf=${v8.confidence}`)
 }
 
 // ---------------------------------------------------------------------------

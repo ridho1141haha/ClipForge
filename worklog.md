@@ -263,3 +263,28 @@ Stage Summary:
   3) Usage-based soft limits (daily cap → friendly 429) — UsageEvent + endpoints already exist.
   4) Storage hygiene: cap/LRU-clean upload/yt (33MB/video adds up), project delete should remove its media dir.
 - Risks: none new. Standing limits: YouTube endpoints are IP-dependent (all flows degrade honestly); in-memory rate-limit store; B-roll/SFX/music preview-only.
+
+---
+Task ID: reconcile-1 (reconcile main with target architecture)
+Agent: Z.ai Code (senior engineer)
+Task: Reconcile main branch — audit every execution path against the target architecture (source preparation → real duration → real transcript → word timestamps → grounded analyze → server scoring → dedupe → plan → export → render), fix discrepancies, remove false claims, enforce build/test gates.
+
+Work Log:
+- Pushed previously-local commits (93d85a1..5ca062b) to origin/main.
+- Audited all 17 route files + libs via full wiring trace (routes × session × Zod × DB-vs-client × utility call-sites). Classification: analyze/plan/export/render/prepare/jobs/usage = IMPLEMENTED+WIRED; GET /api/clips + GET/PATCH/DELETE /api/clips/[id] = implemented-but-unused-by-UI (kept — correct REST surface); /api = legacy template (REMOVED).
+- 🐛 P0 BUG FIXED (media route, orphan commit 5ca062b): `[projectId]` param destructured as `{ id }` → Prisma silently dropped the undefined id filter → ANY media request streamed the FIRST owned project's media. Fixed destructure + 400 guard. Regression-proven: nonexistent id now 404 (pre-fix would be 200 wrong-media); owner+Range → 206 video/mp4; foreign session → 404.
+- 🔒 Analyze route no longer trusts client source data when a project exists (mission #3): server-stored duration/transcript/transcriptWords/transcriptSource/wordTiming now WIN over the body; client values only fill gaps (first-run manual path). Regression test proves a lying client `duration: 720` is ignored in favor of the stored 2383s.
+- 🔒 Hook grounding strengthened (mission #6): validateHookAgainstTranscript rewritten to strict tiers — exact phrase 1.0 / ≥6-run 0.95 / 5-run 0.90 / 4-run+80% coverage 0.85 / 3-run+90% coverage OR ≥95% ordered-subsequence reconstruction 0.8; VERIFIED threshold raised 0.7 → 0.8 (HOOK_VERIFY_THRESHOLD); analyze now verifies the quote against the clip's OWN word window first, then the full transcript. A bare 3-gram no longer verifies anything. Unit tests lock the old-wrong case (3-gram+low coverage → NOT verified).
+- 🐛 checkContext bug fixed: endsMidPunct tested punctuation against normalizeText() output (which strips punctuation) → always false; now tests the raw word. Mid-sentence end-extension no longer runs past completed sentences.
+- Build gates (mission 26–28): next.config.ts ignoreBuildErrors true→false, reactStrictMode false→true (no hydration/double-render issues observed in browser); package.json adds typecheck/check/test/test:scale scripts.
+- Dead code removed (single-strategy rule): /api hello-world route, peekSessionId, getStylePreset, parseScores, ClipCandidate/AnalyzeResult duplicates in editplan.ts, __testHelpers re-export in analyze, `void normalizeText` in plan, dead `transcript: ?undefined:undefined` conditional in page.tsx save flow.
+- Media route doc-claim corrected to honest status (VERIFIED backend endpoint, NOT yet wired to a UI player) — the Auto-Edit preview still uses the YouTube iframe; HTML5 keep-range preview is the next planned step.
+- NEW tests/long-source-scale.ts (15 assertions, test:scale): mission video PLOpsj6DVQ8 (39:43) is bot-blocked from this sandbox IP (429 → "Sign in to confirm you're not a bot"; yt-dlp + innertube WEB/ANDROID/IOS/TVHTML5/WEB_EMBEDDED all rejected; control video dQw4w9WgXcQ resolves fine → IP is fine, this video's fetch is throttled). System degrades honestly (duration=null + requiresManualDuration, NO 720). Scale mechanics proven at the real 2383s duration via the first-class manual path: 400-on-missing-duration, clips inside [0,2383], platform bounds, strict-threshold hook verification, server totals, DB-duration-wins-vs-lying-client.
+- REGRESSION GATES after all changes: tsc clean · eslint clean · unit 106/106 · golden E2E 17/17 (render 20.000s 1080×1920 h264+aac, non-silent) · live 17/17 · url-render 17/17 · scale 15/15.
+- Browser QA (agent-browser, strict mode ON): golden path URL → prepare → analyze → 3 clips, all hooks verbatim + "verified in transcript" (real lyrics), scores 82.7/82.1/80.0, speech-map strip, library render-ready chips; console clean; full-page screenshot verified.
+
+Stage Summary:
+- Execution paths now MATCH the documented architecture with no false claims: every claim above is backed by a passing automated check or a direct probe.
+- Real-caption grounding + real media render proven on dQw4w9WgXcQ (213s via yt-dlp, 291 word timestamps, full URL→MP4 loop).
+- Standing limits (honest): PLOpsj6DVQ8-specific YouTube bot-block from this IP (retry may succeed later); B-roll/SFX/music/animations preview-only; in-memory rate-limit store; /api/media endpoint ready but UI-unwired.
+- Final status per mission rubric: MVP (all P0/P1 wired + tested; production-ready requires multi-tenant hardening, persistent rate-limit store, and unblocked YouTube egress).

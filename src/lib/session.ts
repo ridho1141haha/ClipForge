@@ -32,12 +32,3 @@ export async function getOrCreateSessionId(): Promise<string> {
   }
   return sid
 }
-
-/**
- * Read session id without creating one (for optional scoping).
- */
-export async function peekSessionId(): Promise<string | null> {
-  const store = await cookies()
-  const existing = store.get(SESSION_COOKIE)?.value
-  return existing && /^[\w-]{8,64}$/.test(existing) ? existing : null
-}

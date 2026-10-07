@@ -123,19 +123,6 @@ export interface SubtitleBlock {
   word_timings?: { word: string; start: number; end: number }[]
 }
 
-export interface ClipCandidate {
-  id: string
-  start: number
-  end: number
-  duration: number
-  title: string
-  hook: string // spoken hook (from source)
-  scores: ClipScores
-  reason: string
-  context_risk: boolean
-  recommendation: 'POST' | 'SKIP'
-}
-
 export interface EditPlan {
   project: {
     title: string
@@ -166,15 +153,6 @@ export interface EditPlan {
     music: MusicPlan
     subtitles: SubtitleBlock[]
   }
-}
-
-export interface AnalyzeResult {
-  candidates: ClipCandidate[]
-  platform: string
-  style: string
-  targetDuration: number
-  contentSummary: string
-  estimatedDuration: number
 }
 
 // ---- Style presets ----
@@ -245,10 +223,6 @@ export const STYLE_PRESETS: StylePreset[] = [
   },
 ]
 
-export function getStylePreset(id: string): StylePreset | undefined {
-  return STYLE_PRESETS.find((s) => s.id === id)
-}
-
 // ---- score helpers ----
 export function scoreColor10(v: number): { bg: string; text: string; label: string } {
   if (v >= 8.5) return { bg: 'bg-emerald-500/15', text: 'text-emerald-600 dark:text-emerald-400', label: 'Excellent' }
@@ -303,15 +277,4 @@ export function safeJson<T>(raw: unknown, fallback: T): T {
   }
 }
 
-export function parseScores(raw: unknown): ClipScores {
-  return safeJson<ClipScores>(raw, {
-    hook: 0,
-    curiosity: 0,
-    emotion: 0,
-    payoff: 0,
-    standalone: 0,
-    shareability: 0,
-    context_safety: 0,
-    total: 0,
-  })
-}
+// (parseScores removed — dead code; scores parsing happens via safeJson at call sites)

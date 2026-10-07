@@ -2,11 +2,12 @@ import type { NextConfig } from "next";
 
 const nextConfig: NextConfig = {
   output: "standalone",
-  /* config options here */
+  // Build MUST fail on type errors — silently compiling them hides real defects.
   typescript: {
-    ignoreBuildErrors: true,
+    ignoreBuildErrors: false,
   },
-  reactStrictMode: false,
+  // Strict Mode surfaces double-render/desync bugs; fix root causes, don't mask them.
+  reactStrictMode: true,
 };
 
 export default nextConfig;

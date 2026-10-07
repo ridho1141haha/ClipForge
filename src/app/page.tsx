@@ -956,7 +956,9 @@ export default function Home() {
             description: meta.description,
             duration: meta.duration,
             durationSource: meta.durationSource ?? (meta.duration ? 'unknown' : 'unavailable'),
-            transcript: analyzeResult?.transcriptSource && analyzeResult.transcriptSource !== 'none' ? undefined : undefined,
+            // transcript is intentionally NOT sent here: the analyze route already
+            // persisted the real transcript (with provenance) into the project when
+            // one was available; sending it again would risk masking provenance.
             transcriptSource: analyzeResult?.transcriptSource,
           }),
         })

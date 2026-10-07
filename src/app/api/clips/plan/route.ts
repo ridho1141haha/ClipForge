@@ -409,9 +409,6 @@ Return the JSON object now. All timestamps must be absolute seconds within [${cl
   }
 }
 
-// silence unused-import lint if normalizeText becomes unnecessary later
-void normalizeText
-
 /**
  * Attach REAL word timings to an AI-authored subtitle block — but ONLY when
  * the block text is EXACTLY the words spoken inside its own window (punctuation
