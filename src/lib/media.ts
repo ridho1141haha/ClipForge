@@ -36,6 +36,14 @@ export interface ResolvedTranscript {
   words: WordTimestamp[]
   source: TranscriptSource
   language?: string
+  /**
+   * 'measured'  — each word start/end comes from the source's own word-level
+   *               timing data (json3 tOffsetMs, srv3 word offsets, or ASR).
+   * 'estimated' — no true word timing in the source; word times are evenly
+   *               distributed within segment timings (clearly labeled, never
+   *               treated as true word timestamps downstream).
+   */
+  wordTiming: 'measured' | 'estimated'
   error?: string
 }
 
@@ -139,7 +147,11 @@ async function ytDlpCaptions(youtubeId: string, langPref = 'en,id'): Promise<{ j
     if (files[0].endsWith('.json3')) {
       return { json3: JSON.parse(content), lang }
     }
-    // Convert VTT/SRV3 → json3-like structure for uniform parsing
+    if (files[0].endsWith('.srv3')) {
+      // srv3 (XML) can carry word-level offsets in <s> elements
+      return { json3: srv3ToJson3(content), lang }
+    }
+    // VTT has NO word timing → converted to segment-level json3 (estimated)
     return { json3: vttToJson3(content), lang }
   } catch {
     return null
@@ -169,6 +181,42 @@ function vttToJson3(vtt: string): unknown {
     const text = lines.slice(idx + 1).join(' ').replace(/<[^>]+>/g, '').trim()
     if (!text) continue
     events.push({ tStartMs: start, dDurationMs: Math.max(1, end - start), segs: [{ utf8: text }] })
+  }
+  return { events }
+}
+
+/**
+ * Minimal srv3 (XML timedtext) → json3-ish converter.
+ * <p t="start" d="dur"><s ac-as="offset"|t="offset">word</s>...</p>
+ * When <s> word offsets exist they are preserved (measured word timing);
+ * when absent, parseJson3 falls back to even distribution (estimated).
+ */
+function srv3ToJson3(xml: string): unknown {
+  const events: { tStartMs: number; dDurationMs: number; segs: { utf8: string; tOffsetMs?: number }[] }[] = []
+  const pRe = /<p\b[^>]*\bt="(\d+)"[^>]*(?:\bd="(\d+)")?[^>]*>([\s\S]*?)<\/p>/g
+  let pm: RegExpExecArray | null
+  while ((pm = pRe.exec(xml)) !== null) {
+    const tStartMs = Number(pm[1])
+    const dDurationMs = Number(pm[2] ?? 0) || 3000
+    const inner = pm[3]
+    const segs: { utf8: string; tOffsetMs?: number }[] = []
+    const sRe = /<s\b([^>]*)>([\s\S]*?)<\/s>/g
+    let sm: RegExpExecArray | null
+    let foundS = false
+    while ((sm = sRe.exec(inner)) !== null) {
+      foundS = true
+      const attrs = sm[1] ?? ''
+      const offM = attrs.match(/\bac-as="(\d+)"/) ?? attrs.match(/\bt="(\d+)"/)
+      const off = offM ? Number(offM[1]) : 0
+      const text = sm[2].replace(/<[^>]+>/g, '')
+      if (!text.trim()) continue
+      segs.push({ utf8: text, tOffsetMs: isFinite(off) ? off : undefined })
+    }
+    if (!foundS) {
+      const text = inner.replace(/<[^>]+>/g, '').trim()
+      if (text) segs.push({ utf8: text })
+    }
+    if (segs.length > 0) events.push({ tStartMs, dDurationMs, segs })
   }
   return { events }
 }
@@ -308,28 +356,81 @@ export async function resolveYoutubeMeta(url: string): Promise<ResolvedMeta> {
 
 interface Json3Event { tStartMs: number; dDurationMs?: number; segs?: { utf8: string; tOffsetMs?: number }[] }
 
-function parseJson3(json3: unknown): { words: WordTimestamp[]; text: string } {
+/**
+ * Parse YouTube json3 captions into word timestamps.
+ *
+ * TIMING HONESTY (critical): auto-generated YouTube captions carry REAL
+ * word-level offsets — each `seg.tOffsetMs` is the word's offset from the
+ * event start. When those offsets exist we use them verbatim and mark the
+ * result 'measured'. Only when a track has NO per-word offsets (some manual
+ * tracks, VTT fallback) do we distribute segment time evenly across words —
+ * and that is explicitly labeled 'estimated', never treated as true word
+ * timestamps downstream.
+ */
+function parseJson3(json3: unknown): { words: WordTimestamp[]; text: string; wordTiming: 'measured' | 'estimated' } {
   const words: WordTimestamp[] = []
   const lines: string[] = []
   const events = (json3 as { events?: Json3Event[] })?.events ?? []
+  let measuredSegs = 0
+  let totalSegs = 0
+
+  const round2 = (n: number) => Math.round(n * 100) / 100
+
   for (const ev of events) {
-    if (!Array.isArray(ev.segs)) continue
-    const lineWords: string[] = []
+    if (!Array.isArray(ev.segs) || ev.segs.length === 0) continue
+    const eventStartMs = ev.tStartMs ?? 0
+    const eventEndMs = eventStartMs + (ev.dDurationMs ?? 0)
+
+    // collect usable segments first
+    const usable: { text: string; offsetMs: number | null }[] = []
     for (const seg of ev.segs) {
       const raw = (seg.utf8 ?? '').replace(/\n/g, ' ').trim()
       if (!raw || raw === '\u200b' || raw === '&nbsp;') continue
-      const segStart = (ev.tStartMs ?? 0) / 1000 + (seg.tOffsetMs ?? 0) / 1000
-      // split segment into words, distributing time evenly within the segment
-      const parts = raw.split(/\s+/)
-      const per = parts.length > 0 ? Math.max(0.08, (ev.dDurationMs ?? parts.length * 240) / 1000 / parts.length) : 0.2
-      parts.forEach((p, i) => {
-        lineWords.push(p)
-        words.push({ word: p, start: Math.round((segStart + i * per) * 100) / 100, end: Math.round((segStart + (i + 1) * per) * 100) / 100 })
-      })
+      usable.push({ text: raw, offsetMs: typeof seg.tOffsetMs === 'number' && isFinite(seg.tOffsetMs) ? seg.tOffsetMs : null })
     }
-    if (lineWords.length > 0) lines.push(lineWords.join(' '))
+    if (usable.length === 0) continue
+
+    for (const u of usable) {
+      totalSegs++
+      if (u.offsetMs !== null) measuredSegs++
+    }
+
+    const allMeasured = usable.every((u) => u.offsetMs !== null)
+
+    if (allMeasured) {
+      // REAL word-level timing: start = eventStart + offset; end = next word's
+      // start (or event end for the last word). No estimation involved.
+      const starts = usable.map((u) => (eventStartMs + (u.offsetMs as number)) / 1000)
+      for (let i = 0; i < usable.length; i++) {
+        const start = starts[i]
+        const nextInEvent = i + 1 < usable.length ? starts[i + 1] : eventEndMs / 1000
+        // end must never precede start; keep a floor of 80ms for readability
+        const end = Math.max(start + 0.08, nextInEvent > start ? nextInEvent : start + 0.08)
+        for (const w of usable[i].text.split(/\s+/)) {
+          if (w) words.push({ word: w, start: round2(start), end: round2(end) })
+        }
+      }
+    } else {
+      // ESTIMATED: distribute the segment/event window evenly across words.
+      // A segment without its own offset shares the whole event duration
+      // proportionally with its siblings by word count.
+      const totalWords = usable.reduce((acc, u) => acc + u.text.split(/\s+/).filter(Boolean).length, 0)
+      const winStart = eventStartMs / 1000
+      const winDur = Math.max(usable.length * 0.08, (ev.dDurationMs ?? totalWords * 240) / 1000)
+      const per = Math.max(0.08, winDur / Math.max(1, totalWords))
+      let cursor = winStart
+      for (const u of usable) {
+        const parts = u.text.split(/\s+/).filter(Boolean)
+        for (const p of parts) {
+          words.push({ word: p, start: round2(cursor), end: round2(cursor + per) })
+          cursor += per
+        }
+      }
+    }
   }
-  return { words, text: lines.join('\n') }
+
+  const wordTiming: 'measured' | 'estimated' = totalSegs > 0 && measuredSegs / totalSegs >= 0.8 ? 'measured' : 'estimated'
+  return { words, text: lines.length > 0 ? lines.join('\n') : words.map((w) => w.word).join(' '), wordTiming }
 }
 
 /**
@@ -346,8 +447,12 @@ export async function resolveYoutubeTranscript(youtubeId: string, langPref = 'en
     words: parsed.words,
     source: 'youtube-captions',
     language: caps.lang,
+    wordTiming: parsed.wordTiming,
   }
 }
+
+// output-time helper re-export used by tests
+export const __testHelpers = { parseJson3, srv3ToJson3, vttToJson3 }
 
 // ---------------------------------------------------------------------------
 // Local file probing (for uploaded sources)

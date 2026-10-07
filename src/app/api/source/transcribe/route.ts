@@ -156,6 +156,8 @@ async function runTranscribeJob(
       transcript: asr.text,
       transcriptWords: JSON.stringify(asr.words.slice(0, 60_000)),
       transcriptSource: 'asr' as const,
+      // faster-whisper produces REAL per-word timings (word_timestamps=True)
+      wordTiming: 'measured' as const,
       language: asr.language ?? (language !== 'auto' ? language : null),
     }
 

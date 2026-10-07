@@ -83,6 +83,7 @@ export default function Home() {
   const [projectId, setProjectId] = React.useState<string | null>(null)
   const [sourceTranscript, setSourceTranscript] = React.useState<string | null>(null)
   const [sourceWords, setSourceWords] = React.useState<{ word: string; start: number; end: number }[] | null>(null)
+  const [wordTiming, setWordTiming] = React.useState<'measured' | 'estimated' | null>(null)
   const [transcriptOpen, setTranscriptOpen] = React.useState(false)
   const [error, setError] = React.useState<string | null>(null)
   const [currentPlatform, setCurrentPlatform] = React.useState('shorts')
@@ -297,6 +298,7 @@ export default function Home() {
         if (!res.ok) throw new Error(data.error ?? 'AI analysis failed')
         const result = data as AnalyzeResult
         setAnalyzeResult(result)
+        setWordTiming(result.wordTiming ?? null)
         setCurrentPlatform(platform)
         setCurrentStyle(style)
         setCurrentTargetDuration(targetDuration)
@@ -915,6 +917,7 @@ export default function Home() {
       setProjectId(proj.id)
       setSourceTranscript(proj.transcript ?? null)
       setSourceWords(parseDb(proj.transcriptWords) ?? null)
+      setWordTiming(proj.wordTiming ?? null)
       const loadedClips: SuggestedClip[] = (proj.clips ?? []).map((c: any) => ({
         id: c.id,
         title: c.title,
@@ -1275,6 +1278,7 @@ export default function Home() {
                     analyzeResult={analyzeResult}
                     transcript={sourceTranscript}
                     words={sourceWords}
+                    wordTiming={wordTiming}
                     onOpenTranscript={() => setTranscriptOpen(true)}
                   />
 

@@ -16,7 +16,7 @@ if (!existsSync(WORKDIR)) mkdirSync(WORKDIR, { recursive: true })
 // ---- Job registry (in-memory) ----
 interface RenderJob {
   id: string
-  status: 'queued' | 'extracting' | 'concatenating' | 'rendering' | 'finalizing' | 'done' | 'error'
+  status: 'queued' | 'extracting' | 'concatenating' | 'rendering' | 'finalizing' | 'done' | 'error' | 'cancelled'
   progress: number // 0-100
   stage: string // human-readable stage
   filename?: string
@@ -24,10 +24,14 @@ interface RenderJob {
   duration?: number
   width?: number
   height?: number
+  /** false when rendered duration deviates from the recipe beyond tolerance */
+  durationOk?: boolean
   error?: string
   createdAt: number
   finishedAt?: number
   recipeDuration: number // per-job (fixes the cross-job race)
+  // currently running child process (for cancel)
+  currentChild?: ReturnType<typeof spawn> | null
   // SSE subscribers
   subscribers: Set<(data: string) => void>
 }
@@ -99,12 +103,19 @@ function scaleAtTime(time: number, sorted: { time: number; scale: number }[]): n
   return 1
 }
 
-// Run a command, capturing stderr for progress parsing
-function run(cmd: string[], cwd: string, job: RenderJob, stageLabel: string, stageStart: number, stageEnd: number): Promise<{ code: number; stdout: string; stderr: string }> {
+// Run a command, capturing stderr for progress parsing.
+// Includes a hard timeout — a hung ffmpeg must never hang the job forever.
+function run(cmd: string[], cwd: string, job: RenderJob, stageLabel: string, stageStart: number, stageEnd: number, timeoutMs = 15 * 60_000): Promise<{ code: number; stdout: string; stderr: string }> {
   return new Promise((resolve) => {
     const p = spawn(cmd[0], cmd.slice(1), { cwd })
+    job.currentChild = p
     let stdout = ''
     let stderr = ''
+    let timedOut = false
+    const timer = setTimeout(() => {
+      timedOut = true
+      try { p.kill('SIGKILL') } catch {}
+    }, timeoutMs)
     p.stdout.on('data', (d) => (stdout += d.toString()))
     p.stderr.on('data', (d) => {
       const text = d.toString()
@@ -121,8 +132,30 @@ function run(cmd: string[], cwd: string, job: RenderJob, stageLabel: string, sta
         broadcast(job)
       }
     })
-    p.on('close', (code) => resolve({ code: code ?? -1, stdout, stderr }))
+    p.on('close', (code) => {
+      clearTimeout(timer)
+      job.currentChild = null
+      resolve({ code: timedOut ? -2 : (code ?? -1), stdout, stderr: timedOut ? stderr + `\n[clipforge] command timed out after ${timeoutMs}ms` : stderr })
+    })
   })
+}
+
+/** True when the input file has at least one audio stream. */
+async function probeHasAudio(filePath: string): Promise<boolean> {
+  try {
+    const { execFile } = await import('node:child_process')
+    const { promisify } = await import('node:util')
+    const execFileAsync = promisify(execFile)
+    const { stdout } = await execFileAsync(
+      'ffprobe',
+      ['-v', 'error', '-select_streams', 'a', '-show_entries', 'stream=index', '-of', 'json', filePath],
+      { timeout: 15_000 },
+    )
+    const streams = JSON.parse(stdout)?.streams ?? []
+    return Array.isArray(streams) && streams.length > 0
+  } catch {
+    return false
+  }
 }
 
 function broadcast(job: RenderJob) {
@@ -137,6 +170,7 @@ function broadcast(job: RenderJob) {
     duration: job.duration,
     width: job.width,
     height: job.height,
+    durationOk: job.durationOk,
   })
   for (const send of job.subscribers) {
     try { send(`data: ${payload}\n\n`) } catch {}
@@ -161,6 +195,15 @@ async function processJob(jobId: string, file: File, recipe: RenderRecipe) {
 
     const ranges = recipe.keep_ranges && recipe.keep_ranges.length > 0 ? recipe.keep_ranges : [{ start: recipe.source?.clip_start ?? 0, end: recipe.source?.clip_end ?? 10 }]
 
+    // Probe the input ONCE: does it have audio? This decides the render path —
+    // we NEVER mask a failed render with a silent-audio retry (that produced
+    // silent videos for unrelated failures).
+    const inputHasAudio = await probeHasAudio(inputPath)
+    if (!inputHasAudio) {
+      job.stage = 'Source has no audio stream — rendering with silent track'
+      broadcast(job)
+    }
+
     // Stage 1-3 (single accurate pass): trim keep ranges → concat → burn subs → zoom → 9:16
     // Frame-accurate: filter_complex trim/atrim (NOT -c copy, which snaps to keyframes
     // and desynchronizes output duration from the edit plan).
@@ -172,19 +215,26 @@ async function processJob(jobId: string, file: File, recipe: RenderRecipe) {
     if (recipe.subtitles_ass) writeFileSync(join(jobDir, 'subs.ass'), recipe.subtitles_ass)
 
     // build filter_complex
+    // FILTER ORDER (fixed): scale/crop to 9:16 FIRST (no aspect distortion),
+    // then zoompan punches into the already-vertical frame, then subtitles are
+    // burned LAST so they stay fixed-size and are never cropped by the zoom.
     const fcParts: string[] = []
     ranges.forEach((r, i) => {
       fcParts.push(`[0:v]trim=start=${Number(r.start).toFixed(3)}:end=${Number(r.end).toFixed(3)},setpts=PTS-STARTPTS[v${i}]`)
-      fcParts.push(`[0:a]atrim=start=${Number(r.start).toFixed(3)}:end=${Number(r.end).toFixed(3)},asetpts=PTS-STARTPTS[a${i}]`)
+      if (inputHasAudio) {
+        fcParts.push(`[0:a]atrim=start=${Number(r.start).toFixed(3)}:end=${Number(r.end).toFixed(3)},asetpts=PTS-STARTPTS[a${i}]`)
+      } else {
+        fcParts.push(`[1:a]atrim=start=${Number(r.start).toFixed(3)}:end=${Number(r.end).toFixed(3)},asetpts=PTS-STARTPTS[a${i}]`)
+      }
     })
     const concatIn = ranges.map((_, i) => `[v${i}][a${i}]`).join('')
     fcParts.push(`${concatIn}concat=n=${ranges.length}:v=1:a=1[vc][ac]`)
     const postParts: string[] = []
-    if (recipe.subtitles_ass) postParts.push(`ass='${join(jobDir, 'subs.ass')}'`)
-    const zoom = buildZoompanFilter(recipe)
-    if (zoom) postParts.push(zoom)
     postParts.push('scale=1080:1920:force_original_aspect_ratio=increase')
     postParts.push('crop=1080:1920')
+    const zoom = buildZoompanFilter(recipe)
+    if (zoom) postParts.push(zoom)
+    if (recipe.subtitles_ass) postParts.push(`ass='${join(jobDir, 'subs.ass')}'`)
     fcParts.push(`[vc]${postParts.join(',')}[vf]`)
 
     job.status = 'rendering'
@@ -194,30 +244,33 @@ async function processJob(jobId: string, file: File, recipe: RenderRecipe) {
 
     const outName = `clipforge_${sanitize(recipe.title ?? 'clip')}.mp4`
     const outPath = join(jobDir, outName)
-    const baseArgs = ['ffmpeg', '-nostdin', '-y', '-i', inputPath, '-filter_complex', fcParts.join(';'), '-map', '[vf]', '-map', '[ac]', '-c:v', 'libx264', '-preset', 'medium', '-crf', '20', '-c:a', 'aac', '-b:a', '128k', '-r', '30', outPath]
-    let finalRes = await run(baseArgs, jobDir, job, 'Encoding H.264 + burning subtitles + zoom', 25, 92)
-    if (finalRes.code !== 0) {
-      // fallback: source has no audio stream → generate silence for [ac]
-      const hasAudio = finalRes.stderr.includes('Stream map') || finalRes.stderr.includes('[0:a]') === false || true
-      if (hasAudio) {
-        job.stage = 'Retrying without source audio (silent audio track)…'
-        broadcast(job)
-        const fcParts2 = fcParts.slice(0, ranges.length * 2).map((p) => p.replace('[0:a]', '[1:a]'))
-        fcParts2.push(`${ranges.map((_, i) => `[v${i}][a${i}]`).join('')}concat=n=${ranges.length}:v=1:a=1[vc][ac]`)
-        const post = fcParts.slice(ranges.length * 2 + 1).join(';')
-        const fc2 = fcParts2.join(';') + ';' + post.replace('[vc]', '[vc]') // reuse post chain
-        const silentArgs = [
-          'ffmpeg', '-nostdin', '-y',
-          '-i', inputPath,
-          '-f', 'lavfi', '-i', 'anullsrc=channel_layout=stereo:sample_rate=44100',
-          '-filter_complex', fc2,
-          '-map', '[vf]', '-map', '[ac]',
-          '-c:v', 'libx264', '-preset', 'medium', '-crf', '20', '-c:a', 'aac', '-b:a', '128k', '-r', '30',
-          '-shortest', outPath,
-        ]
-        finalRes = await run(silentArgs, jobDir, job, 'Encoding (silent audio)', 25, 92)
+
+    let finalRes: { code: number; stdout: string; stderr: string }
+    if (job.status === 'cancelled') return // cancelled before render started
+    if (inputHasAudio) {
+      const args = ['ffmpeg', '-nostdin', '-y', '-i', inputPath, '-filter_complex', fcParts.join(';'), '-map', '[vf]', '-map', '[ac]', '-c:v', 'libx264', '-preset', 'medium', '-crf', '20', '-c:a', 'aac', '-b:a', '128k', '-r', '30', outPath]
+      finalRes = await run(args, jobDir, job, 'Encoding H.264 + burning subtitles + zoom', 25, 92)
+      if (job.status === 'cancelled') return
+      if (finalRes.code !== 0) {
+        throw new Error('ffmpeg render failed: ' + finalRes.stderr.slice(-600))
       }
-      if (finalRes.code !== 0) throw new Error('ffmpeg render failed: ' + finalRes.stderr.slice(-500))
+    } else {
+      // no source audio → use anullsrc silence for the audio chain (single attempt)
+      if (job.status === 'cancelled') return
+      const silentArgs = [
+        'ffmpeg', '-nostdin', '-y',
+        '-i', inputPath,
+        '-f', 'lavfi', '-i', 'anullsrc=channel_layout=stereo:sample_rate=44100',
+        '-filter_complex', fcParts.join(';'),
+        '-map', '[vf]', '-map', '[ac]',
+        '-c:v', 'libx264', '-preset', 'medium', '-crf', '20', '-c:a', 'aac', '-b:a', '128k', '-r', '30',
+        '-shortest', outPath,
+      ]
+      finalRes = await run(silentArgs, jobDir, job, 'Encoding (silent audio — source has no audio)', 25, 92)
+      if (job.status === 'cancelled') return
+      if (finalRes.code !== 0) {
+        throw new Error('ffmpeg render failed (silent-audio path): ' + finalRes.stderr.slice(-600))
+      }
     }
 
     // Stage 4: probe + done
@@ -233,18 +286,24 @@ async function processJob(jobId: string, file: File, recipe: RenderRecipe) {
     const stat = statSync(outPath)
     job.size = stat.size
     job.filename = outName
-    // probe duration + dimensions + codecs
-    const probeRes = await run(['ffprobe', '-v', 'error', '-show_entries', 'format=duration:stream=width,height,codec_name,codec_type', '-of', 'json', outPath], jobDir, job, 'Finalizing', 95, 99)
-    try {
-      const probe = JSON.parse(probeRes.stdout)
-      job.duration = parseFloat(probe.format?.duration ?? '0')
-      const vs = (probe.streams ?? []).find((s: any) => s.width)
-      job.width = vs?.width
-      job.height = vs?.height
-      const has264 = (probe.streams ?? []).some((s: any) => s.codec_name === 'h264')
-      const hasAac = (probe.streams ?? []).some((s: any) => s.codec_name === 'aac')
-      if (!has264 || !hasAac) throw new Error(`codec check failed: h264=${has264} aac=${hasAac}`)
-    } catch {}
+    // probe duration + dimensions + codecs — a failed codec check MUST fail the job
+    const probeRes = await run(['ffprobe', '-v', 'error', '-show_entries', 'format=duration:stream=width,height,codec_name,codec_type', '-of', 'json', outPath], jobDir, job, 'Finalizing', 95, 99, 30_000)
+    const probe = JSON.parse(probeRes.stdout)
+    job.duration = parseFloat(probe.format?.duration ?? '0')
+    const vs = (probe.streams ?? []).find((s: any) => s.width)
+    job.width = vs?.width
+    job.height = vs?.height
+    const has264 = (probe.streams ?? []).some((s: any) => s.codec_name === 'h264')
+    const hasAac = (probe.streams ?? []).some((s: any) => s.codec_name === 'aac')
+    if (!has264 || !hasAac) {
+      throw new Error(`codec check failed: h264=${has264} aac=${hasAac}`)
+    }
+    if (job.width !== 1080 || job.height !== 1920) {
+      throw new Error(`resolution check failed: got ${job.width}x${job.height}, want 1080x1920`)
+    }
+    // duration sanity vs recipe (tolerance 1.5s) — reported, surfaced to UI/tests
+    const expected = recipe.duration ?? (recipe.source ? recipe.source.clip_end! - recipe.source.clip_start! : 0)
+    job.durationOk = !(expected > 0 && Math.abs((job.duration ?? 0) - expected) > 1.5)
 
     job.status = 'done'
     job.stage = 'Render complete'
@@ -260,6 +319,7 @@ async function processJob(jobId: string, file: File, recipe: RenderRecipe) {
       jobs.delete(jobId)
     }, 600000)
   } catch (e: any) {
+    if (job.status === 'cancelled') return // cancellation already broadcast — do not overwrite
     job.status = 'error'
     job.error = e?.message ?? 'Unknown error'
     job.stage = 'Failed'
@@ -347,6 +407,22 @@ serve({
       })
       const res = new Response(stream, { headers: { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive' } })
       return cors(res)
+    }
+
+    // POST /jobs/:id/cancel — cancel a queued/running job (kills ffmpeg)
+    const cancelMatch = url.pathname.match(/^\/jobs\/([^/]+)\/cancel$/)
+    if (req.method === 'POST' && cancelMatch) {
+      const job = jobs.get(cancelMatch[1])
+      if (!job) return cors(json({ error: 'job not found' }, 404))
+      if (job.status === 'done' || job.status === 'error' || job.status === 'cancelled') {
+        return cors(json({ id: job.id, status: job.status, progress: job.progress }))
+      }
+      job.status = 'cancelled'
+      job.stage = 'Cancelled by user'
+      job.finishedAt = Date.now()
+      try { job.currentChild?.kill('SIGKILL') } catch {}
+      broadcast(job)
+      return cors(json({ id: job.id, status: 'cancelled', progress: job.progress }))
     }
 
     // GET /jobs/:id/download — download rendered MP4

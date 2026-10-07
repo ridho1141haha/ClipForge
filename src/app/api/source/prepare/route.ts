@@ -105,6 +105,7 @@ async function runPrepareJob(
     let transcriptText: string | null = null
     let transcriptWords: string | null = null
     let transcriptSource = 'none'
+    let wordTiming: 'measured' | 'estimated' | null = null
     let transcriptError: string | null = null
 
     const caps = await resolveYoutubeTranscript(meta.youtubeId, opts.language && opts.language !== 'auto' ? `${opts.language},en,id` : 'en,id')
@@ -112,6 +113,7 @@ async function runPrepareJob(
       transcriptText = caps.text
       transcriptWords = caps.words.length > 0 ? JSON.stringify(caps.words.slice(0, 60_000)) : null
       transcriptSource = caps.source
+      wordTiming = caps.words.length > 0 ? caps.wordTiming : null
     } else {
       transcriptError = 'No captions available via yt-dlp (blocked, disabled, or none exist for this video)'
     }
@@ -120,6 +122,7 @@ async function runPrepareJob(
       transcriptText = opts.manualTranscript
       transcriptWords = null // manual paste has no word timings
       transcriptSource = 'manual'
+      wordTiming = null
       transcriptError = null
     }
 
@@ -137,6 +140,7 @@ async function runPrepareJob(
       transcript: transcriptText,
       transcriptWords,
       transcriptSource,
+      wordTiming,
       language: opts.language ?? null,
     }
 
@@ -154,6 +158,7 @@ async function runPrepareJob(
       duration: project.duration,
       durationSource: project.durationSource,
       transcriptSource: project.transcriptSource,
+      wordTiming: project.wordTiming,
       transcriptChars: transcriptText?.length ?? 0,
       wordCount: transcriptWords ? (JSON.parse(transcriptWords) as unknown[]).length : 0,
       transcriptError,
@@ -161,6 +166,7 @@ async function runPrepareJob(
       warnings: [
         ...(duration === null ? ['Real duration unavailable — provide manual duration before analysis.'] : []),
         ...(transcriptSource === 'none' ? ['No transcript available — analysis will run WITHOUT content grounding (hooks unverified).'] : []),
+        ...(wordTiming === 'estimated' ? ['Word timestamps are ESTIMATED from segment timings (source has no word-level timing data).'] : []),
       ],
     }
     await setJob(jobId, {

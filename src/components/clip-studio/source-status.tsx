@@ -69,12 +69,14 @@ export function SourceStatusPanel({
   analyzeResult,
   transcript,
   words,
+  wordTiming,
   onOpenTranscript,
 }: {
   meta: { duration?: number | null; durationSource?: string; title?: string } | null
   analyzeResult: AnalyzeResult | null
   transcript?: string | null
   words?: { word: string; start: number; end: number }[] | null
+  wordTiming?: 'measured' | 'estimated' | null
   onOpenTranscript?: () => void
 }) {
   if (!meta && !analyzeResult) return null
@@ -105,10 +107,20 @@ export function SourceStatusPanel({
           transcript: {tSrc.label}
         </Chip>
         {wordCount > 0 && (
-          <Chip tone="good" title="Word-level timestamps available — subtitle & context validation fully grounded">
-            <BadgeCheck className="h-3 w-3" />
-            {wordCount.toLocaleString()} word timestamps
-          </Chip>
+          wordTiming === 'estimated' ? (
+            <Chip
+              tone="warn"
+              title="Word timestamps are ESTIMATED (evenly distributed within segment timings) — the source had no word-level timing data. Boundaries/subtitles are approximate to segment accuracy."
+            >
+              <AlertTriangle className="h-3 w-3" />
+              {wordCount.toLocaleString()} word timestamps · estimated
+            </Chip>
+          ) : (
+            <Chip tone="good" title="Word-level timestamps MEASURED from the source (json3/srv3 offsets or ASR) — subtitle & context validation fully grounded">
+              <BadgeCheck className="h-3 w-3" />
+              {wordCount.toLocaleString()} word timestamps · measured
+            </Chip>
+          )
         )}
         {transcript && !wordCount && (
           <Chip tone="warn" title="Transcript text available but without word timings">
@@ -130,7 +142,7 @@ export function SourceStatusPanel({
       {tSrc.tone === 'bad' && (
         <div className="mt-2 flex items-start gap-1.5 rounded-md bg-rose-500/5 px-2 py-1.5 text-[10px] leading-relaxed text-rose-600 dark:text-rose-400">
           <AlertTriangle className="mt-0.5 h-3 w-3 shrink-0" />
-          No transcript — hooks are omitted, context validation is UNKNOWN, and every candidate is flagged unverified. Upload the media for ASR or paste a transcript for grounded analysis.
+          No transcript — hooks are omitted, context validation is treated as NO_TRANSCRIPT (low confidence), and every candidate is flagged unverified. Upload the media for ASR or paste a transcript for grounded analysis.
         </div>
       )}
     </motion.div>

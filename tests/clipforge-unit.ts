@@ -22,6 +22,10 @@ import {
   buildSubtitlesFromWords,
   buildSrt,
   buildVtt,
+  outputDuration,
+  totalCutDuration,
+  isDroppedByCuts,
+  sourceToOutputTimeBounded,
 } from '../src/lib/subtitles'
 
 let passed = 0
@@ -224,6 +228,83 @@ console.log('\n== Phase 15: SRT/VTT from word timestamps (output time) ==')
 console.log('\n== normalize edge cases ==')
 {
   assert(normalizeText('Hello,  WORLD!') === 'hello world', 'normalize strips punct/case')
+}
+
+// ---------------------------------------------------------------------------
+console.log('\n== Test I-b: duration semantics (totalCutDuration vs outputDuration) ==')
+{
+  // clip 0–40, cut 20–30 → kept 30, removed 10
+  const cs = 0, ce = 40
+  const cuts = [{ start: 20, end: 30, reason: 'x' }]
+  assert(eq(outputDuration(cs, ce, cuts), 30), 'outputDuration = KEPT duration (30)', `got ${outputDuration(cs, ce, cuts)}`)
+  assert(eq(totalCutDuration(cs, ce, cuts), 10), 'totalCutDuration = REMOVED duration (10)', `got ${totalCutDuration(cs, ce, cuts)}`)
+  assert(eq(outputDuration(cs, ce, cuts) + totalCutDuration(cs, ce, cuts), ce - cs), 'kept + removed = clip length')
+  // multiple cuts: clip 100–200, cuts 110–120 and 150–155
+  const cutsM = [{ start: 110, end: 120 }, { start: 150, end: 155 }]
+  assert(eq(outputDuration(100, 200, cutsM), 85), 'multiple cuts: output 85', `got ${outputDuration(100, 200, cutsM)}`)
+  assert(eq(totalCutDuration(100, 200, cutsM), 15), 'multiple cuts: removed 15', `got ${totalCutDuration(100, 200, cutsM)}`)
+  // cut at the very start / end / extending past clipEnd
+  assert(eq(outputDuration(10, 30, [{ start: 5, end: 12 }]), 18), 'cut overlapping clip start handled')
+  assert(eq(outputDuration(10, 30, [{ start: 25, end: 40 }]), 15), 'cut overlapping clip end handled')
+  assert(eq(outputDuration(10, 30, []), 20), 'zero cuts → full clip duration')
+  // bounded mapping: event past clipEnd clamps to the clip's output end
+  assert(eq(sourceToOutputTimeBounded(45, 0, 40, cuts), 30), 'bounded: source past clipEnd → output end (30)', `got ${sourceToOutputTimeBounded(45, 0, 40, cuts)}`)
+  assert(eq(outputToSourceTime(29.9, 0, cuts, 40), 39.9), 'inverse with clipEnd bound lands in last keep range', `got ${outputToSourceTime(29.9, 0, cuts, 40)}`)
+}
+
+// ---------------------------------------------------------------------------
+console.log('\n== Test I-c: isDroppedByCuts unified rule (drop when <50% survives) ==')
+{
+  const cs = 0, ce = 100
+  const cuts = [{ start: 20, end: 30, reason: 'x' }]
+  // event 28–32 (1s inside cut of 2s span → 50% survives) → borderline KEPT (>= 50%)
+  assert(!isDroppedByCuts(28, 32, cs, ce, cuts), 'event 50%+ outside cut → kept')
+  // event 27–31 (1s of 4s? no: 27-31 spans 4s, 3s inside cut → 25% survives) → DROPPED
+  assert(isDroppedByCuts(27, 31, cs, ce, cuts), 'event 75% inside cut → dropped', '80%-covered event was previously kept')
+  // fully inside → dropped
+  assert(isDroppedByCuts(21, 29, cs, ce, cuts), 'event fully inside cut → dropped')
+  // fully outside → kept
+  assert(!isDroppedByCuts(40, 50, cs, ce, cuts), 'event fully outside cut → kept')
+  // tiny event fully covered by cut → dropped
+  assert(isDroppedByCuts(25, 25.2, cs, ce, cuts), 'tiny fully-covered event → dropped')
+}
+
+// ---------------------------------------------------------------------------
+console.log('\n== P0-1: json3 word timing — measured vs estimated ==')
+{
+  const { parseJson3, vttToJson3, srv3ToJson3 } = (await import('../src/lib/media')).__testHelpers
+
+  // YouTube auto-captions style: EVERY seg carries tOffsetMs (word-level offsets)
+  const measuredJson3 = {
+    events: [
+      { tStartMs: 10000, dDurationMs: 900, segs: [
+        { utf8: 'real', tOffsetMs: 0 },
+        { utf8: 'word', tOffsetMs: 300 },
+        { utf8: 'timing', tOffsetMs: 600 },
+      ] },
+    ],
+  }
+  const m = parseJson3(measuredJson3)
+  assert(m.wordTiming === 'measured', 'json3 with tOffsetMs → wordTiming measured', `got ${m.wordTiming}`)
+  assert(m.words.length === 3, 'one entry per word', `got ${m.words.length}`)
+  const w0 = m.words[0], w1 = m.words[1], w2 = m.words[2]
+  assert(eq(w0.start, 10.0) && eq(w1.start, 10.3) && eq(w2.start, 10.6), 'word starts use REAL tOffsetMs (not even split)', JSON.stringify(m.words))
+  assert(eq(w0.end, 10.3), 'word end = next word start', `got ${w0.end}`)
+  assert(eq(w2.end, 10.9), 'last word end = event end', `got ${w2.end}`)
+
+  // VTT fallback: NO word offsets anywhere → estimated, never labeled measured
+  const vtt = `WEBVTT\n\n1\n00:00:10.000 --> 00:00:11.800\nevenly spread words here`
+  const conv = vttToJson3(vtt)
+  const e = parseJson3(conv)
+  assert(e.wordTiming === 'estimated', 'VTT-derived captions → wordTiming estimated', `got ${e.wordTiming}`)
+  assert(e.words.length === 4, 'VTT words split', `got ${e.words.length}`)
+  assert(eq(e.words[0].start, 10.0) && eq(e.words[e.words.length - 1].end, 11.8), 'estimated words span the segment window')
+
+  // srv3 with word offsets → measured
+  const srv3 = `<timedtext><body><p t="5000" d="1000"><s ac-as="0">srv3</s><s ac-as="400">words</s></p></body></timedtext>`
+  const s = parseJson3(srv3ToJson3(srv3))
+  assert(s.wordTiming === 'measured', 'srv3 with ac-as offsets → measured', `got ${s.wordTiming}`)
+  assert(eq(s.words[1].start, 5.4), 'srv3 word offset honored (400ms)', `got ${s.words[1]?.start}`)
 }
 
 console.log(`\n════════════════════════════════`)

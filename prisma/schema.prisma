@@ -31,6 +31,9 @@ model Project {
   transcriptWords String? // JSON: [{ word, start, end }] word-level timestamps where available
   // 'youtube-captions' | 'manual' | 'asr' | 'none'
   transcriptSource String  @default("none")
+  // 'measured' (real word-level timing from the source) | 'estimated'
+  // (evenly distributed within segment timings) | null (no words)
+  wordTiming      String?
   language        String?
 
   // Reproducibility metadata for the last analysis run

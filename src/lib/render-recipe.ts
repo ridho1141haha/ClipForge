@@ -1,6 +1,26 @@
 // Render recipe: convert an AI edit plan into concrete render instructions
 // (used by the in-browser AutoEditPlayer AND the ffmpeg shell-script generator)
 //
+// ─── ARCHITECTURE CONTRACT ──────────────────────────────────────────────────
+//   EditPlan (AI, SOURCE_TIME)
+//        ↓  buildRenderRecipe()          ← the ONLY plan→recipe translation
+//   RenderRecipe
+//        ↓  buildRecipeJSON() / generateASS() / generateFFmpegScript()
+//   Renderer (mini-service ffmpeg-renderer, shell script, future cloud worker)
+//
+// RULES (do not break):
+//   1. The renderer NEVER imports UI code, AI code, or DB models. It consumes
+//      only the recipe JSON produced here.
+//   2. The UI NEVER builds ffmpeg commands or filter graphs. It renders
+//      previews from RenderRecipe via scaleAtTime/subtitleAtTime helpers.
+//   3. recipe.camera_keyframes in recipe JSON are OUTPUT-time (pre-mapped);
+//      cameraKeyframes on the RenderRecipe object are SOURCE-time.
+//   4. All timeline conversion goes through src/lib/subtitles.ts — one
+//      canonical SOURCE↔OUTPUT mapping, bounded to [clipStart, clipEnd].
+//   5. Swapping the renderer (cloud FFmpeg worker, GPU, Remotion) must only
+//      require implementing "recipe JSON → MP4", nothing else.
+// ─────────────────────────────────────────────────────────────────────────────
+//
 // TIMELINE SYSTEMS (Phase 13):
 //   The edit plan uses SOURCE_TIME (absolute seconds in the original video).
 //   The renderer works in OUTPUT_TIME (after cuts are removed).
@@ -8,7 +28,7 @@
 //   src/lib/subtitles.ts — no naive `t - clipStart` subtraction anywhere.
 
 import type { EditPlan } from '@/lib/editplan'
-import { buildKeepRanges, outputToSourceTime, sourceToOutputTime } from '@/lib/subtitles'
+import { buildKeepRanges, isDroppedByCuts, outputToSourceTime, sourceToOutputTime } from '@/lib/subtitles'
 
 export interface RenderRecipe {
   clipId: string
@@ -258,12 +278,9 @@ export function timeToAss(sec: number): string {
   return `${h}:${pad(m)}:${pad(si)}.${pad(Math.min(99, cs), 2)}`
 }
 
-/** Drop events that are (mostly) inside removed ranges. */
-function droppedByCuts(start: number, end: number, clipStart: number, clipEnd: number, cuts: RenderRecipe['cuts']): boolean {
-  const kept = buildKeepRanges(clipStart, clipEnd, cuts)
-  const overlap = kept.reduce((acc, r) => acc + Math.max(0, Math.min(end, r.end) - Math.max(start, r.start)), 0)
-  return overlap <= Math.min(0.35, Math.max(0.05, (end - start) * 0.5))
-}
+// Drop events that are (mostly) inside removed ranges — canonical rule from
+// src/lib/subtitles.ts (single definition; no duplicate logic here).
+const droppedByCuts = isDroppedByCuts
 
 // Generate an .ass subtitle file with emphasis styling.
 // Times are converted SOURCE → OUTPUT (cuts removed) — Phase 13 correctness.
@@ -279,7 +296,7 @@ Script Type: V4.00+
 PlayResX: 1080
 PlayResY: 1920
 ScaledBorderAndShadow: yes
-WrapStyle: 2
+WrapStyle: 0
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
@@ -300,9 +317,10 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     })
     .filter((l): l is string => l !== null)
     .join('\n')
-  // generated hook overlay as a title card at output start (this is GENERATED text, not speech)
+  // generated hook overlay as a title card at output start — {\an8} pins it
+  // TOP-CENTER so it never collides with bottom-centered subtitles (0-3s)
   const hookLines = recipe.generatedHook
-    ? `Dialogue: 1,${timeToAss(0)},${timeToAss(3)},Emphasis,,0,0,0,,${escapeASS(recipe.generatedHook)}\n`
+    ? `Dialogue: 1,${timeToAss(0)},${timeToAss(3)},Emphasis,,0,0,0,,{\\an8}${escapeASS(recipe.generatedHook)}\n`
     : ''
   return header + hookLines + events + '\n'
 }
@@ -368,7 +386,7 @@ export function buildZoompanFilter(recipe: RenderRecipe, fps = 30): string | nul
   const scales: number[] = []
   for (let f = 0; f < totalFrames; f++) {
     const outT = f / fps
-    const srcT = outputToSourceTime(outT, recipe.clipStart, recipe.cuts)
+    const srcT = outputToSourceTime(outT, recipe.clipStart, recipe.cuts, recipe.clipEnd)
     scales.push(scaleAtTime(srcT, kfs))
   }
   const maxScale = Math.max(...scales, 1)
@@ -472,11 +490,11 @@ export function generateFFmpegScript(
   lines.push('ffmpeg -nostdin -y -f concat -safe 0 -i concat.txt -c copy merged.mp4')
   lines.push('')
 
-  lines.push('# 4. Burn subtitles + camera punch-in (zoompan uses OUTPUT-time mapping)')
+  lines.push('# 4. Camera punch-in (9:16 crop FIRST, then zoompan — no aspect distortion), then burn subtitles last (fixed size)')
   const zoomFilter = buildZoompanFilter(recipe)
-  const vfParts = [`ass='$ASS'`]
+  const vfParts: string[] = ['scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920']
   if (zoomFilter) vfParts.push(zoomFilter)
-  vfParts.push(`scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920`)
+  vfParts.push(`ass='$ASS'`)
   lines.push(`ffmpeg -nostdin -y -i merged.mp4 -vf "${vfParts.join(',')}" -c:v libx264 -preset medium -crf 20 -c:a aac -b:a 128k "$OUTPUT"`)
   lines.push('')
   lines.push('# 5. Cleanup intermediate files')

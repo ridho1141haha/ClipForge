@@ -46,6 +46,8 @@ interface AnalyzeBody {
   transcript?: string
   words?: WordInput[]
   transcriptSource?: string
+  /** 'measured' = real word-level timing from the source; 'estimated' = distributed from segment timings */
+  wordTiming?: 'measured' | 'estimated'
   save?: boolean
 }
 
@@ -178,7 +180,7 @@ export async function POST(req: NextRequest) {
         : Math.round((minLen + maxLen) / 2)
 
     // ---------- ownership check when persisting ----------
-    let project: { id: string; transcript: string | null; transcriptWords: string | null; transcriptSource: string } | null = null
+    let project: { id: string; transcript: string | null; transcriptWords: string | null; transcriptSource: string; wordTiming: string | null } | null = null
     if (body.projectId) {
       const p = await db.project.findUnique({ where: { id: body.projectId } })
       if (!p || p.ownerId !== ownerId) {
@@ -200,6 +202,9 @@ export async function POST(req: NextRequest) {
     // transcript: body wins, then project record, then synthesized from word timestamps
     const transcript = ((body.transcript ?? '').trim() || project?.transcript?.trim() || (words.length > 0 ? words.map((w) => w.word).join(' ') : '')) as string
     const transcriptSource = body.transcriptSource ?? project?.transcriptSource ?? (transcript ? 'manual' : 'none')
+    // word-timing provenance: explicit body flag > persisted project flag > honest default
+    const wordTiming: 'measured' | 'estimated' | null =
+      body.wordTiming ?? (project?.wordTiming === 'measured' || project?.wordTiming === 'estimated' ? project.wordTiming : null) ?? (words.length > 0 ? 'estimated' : null)
     const hasTranscript = transcript.length > 0
 
     // ---------- LLM call ----------
@@ -290,6 +295,7 @@ Return the JSON object now.`
         analysisVersion: ANALYSIS_VERSION,
         analyzedAt: new Date().toISOString(),
         transcriptSource,
+        wordTiming,
         durationSource: body.durationSource ?? 'unknown',
       }
       analysisMeta = meta
@@ -332,7 +338,7 @@ Return the JSON object now.`
             clipCount: finalClips.length,
             analysisMeta: JSON.stringify(meta),
             ...(hasTranscript && !project!.transcript ? { transcript } : {}),
-            ...(words.length > 0 && !project!.transcriptWords ? { transcriptWords: JSON.stringify(words) } : {}),
+            ...(words.length > 0 && !project!.transcriptWords ? { transcriptWords: JSON.stringify(words), wordTiming } : {}),
             ...(transcriptSource !== 'none' ? { transcriptSource } : {}),
           },
         })
@@ -356,6 +362,7 @@ Return the JSON object now.`
         : undefined,
       transcriptSource,
       transcriptGrounded: hasTranscript,
+      wordTiming,
       analysisMeta,
       meta: {
         serverScored: true,
@@ -384,7 +391,6 @@ interface ProcessCtx {
   transcript: string
   words: TWord[]
 }
-
 type AICandidate = z.infer<typeof ClipCandidateSchema>
 
 interface ProcessedClip {
@@ -438,6 +444,11 @@ function processCandidate(c: AICandidate, idx: number, ctx: ProcessCtx): Process
     }
     contextStatus = cc.status
     if (cc.contextRisk) contextRisk = true
+  } else if (!hasTranscript) {
+    // SERVER AUTHORITY: with no transcript there is NO evidence about context.
+    // Never trust the model's own context_risk claim — force low confidence.
+    contextStatus = 'NO_TRANSCRIPT'
+    contextRisk = true
   }
 
   // spoken hook: verbatim-from-transcript requirement
@@ -477,6 +488,11 @@ function processCandidate(c: AICandidate, idx: number, ctx: ProcessCtx): Process
   // unverified hook caps the hook dimension and context safety (server-side penalty)
   if (hasTranscript && !hookVerified) {
     rawScores.hook = Math.min(rawScores.hook, 4)
+    rawScores.context_safety = Math.min(rawScores.context_safety, 5)
+  }
+  // no transcript at all → the server has zero evidence; cap context safety hard
+  // (recommendation needs ctx >= 7 for POST, so these clips can never auto-POST)
+  if (!hasTranscript) {
     rawScores.context_safety = Math.min(rawScores.context_safety, 5)
   }
   const total = recalcTotal(rawScores)

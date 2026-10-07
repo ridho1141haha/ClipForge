@@ -72,6 +72,7 @@ export interface AnalyzeResult {
   estimatedDuration: number
   transcriptSource?: string
   transcriptGrounded?: boolean
+  wordTiming?: 'measured' | 'estimated' | null
   meta?: {
     serverScored?: boolean
     requestedCount?: number
@@ -98,6 +99,7 @@ export interface Project {
   duration: number | null
   durationSource?: string
   transcriptSource?: string
+  wordTiming?: 'measured' | 'estimated' | null
   status: string
   clipCount: number
   clips?: SuggestedClip[]

@@ -40,8 +40,18 @@ export function buildKeepRanges(clipStart: number, clipEnd: number, cuts: Cut[])
   return ranges
 }
 
-/** Total removed duration within the clip. */
+/**
+ * Total REMOVED duration within [clipStart, clipEnd].
+ * (Was previously swapped with outputDuration — it returned the KEPT sum.
+ *  Fixed: removed = clip length − kept. Verify with unit tests.)
+ */
 export function totalCutDuration(clipStart: number, clipEnd: number, cuts: Cut[]): number {
+  const kept = keptDuration(clipStart, clipEnd, cuts)
+  return Math.round((clipEnd - clipStart - kept) * 1000) / 1000
+}
+
+/** Sum of keep-range lengths inside [clipStart, clipEnd] (the kept duration). */
+function keptDuration(clipStart: number, clipEnd: number, cuts: Cut[]): number {
   return buildKeepRanges(clipStart, clipEnd, cuts).reduce((acc, r) => acc + (r.end - r.start), 0)
 }
 
@@ -67,9 +77,33 @@ export function sourceToOutputTime(sourceTime: number, clipStart: number, cuts: 
   return Math.max(0, Math.round((sourceTime - clipStart - removed) * 1000) / 1000)
 }
 
-/** OUTPUT_TIME → SOURCE_TIME (inverse mapping; lands inside the containing keep range). */
-export function outputToSourceTime(outputTime: number, clipStart: number, cuts: Cut[]): number {
-  const ranges = buildKeepRanges(clipStart, Number.MAX_SAFE_INTEGER, cuts)
+/**
+ * SOURCE_TIME → OUTPUT_TIME bounded to the clip window [clipStart, clipEnd].
+ * Same as sourceToOutputTime but guarantees the result never exceeds the
+ * clip's own output duration (events past clipEnd clamp to the end).
+ */
+export function sourceToOutputTimeBounded(
+  sourceTime: number,
+  clipStart: number,
+  clipEnd: number,
+  cuts: Cut[],
+): number {
+  const clamped = Math.min(Math.max(sourceTime, clipStart), clipEnd)
+  return sourceToOutputTime(clamped, clipStart, cuts)
+}
+
+/**
+ * OUTPUT_TIME → SOURCE_TIME (inverse mapping; lands inside the containing keep range).
+ * `clipEnd` bounds the search window — cuts extending past the clip end cannot
+ * inflate the keep ranges (previously Number.MAX_SAFE_INTEGER).
+ */
+export function outputToSourceTime(
+  outputTime: number,
+  clipStart: number,
+  cuts: Cut[],
+  clipEnd: number = Number.MAX_SAFE_INTEGER,
+): number {
+  const ranges = buildKeepRanges(clipStart, clipEnd, cuts)
   let acc = 0
   for (const r of ranges) {
     const len = r.end - r.start
@@ -82,16 +116,26 @@ export function outputToSourceTime(outputTime: number, clipStart: number, cuts: 
   return last ? last.end : clipStart
 }
 
-/** Output duration of the clip after cuts. */
+/**
+ * Output duration of the clip after cuts = the KEPT duration.
+ * (Was previously swapped with totalCutDuration. Fixed semantics:
+ *  outputDuration = kept, totalCutDuration = removed.)
+ */
 export function outputDuration(clipStart: number, clipEnd: number, cuts: Cut[]): number {
-  return Math.round((clipEnd - clipStart - totalCutDuration(clipStart, clipEnd, cuts)) * 1000) / 1000
+  return Math.round(keptDuration(clipStart, clipEnd, cuts) * 1000) / 1000
 }
 
-/** True if a source-time event lies entirely inside removed ranges (should be dropped). */
+/**
+ * True if a source-time event should be DROPPED because it lies mostly inside
+ * removed ranges. Rule: keep only when MORE THAN HALF of the event survives
+ * (and at least a minimal sliver, so zero-survival events always drop).
+ */
 export function isDroppedByCuts(start: number, end: number, clipStart: number, clipEnd: number, cuts: Cut[]): boolean {
+  const dur = Math.max(0, end - start)
+  if (dur <= 0) return true
   const kept = buildKeepRanges(clipStart, clipEnd, cuts)
   const overlap = kept.reduce((acc, r) => acc + Math.max(0, Math.min(end, r.end) - Math.max(start, r.start)), 0)
-  return overlap <= Math.min(0.35, (end - start) * 0.5) // >~65% inside cuts → drop
+  return overlap < Math.max(0.05, dur * 0.5) // <50% survives (or <50ms) → drop
 }
 
 // ---------------------------------------------------------------------------
