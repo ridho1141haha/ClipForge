@@ -403,3 +403,33 @@ Stage Summary:
   3) Word-precision subtitle QA on a fetchable long source (PLOpsj6DVQ8 still video-flagged; IP heat rules: ≤1 probe/hour).
   4) docs/ARCHITECTURE.md refresh (players/auto-heal/limits/LRU have evolved since it was written).
 - Risks: none new. Standing: YouTube egress IP/heat dependent; in-memory burst limiter (soft limits DB-backed); B-roll/SFX/music preview-only; render artifacts expire after 10 min.
+
+---
+Task ID: cron-review-20261008-4 (webDevReview round 8)
+Agent: Z.ai Code (Principal Engineer)
+Task: Status assessment + agent-browser QA + close out the leftover debug-route investigation; next feature: cover-frame picker (top suggestion from round 7).
+
+Work Log:
+- BASELINE @ 695a946 (that HEAD was an UNdocumented automated commit adding a TEMPORARY unauthenticated /api/debug/fs route used to diagnose a suspected "media-410 false positive"; no worklog entry existed). Verified: tsc clean · eslint clean · unit 225/225 · renderer (3003) healthy · dev server healthy · media streaming 206 with the file present on disk (33.9 MB).
+- LEFTOVER INVESTIGATION CLOSED: the debug route's own output proved the server side is healthy (cwd correct, resolveLocalMediaPath valid, stat OK) — there is NO server-side 410 false positive. Actions: (1) DELETED the unauthenticated debug route (it leaked cwd/env/fs info with no session check — a security regression marked "delete after diagnosing"); (2) honesty upgrade in VideoPreview's probe: a 409 ("no streamable source, state: X") is NOT the same truth as a 410 ("file was on disk, now gone") — the heal card now parses the 409 body and says WHICH truth: "Source file is missing on disk" (410) / "Source download never completed" (409 failed) / "Source was never downloaded" (409 skipped/unavailable), each with matching action copy.
+- BROWSER QA (agent-browser) of the restored project (dQw4w9WgXcQ): landing clean; library → open → HTML5 video readyState 4 (213s, 1920x1080), LOCAL SOURCE badge, playback advances; Auto-Edit drawer "local source · real cut preview" with LIVE EDIT STATE advancing (source 00:24, progress 12%, camera 1.08×, karaoke subtitle + B-roll card visible); Render panel: Server source selected (32.3 MB) + render-ready chip + honesty card; zero console errors.
+- 🆕 FEATURE — COVER-FRAME PICKER (Shorts cover, end-to-end, preview == render):
+  • Renderer contract (recipe-validation.ts): optional `cover: { timestamp }` (OUTPUT time) — INVALID_COVER code for non-object/NaN/negative/beyond duration+1s; carried through ValidatedRecipe.
+  • Renderer (index.ts): after codec gates, extracts cover.jpg from the RENDERED output (`-ss <t> -frames:v 1 -q:v 2`, clamped inside duration); job.hasCover broadcast in poll/SSE; NEW GET /jobs/:id/cover serves image/jpeg with a sanitized download filename; extraction failure degrades honestly (hasCover=false, MP4 stays valid, warn log).
+  • buildRecipeJSON(recipe, { coverTimestamp }) emits cover only when finite + in-bounds (clamps exact-end to duration−0.05) — never sends known-bad data.
+  • Proxy: /jobs/:id/cover added to the authorized JOB_PATH_RE (owner-scoped like poll/stream/download/cancel); SECURITY.md-relevant comment updated.
+  • UI (upload-render.tsx): cover picker panel (plan + non-empty edit) — 9:16 canvas preview drawing the REAL source frame at sourceTimeAtOutput(mapKeepRanges(...), coverT) (SAME mapping the renderer consumes), 0.1s slider over the output duration, First/Middle/Last presets, Clear, honest copy ("a JPG of this exact frame — after cuts, zoom & subtitles"); no-preview-source state stays honest; recipe carries the choice in BOTH render modes; result card shows the cover thumbnail beside the video + "Download cover (JPG)".
+  • TESTS: unit 225 → 240 (6 validation-matrix cover cases + 9 recipe-emission/preview-parity cases); golden E2E 17 → 25 (recipe carries cover, hasCover=true, /cover serves a real 1080x1920 JPEG: magic FFD8FF, decodable, correct dimensions).
+- BROWSER-VERIFIED FULL COVER LOOP (real render, 2:38): picker canvas drew the real frame (@ 18s via Middle preset) → Render MP4 → "Render complete! 1080×1920 · 36s · 24.62 MB" with the cover thumbnail BESIDE the video (burned subtitle visible in the cover — exactly as promised) + Download cover (JPG) button present; zero console errors.
+- REGRESSION GATES (all after changes): tsc clean · eslint clean · unit 240/240 · golden E2E 25/25 · render-security 20/20 · url-render 17/17 · long-source scale 15/15 · live 17/17.
+- Committed 391b786, pushed to origin/main (also carries 695a946's now-deleted debug route — net zero).
+
+Stage Summary:
+- The suspected 410 false positive is closed with evidence (no server bug; client probe now state-honest), and the temporary debug surface is gone.
+- Shorts cover workflow shipped: pick a frame from the REAL edited output (preview == render parity), get a 1080×1920 JPEG with the render — a real creator need, fully authorized end-to-end.
+- Next round suggestions (priority order):
+  1) Batch render queue: render all POST-flagged clips sequentially with per-clip progress (pipeline + soft limits already support it; UI is the work).
+  2) Cover UX+: per-clip cover memory (persist chosen coverT on the Clip row) + "download cover" from the library for older renders (needs artifact persistence beyond the 10-min expiry — pair with an artifacts dir).
+  3) Word-precision subtitle QA on a fetchable long source (PLOpsj6DVQ8 still video-flagged; IP heat rules: ≤1 probe/hour).
+  4) docs/ARCHITECTURE.md refresh (players/auto-heal/limits/LRU/cover have evolved since it was written).
+- Risks: none new. Standing: YouTube egress IP/heat dependent (honest degradation); in-memory burst limiter (soft limits DB-backed); B-roll/SFX/music preview-only; render artifacts expire after 10 min (cover.jpg shares that lifecycle).
