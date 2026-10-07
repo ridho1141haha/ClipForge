@@ -2,6 +2,8 @@
 
 > Paste a YouTube link → resolve **real duration** (yt-dlp → innertube → oEmbed, never guessed) → acquire **real transcript** (YouTube captions via yt-dlp, manual paste, or ASR for uploads) → the LLM proposes clip candidates **grounded in the transcript** → the server validates timestamps, recalculates scores, checks context, dedupes and ranks → generate a transcript-locked **Edit Plan** → render a real **1080×1920 H.264+AAC MP4** with frame-accurate cuts, burned subtitles (output-time mapped) and camera punch-ins → export **JSON / SRT / VTT / CSV / EDL**.
 
+**The URL flow renders with zero uploads:** the prepare job also downloads the source video server-side (yt-dlp, ≤1080p for ≤20 min sources, ≤720p above, resumable on retry) — the Render tab then renders straight from the stored file ("Server source") instead of asking you to upload it. Uploaded files are persisted the same way by the ASR job. A bare URL now goes link → clips → plan → **finished vertical MP4** with no manual steps.
+
 Built with **Next.js 16**, **TypeScript**, **Tailwind CSS 4**, **shadcn/ui**, **Prisma + SQLite**, an **ffmpeg renderer micro-service**, and the **z-ai-web-dev-sdk** LLM.
 
 **Honesty guarantees** (enforced in code, not just docs):
@@ -21,8 +23,11 @@ YouTube URL
   → POST /api/source/prepare          async job (PRIMARY UI PATH): DOWNLOADING → TRANSCRIBING → COMPLETED
                                       • resolves real metadata + fetches YouTube captions automatically
                                       • prefers the word-offset ASR track ('orig') → wordTiming 'measured'
+                                      • downloads the SOURCE VIDEO (render-ready project, no upload needed)
+                                        — download failure never fails the job: localMediaState='failed' is honest
                                       • persists duration + transcript + word timestamps into an owned Project
-                                      • failed jobs are retryable: POST /api/jobs/:id/retry (payload persisted)
+                                      • failed jobs are retryable: POST /api/jobs/:id/retry (payload persisted,
+                                        yt-dlp resumes .part downloads)
   → POST /api/clips/analyze           transcript-grounded candidate detection
                                       • belt-and-braces: auto-fetches captions here too when none supplied
         • Zod-validated AI output (+1 repair attempt)
@@ -33,6 +38,9 @@ YouTube URL
         • transactional persistence + analysis metadata (model/provider/promptVersion/analysisVersion)
   → POST /api/clips/plan              transcript-locked edit plan (subtitles verified against transcript; deterministic rebuild on mismatch)
   → POST /api/render-proxy/render     ffmpeg renderer (job-based, SSE progress, ffmpeg -progress granular stages): frame-accurate trim+concat → ASS burn-in → zoompan → 1080×1920
+                                      • TWO input modes: multipart (client-uploaded file) OR JSON {recipe, projectId}
+                                        (server-side media — the proxy resolves the path from the owned project,
+                                        validates path containment, and re-builds the multipart; renderer contract unchanged)
   → POST /api/export                  json (full plan + transcript + scores) · srt · vtt (real speech, output time) · csv · edl
 ```
 
@@ -76,16 +84,21 @@ YouTube URL
 YouTube heavily rate-limits/bot-blocks datacenter IPs (player API returns "Sign in to confirm you're not a bot"). On such hosts:
 - duration resolution degrades to oEmbed (title/author only) → `duration: null` + `requiresManualDuration: true` → the UI asks you to enter the real duration
 - caption download fails → `transcriptSource: 'none'` → analysis runs ungrounded (hooks omitted, `contextRisk=true`) or you paste a transcript manually
+- media download fails → `localMediaState: 'failed'` → the Render tab offers the upload path instead
 No fake values are substituted — this is by design.
 
 ## Tests
 ```bash
-bun run tests/clipforge-unit.ts   # 73 assertions: scoring scale, hook grounding, dedupe/overlap/count,
+bun run tests/clipforge-unit.ts   # 102 assertions: scoring scale, hook grounding, dedupe/overlap/count,
                                   # timeline mapping (incl. totalCutDuration/outputDuration semantics),
                                   # bounded mapping, drop-by-cuts rule, measured-vs-estimated word timing,
-                                  # clamps, context validation, JSON extraction, SRT/VTT
+                                  # clamps, context validation, JSON extraction, SRT/VTT,
+                                  # local-media path safety (traversal/absolute/non-upload rejection)
 bun run tests/e2e-render.ts       # GOLDEN E2E: synthetic fixture → plan → recipe → real FFmpeg render →
                                   # ffprobe/volumedetect assertions (duration, 1080x1920, h264+aac, non-silent audio)
+bun run tests/url-render-e2e.ts   # URL-FLOW E2E: bare URL → prepare (metadata+captions+MEDIA DOWNLOAD) →
+                                  # JSON project-source render via render-proxy → real MP4 verified
+                                  # (+ ownership: foreign session render → 404); skips honestly when YouTube blocks
 bash tests/clipforge-live.sh      # live API tests: duration honesty, transcript grounding, security, duplicate save, exports
 ```
 
@@ -96,4 +109,4 @@ bash tests/clipforge-live.sh      # live API tests: duration honesty, transcript
 - ASR for uploaded files: run faster-whisper server-side and feed `words` into the analyze/plan endpoints (schema already supports word-level timestamps end-to-end).
 - Word-timestamp provenance is tracked (`wordTiming: 'measured' | 'estimated'`): json3/srv3 caption offsets and faster-whisper produce MEASURED timing; VTT-only sources and manual pastes are labeled honestly in the UI.
 
-## Status: **MVP+ (beta)** — the full pipeline (URL or upload → real duration → transcript with word timestamps → grounded AI analysis → server scoring → plan → frame-accurate render) is real and verified end-to-end, now with zero-input auto-grounding (YouTube captions fetched automatically when available, with retryable source-prep jobs and usage metering). Remaining gaps: YouTube metadata/captions depend on the host IP not being bot-blocked (manual-duration + ASR-upload flows are first-class, failed prepares are retryable), and B-roll/SFX/music remain preview-only recommendations.
+## Status: **MVP+ (beta)** — the full pipeline (URL or upload → real duration → transcript with word timestamps → grounded AI analysis → server scoring → plan → frame-accurate render) is real and verified end-to-end, now with zero-input auto-grounding (captions fetched automatically) AND a fully closed URL→render loop (source video downloaded server-side, rendered without any upload — browser-verified). Remaining gaps: YouTube endpoints depend on the host IP not being bot-blocked (manual-duration + ASR-upload flows are first-class, failed prepares are retryable), and B-roll/SFX/music remain preview-only recommendations.

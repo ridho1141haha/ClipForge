@@ -1,16 +1,20 @@
 import { db } from '@/lib/db'
-import { extractYouTubeId, resolveYoutubeMeta, resolveYoutubeTranscript } from '@/lib/media'
+import { downloadYoutubeMedia, extractYouTubeId, resolveYoutubeMeta, resolveYoutubeTranscript } from '@/lib/media'
 import { recordUsage } from '@/lib/usage'
 
 /**
  * Prepare-job worker (shared by POST /api/source/prepare and POST /api/jobs/:id/retry).
  *
  * Stage model (persisted in SourceJob.status/stage/progress):
- *   QUEUED → DOWNLOADING (metadata) → TRANSCRIBING (captions) → COMPLETED | FAILED
+ *   QUEUED → DOWNLOADING (metadata) → TRANSCRIBING (captions)
+ *          → TRANSCRIBING (media download for rendering) → COMPLETED | FAILED
  *
  * Honesty rules preserved here:
  *   - duration: real (yt-dlp → innertube → oEmbed-chain) or user-provided; NEVER guessed
  *   - transcript: real captions (word-timing provenance kept) or manual; NEVER fabricated
+ *   - media download failure never fails the job: its primary purpose is
+ *     metadata + transcript for analysis. A failed download is persisted as
+ *     localMediaState='failed' so the UI can offer the upload path instead.
  */
 export interface PreparePayload {
   url: string
@@ -18,6 +22,8 @@ export interface PreparePayload {
   manualDuration?: number
   manualTranscript?: string
   language?: string
+  /** download the source video so the project can render without an upload (default true) */
+  downloadMedia?: boolean
   ownerId: string
 }
 
@@ -77,8 +83,33 @@ export async function runPrepareJob(jobId: string, opts: PreparePayload) {
       transcriptError = null
     }
 
-    // ---------- Stage 3: persist project ----------
-    await setPrepareJob(jobId, { status: 'TRANSCRIBING', stage: 'Saving source data…', progress: 80 })
+    // ---------- Stage 3: source media download (render-ready project) ----------
+    let localMediaState: string | null = null
+    let localMediaError: string | null = null
+    let localMedia: { relativePath: string; sizeBytes: number; mimeType: string } | null = null
+    if (opts.downloadMedia === false) {
+      localMediaState = 'skipped'
+    } else {
+      await setPrepareJob(jobId, {
+        status: 'TRANSCRIBING',
+        stage: `Downloading source video (yt-dlp, ≤${duration && duration <= 1200 ? 1080 : 720}p) — enables direct rendering…`,
+        progress: 60,
+      })
+      try {
+        const dl = await downloadYoutubeMedia(meta.youtubeId, {
+          maxHeight: duration && duration <= 1200 ? 1080 : 720,
+        })
+        localMediaState = 'ready'
+        localMedia = { relativePath: dl.relativePath, sizeBytes: dl.sizeBytes, mimeType: dl.mimeType }
+      } catch (e) {
+        // NEVER fail the job for a media download problem — analysis still works
+        localMediaState = 'failed'
+        localMediaError = e instanceof Error ? e.message : 'Download failed'
+      }
+    }
+
+    // ---------- Stage 4: persist project ----------
+    await setPrepareJob(jobId, { status: 'TRANSCRIBING', stage: 'Saving source data…', progress: 90 })
 
     const projectData = {
       youtubeId: meta.youtubeId,
@@ -93,6 +124,10 @@ export async function runPrepareJob(jobId: string, opts: PreparePayload) {
       transcriptSource,
       wordTiming,
       language: opts.language ?? null,
+      localMedia: localMedia?.relativePath ?? null,
+      localMediaSize: localMedia?.sizeBytes ?? null,
+      localMediaState,
+      localMediaError,
     }
 
     let project
@@ -119,10 +154,16 @@ export async function runPrepareJob(jobId: string, opts: PreparePayload) {
       wordCount: transcriptWords ? (JSON.parse(transcriptWords) as unknown[]).length : 0,
       transcriptError,
       resolverErrors: meta.resolverErrors,
+      localMedia: localMedia
+        ? { state: 'ready' as const, sizeBytes: localMedia.sizeBytes, mimeType: localMedia.mimeType, path: localMedia.relativePath }
+        : { state: localMediaState, error: localMediaError },
       warnings: [
         ...(duration === null ? ['Real duration unavailable — provide manual duration before analysis.'] : []),
         ...(transcriptSource === 'none' ? ['No transcript available — analysis will run WITHOUT content grounding (hooks unverified).'] : []),
         ...(wordTiming === 'estimated' ? ['Word timestamps are ESTIMATED from segment timings (source has no word-level timing data).'] : []),
+        ...(localMediaState === 'failed'
+          ? [`Source video could not be downloaded (${localMediaError ?? 'unknown reason'}). You can still analyze — upload the file when rendering.`]
+          : []),
       ],
     }
     // usage metering (best-effort, never fails the job)

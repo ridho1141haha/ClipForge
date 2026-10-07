@@ -16,6 +16,7 @@ import {
   UploadCloud,
   BadgeCheck,
   Clock,
+  Film,
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -60,6 +61,8 @@ interface AsrState {
   durationSource?: string
   words?: { word: string; start: number; end: number }[]
   wordCount?: number
+  localMediaState?: string | null
+  localMediaSize?: number | null
   error?: string
   fileName?: string
 }
@@ -166,6 +169,7 @@ export function UrlInput({ onAnalyze, loading, error }: Props) {
         const job = data.job ?? {}
         if (job.status === 'COMPLETED') {
           const r = job.result ?? {}
+          const lm = (r.localMedia ?? {}) as { state?: string; sizeBytes?: number }
           setAsr((s) => ({
             ...s,
             phase: 'done',
@@ -177,6 +181,8 @@ export function UrlInput({ onAnalyze, loading, error }: Props) {
             durationSource: r.durationSource,
             words: r.words ?? [],
             wordCount: r.wordCount ?? (r.words?.length ?? 0),
+            localMediaState: lm.state ?? null,
+            localMediaSize: lm.sizeBytes ?? null,
           }))
           return
         }
@@ -565,6 +571,11 @@ export function UrlInput({ onAnalyze, loading, error }: Props) {
                           {asr.duration != null && (
                             <span className="inline-flex items-center gap-1 rounded bg-muted px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground">
                               <Clock className="h-3 w-3" /> {Math.floor(asr.duration / 60)}m {Math.round(asr.duration % 60)}s (ffprobe)
+                            </span>
+                          )}
+                          {asr.localMediaState === 'ready' && (
+                            <span className="inline-flex items-center gap-1 rounded bg-sky-500/15 px-1.5 py-0.5 text-[10px] font-semibold text-sky-600 dark:text-sky-400">
+                              <Film className="h-3 w-3" /> source saved — render without re-upload{asr.localMediaSize ? ` (${(asr.localMediaSize / 1024 / 1024).toFixed(1)} MB)` : ''}
                             </span>
                           )}
                           <span className="inline-flex items-center gap-1 rounded bg-violet-500/15 px-1.5 py-0.5 text-[10px] font-semibold text-violet-600 dark:text-violet-400">

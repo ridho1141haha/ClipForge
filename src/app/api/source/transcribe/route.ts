@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server'
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { copyFileSync, mkdirSync, mkdtempSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { randomUUID } from 'node:crypto'
@@ -181,6 +181,36 @@ async function runTranscribeJob(
       },
     })
 
+    // ---------- Stage 4b: persist the source media (render without re-upload) ----------
+    // The uploaded original is kept under upload/projects/<id>/ so the render
+    // tab can use it directly instead of asking the user to upload again.
+    let localMediaState: string | null = 'unavailable'
+    let localMediaError: string | null = null
+    let localMediaSize: number | null = null
+    try {
+      const ext = ((opts.originalName.match(/\.([A-Za-z0-9]{1,5})$/)?.[1] ?? 'mp4').toLowerCase())
+      const mediaDir = join(process.cwd(), 'upload', 'projects', project.id)
+      mkdirSync(mediaDir, { recursive: true })
+      const dest = join(mediaDir, `source.${ext}`)
+      copyFileSync(opts.mediaPath, dest)
+      localMediaSize = statSync(dest).size
+      localMediaState = 'ready'
+      localMediaError = null
+      await db.project.update({
+        where: { id: project.id },
+        data: {
+          localMedia: `upload/projects/${project.id}/source.${ext}`,
+          localMediaSize,
+          localMediaState,
+          localMediaError: null,
+        },
+      })
+    } catch (e) {
+      // non-fatal: the user can still render by uploading the file again
+      localMediaState = 'failed'
+      localMediaError = e instanceof Error ? e.message : 'Could not persist media'
+    }
+
     const result = {
       projectId: project.id,
       title: project.title,
@@ -191,6 +221,7 @@ async function runTranscribeJob(
       wordCount: asr.words.length,
       language: asr.language,
       words: asr.words.slice(0, 20_000), // client grounds analyze immediately (≈2h of speech)
+      localMedia: localMediaState === 'ready' ? { state: 'ready', sizeBytes: localMediaSize } : { state: localMediaState, error: localMediaError },
       warnings: [],
     }
     // usage metering (best-effort): media seconds transcribed

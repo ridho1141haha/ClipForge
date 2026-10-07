@@ -386,6 +386,22 @@ console.log('\n== Karaoke: \\k word-highlight from REAL word timings ==')
   assert(buildSpeechStrip([{ word: 'x', start: 19.5, end: 25 }, { word: 'y', start: -5, end: 1 }], 20, 10).every((v) => v >= 0 && v <= 1), 'strip values clamped 0..1')
 }
 
+// ---- local media helpers (URL flow → render without upload) ----
+{
+  const { mediaMimeForExt, isSafeYouTubeId, resolveLocalMediaPath } = await import('../src/lib/media')
+  assert(mediaMimeForExt('mp4') === 'video/mp4', 'mime map mp4')
+  assert(mediaMimeForExt('MKV') === 'video/x-matroska', 'mime map case-insensitive')
+  assert(mediaMimeForExt('exe') === null, 'mime map rejects unknown ext')
+  assert(isSafeYouTubeId('dQw4w9WgXcQ'), 'safe id accepted')
+  assert(!isSafeYouTubeId('../etc/passwd') && !isSafeYouTubeId('a/b') && !isSafeYouTubeId('x'), 'unsafe ids rejected')
+  const ok = resolveLocalMediaPath('upload/yt/dQw4w9WgXcQ/source.mp4')
+  assert(ok !== null && ok.endsWith('/upload/yt/dQw4w9WgXcQ/source.mp4'), 'stored media path resolves under upload/')
+  assert(resolveLocalMediaPath('upload/../.env') === null, 'path traversal rejected')
+  assert(resolveLocalMediaPath('/etc/passwd') === null, 'absolute path rejected')
+  assert(resolveLocalMediaPath('etc/passwd') === null, 'non-upload relative path rejected')
+  assert(resolveLocalMediaPath('') === null, 'empty path rejected')
+}
+
 console.log(`\n════════════════════════════════`)
 console.log(`RESULT: ${passed} passed, ${failed} failed`)
 process.exit(failed > 0 ? 1 : 0)

@@ -36,6 +36,15 @@ model Project {
   wordTiming      String?
   language        String?
 
+  // Server-side source media — makes a project RENDERABLE without a re-upload.
+  // YouTube URL flow: downloaded by the prepare job (yt-dlp).
+  // Upload flow: the original file persisted by the transcribe job.
+  localMedia       String? // RELATIVE path under upload/, e.g. upload/yt/<id>/source.mp4
+  localMediaSize   Int? // bytes
+  // 'ready' | 'failed' | 'skipped' | 'unavailable'
+  localMediaState  String?
+  localMediaError  String?
+
   // Reproducibility metadata for the last analysis run
   analysisMeta    String? // JSON: { model, provider, promptVersion, analysisVersion, analyzedAt }
 

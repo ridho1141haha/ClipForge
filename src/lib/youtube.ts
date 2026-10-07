@@ -100,6 +100,9 @@ export interface Project {
   durationSource?: string
   transcriptSource?: string
   wordTiming?: 'measured' | 'estimated' | null
+  // server-side source media (render without upload) — 'ready' when downloadable/saved
+  localMediaState?: string | null
+  localMediaSize?: number | null
   status: string
   clipCount: number
   clips?: SuggestedClip[]

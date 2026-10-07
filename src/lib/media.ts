@@ -1,7 +1,7 @@
 import { execFile } from 'node:child_process'
-import { mkdtempSync, readFileSync, readdirSync, rmSync, existsSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, existsSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { join, sep } from 'node:path'
 import { promisify } from 'node:util'
 
 const execFileAsync = promisify(execFile)
@@ -501,6 +501,132 @@ export async function resolveYoutubeTranscript(youtubeId: string, langPref = 'en
 
 // output-time helper re-export used by tests
 export const __testHelpers = { parseJson3, srv3ToJson3, vttToJson3 }
+
+// ---------------------------------------------------------------------------
+// Source media download (URL flow → render without upload)
+// ---------------------------------------------------------------------------
+
+export interface DownloadedMedia {
+  /** RELATIVE path under the project root, e.g. upload/yt/<id>/source.mp4 */
+  relativePath: string
+  sizeBytes: number
+  mimeType: string
+  duration: number | null
+}
+
+const MEDIA_EXT_MIME: Record<string, string> = {
+  mp4: 'video/mp4',
+  m4v: 'video/mp4',
+  webm: 'video/webm',
+  mkv: 'video/x-matroska',
+  mov: 'video/quicktime',
+  avi: 'video/x-msvideo',
+  flv: 'video/x-flv',
+  ts: 'video/mp2t',
+}
+
+/** Mime type for a downloaded media extension (null = unknown/ignored). */
+export function mediaMimeForExt(ext: string): string | null {
+  return MEDIA_EXT_MIME[ext.toLowerCase()] ?? null
+}
+
+/** Strict YouTube id check — the id is interpolated into a filesystem path. */
+export function isSafeYouTubeId(id: string): boolean {
+  return /^[-A-Za-z0-9_]{6,20}$/.test(id)
+}
+
+/**
+ * Download the source video for a YouTube URL into upload/yt/<id>/source.<ext>
+ * so the project becomes renderable without a manual upload.
+ *
+ * Design notes:
+ *  - format: hard height cap (default 1080 for ≤20 min sources, 720 above) —
+ *    the 9:16 renderer crops+upscales, so 1080p keeps the output sharp while
+ *    capping download size; --max-filesize is the final guard.
+ *  - resume: files live in a per-video directory and yt-dlp resumes .part
+ *    files, so a failed job retried via /api/jobs/:id/retry continues where
+ *    it stopped instead of restarting.
+ *  - explicit errors: callers degrade honestly (localMediaState='failed'),
+ *    never silently.
+ */
+export async function downloadYoutubeMedia(
+  youtubeId: string,
+  opts?: { maxHeight?: number; timeoutMs?: number },
+): Promise<DownloadedMedia> {
+  if (!isSafeYouTubeId(youtubeId)) throw new Error('Invalid YouTube id')
+  const maxHeight = Math.min(2160, Math.max(144, Math.round(opts?.maxHeight ?? 1080)))
+  const timeoutMs = opts?.timeoutMs ?? 10 * 60_000
+
+  const dir = join(process.cwd(), 'upload', 'yt', youtubeId)
+  mkdirSync(dir, { recursive: true })
+
+  const args = [
+    '--js-runtimes', 'bun',
+    '--no-playlist',
+    '--no-warnings',
+    '--concurrent-fragments', '4',
+    '--retries', '3',
+    '--fragment-retries', '3',
+    // hard height cap with progressive fallback; -S prefers h264/mp4-compatible streams
+    '-f', `bv*[height<=${maxHeight}]+ba/b[height<=${maxHeight}]/b`,
+    '-S', `res:${maxHeight},ext:mp4:m4a`,
+    '--max-filesize', '1500M',
+    '-o', join(dir, 'source.%(ext)s'),
+    `https://www.youtube.com/watch?v=${youtubeId}`,
+  ]
+
+  try {
+    await runYtDlp(args, timeoutMs)
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e)
+    if (/larger than max-filesize/i.test(msg)) {
+      throw new Error(`Source video exceeds the ${1500} MB download cap`)
+    }
+    if (/timed out|ETIMEDOUT|killed/i.test(msg)) {
+      throw new Error('Download timed out — retry (it resumes from where it stopped)')
+    }
+    throw new Error(`yt-dlp download failed: ${msg.slice(0, 200)}`)
+  }
+
+  // decide from files on disk (never from the exit code — same rule as captions)
+  const files = readdirSync(dir)
+    .filter((f) => f.startsWith('source.') && !/\.part$|\.ytdl$|\.temp$/.test(f))
+    .sort((a, b) => statSync(join(dir, b)).size - statSync(join(dir, a)).size)
+  if (files.length === 0) {
+    throw new Error('Download produced no media file (blocked, geo-restricted, or members-only)')
+  }
+  const fileName = files[0]
+  const ext = fileName.split('.').pop() ?? ''
+  const mimeType = mediaMimeForExt(ext)
+  if (!mimeType) throw new Error(`Downloaded file has an unsupported extension: .${ext}`)
+
+  const absolute = join(dir, fileName)
+  const sizeBytes = statSync(absolute).size
+  if (sizeBytes < 1024) throw new Error('Downloaded file is suspiciously small (<1 KB) — likely blocked')
+  const duration = await probeMediaDuration(absolute)
+
+  return {
+    relativePath: `upload/yt/${youtubeId}/${fileName}`,
+    sizeBytes,
+    mimeType,
+    duration,
+  }
+}
+
+/**
+ * Resolve + validate a stored relative media path (defense in depth).
+ * Stored paths are RELATIVE TO THE PROJECT ROOT and always start with
+ * 'upload/' (e.g. upload/yt/<id>/source.mp4, upload/projects/<id>/source.mp4).
+ */
+export function resolveLocalMediaPath(relativePath: string): string | null {
+  if (!relativePath || relativePath.includes('..') || relativePath.startsWith('/')) return null
+  if (!relativePath.startsWith('upload/')) return null
+  const root = process.cwd()
+  const uploadRoot = join(root, 'upload')
+  const absolute = join(root, relativePath)
+  if (!absolute.startsWith(uploadRoot + sep)) return null
+  return absolute
+}
 
 // ---------------------------------------------------------------------------
 // Local file probing (for uploaded sources)

@@ -15,6 +15,8 @@ import {
   Sparkles,
   Scissors,
   Wand2,
+  CloudDownload,
+  HardDriveUpload,
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
@@ -24,12 +26,19 @@ import { fmtTime, fmtDuration } from '@/lib/youtube'
 
 interface Props {
   plan: EditPlan | null
+  /** current project — enables the server-side source media (render without upload) */
+  projectId?: string | null
+  /** server-side source media state for the project (downloaded YouTube source or persisted upload) */
+  projectMedia?: { state?: string | null; size?: number | null; error?: string | null } | null
   // optional: when invoked from library with a stored clip plan
 }
 
 type Phase = 'idle' | 'uploading' | 'rendering' | 'done' | 'error'
+type SourceMode = 'local' | 'upload'
 
-export function UploadRender({ plan }: Props) {
+export function UploadRender({ plan, projectId, projectMedia }: Props) {
+  const localReady = Boolean(projectId && projectMedia?.state === 'ready')
+  const [sourceMode, setSourceMode] = React.useState<SourceMode>(localReady ? 'local' : 'upload')
   const [file, setFile] = React.useState<File | null>(null)
   const [dragOver, setDragOver] = React.useState(false)
   const [phase, setPhase] = React.useState<Phase>('idle')
@@ -45,7 +54,12 @@ export function UploadRender({ plan }: Props) {
   const pollRef = React.useRef<number>(0)
   const stoppedRef = React.useRef(false)
 
-  const canRender = !!file && !!plan
+  // keep the default source in sync when the project state changes
+  React.useEffect(() => {
+    setSourceMode(localReady ? 'local' : 'upload')
+  }, [localReady])
+
+  const canRender = (sourceMode === 'local' ? localReady : !!file) && !!plan
 
   const onFileSelect = (f: File) => {
     if (!f.type.startsWith('video/')) {
@@ -69,10 +83,11 @@ export function UploadRender({ plan }: Props) {
   }
 
   const startRender = async () => {
-    if (!file || !plan) return
+    if (!plan) return
+    if (sourceMode === 'upload' && !file) return
     setPhase('rendering')
     setProgress(0)
-    setStage('Uploading…')
+    setStage('Queuing…')
     setError(null)
     setNotice(null)
     setRenderedUrl(null)
@@ -83,14 +98,29 @@ export function UploadRender({ plan }: Props) {
       // OUTPUT-time camera keyframes + duration), NOT the raw RenderRecipe.
       // The raw object has none of those — the renderer would silently render
       // the full clip WITHOUT cuts and WITHOUT subtitles.
-      const formData = new FormData()
-      formData.append('video', file)
-      formData.append('recipe', buildRecipeJSON(recipe))
-      // Use Next.js API proxy to avoid CORS — proxies to localhost:3003
-      const res = await fetch('/api/render-proxy/render', {
-        method: 'POST',
-        body: formData,
-      })
+      const recipeJson = buildRecipeJSON(recipe)
+      let res: Response
+      if (sourceMode === 'local' && projectId && localReady) {
+        // project-source render: the proxy streams the server-side media to the
+        // renderer — no browser upload needed
+        setStage('Preparing source…')
+        res = await fetch('/api/render-proxy/render', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ recipe: recipeJson, projectId }),
+        })
+      } else if (file) {
+        const formData = new FormData()
+        formData.append('video', file)
+        formData.append('recipe', recipeJson)
+        // Use Next.js API proxy to avoid CORS — proxies to localhost:3003
+        res = await fetch('/api/render-proxy/render', {
+          method: 'POST',
+          body: formData,
+        })
+      } else {
+        throw new Error('No source video selected')
+      }
       const data = await res.json()
       if (!res.ok) throw new Error(data.error ?? 'Upload failed')
       setJobId(data.id)
@@ -205,7 +235,9 @@ export function UploadRender({ plan }: Props) {
         <div>
           <h3 className="text-sm font-semibold">Render your clip</h3>
           <p className="text-xs text-muted-foreground">
-            Upload your source video and we&apos;ll render it into a 9:16 MP4 with the AI edit plan applied — cuts, subtitles, camera zoom.
+            {localReady
+              ? 'Your source video is already on the server — render directly, or upload a different file.'
+              : 'Upload your source video and we\u2019ll render it into a 9:16 MP4 with the AI edit plan applied — cuts, subtitles, camera zoom.'}
           </p>
         </div>
       </div>
@@ -223,7 +255,69 @@ export function UploadRender({ plan }: Props) {
         </div>
       )}
 
-      {/* drop zone */}
+      {/* source selector (only when a server-side source exists) */}
+      {projectId && (projectMedia?.state === 'ready' || projectMedia?.state === 'failed') && (
+        <div className="space-y-2">
+          <div className="grid grid-cols-2 gap-2" role="tablist" aria-label="Render source">
+            <button
+              type="button"
+              role="tab"
+              aria-selected={sourceMode === 'local'}
+              disabled={projectMedia?.state !== 'ready'}
+              onClick={() => setSourceMode('local')}
+              className={`flex items-center gap-2.5 rounded-xl border p-3 text-left transition-all ${
+                sourceMode === 'local'
+                  ? 'border-primary/60 bg-primary/10 shadow-sm ring-1 ring-primary/30'
+                  : 'border-border/60 bg-card/40 hover:border-primary/30 hover:bg-card/70'
+              } ${projectMedia?.state !== 'ready' ? 'cursor-not-allowed opacity-50' : ''}`}
+            >
+              <div className={`grid h-9 w-9 shrink-0 place-items-center rounded-lg ${sourceMode === 'local' ? 'bg-primary/20 text-primary' : 'bg-muted text-muted-foreground'}`}>
+                <CloudDownload className="h-4.5 w-4.5" />
+              </div>
+              <div className="min-w-0">
+                <p className="truncate text-xs font-semibold">Server source</p>
+                <p className="text-[10px] text-muted-foreground">
+                  {projectMedia?.state === 'ready'
+                    ? `Downloaded / saved · ${projectMedia.size ? `${(projectMedia.size / 1024 / 1024).toFixed(1)} MB` : 'ready'}`
+                    : 'Unavailable'}
+                </p>
+              </div>
+              {sourceMode === 'local' && projectMedia?.state === 'ready' && (
+                <Check className="ml-auto h-4 w-4 shrink-0 text-primary" strokeWidth={3} />
+              )}
+            </button>
+            <button
+              type="button"
+              role="tab"
+              aria-selected={sourceMode === 'upload'}
+              onClick={() => setSourceMode('upload')}
+              className={`flex items-center gap-2.5 rounded-xl border p-3 text-left transition-all ${
+                sourceMode === 'upload'
+                  ? 'border-primary/60 bg-primary/10 shadow-sm ring-1 ring-primary/30'
+                  : 'border-border/60 bg-card/40 hover:border-primary/30 hover:bg-card/70'
+              }`}
+            >
+              <div className={`grid h-9 w-9 shrink-0 place-items-center rounded-lg ${sourceMode === 'upload' ? 'bg-primary/20 text-primary' : 'bg-muted text-muted-foreground'}`}>
+                <HardDriveUpload className="h-4.5 w-4.5" />
+              </div>
+              <div className="min-w-0">
+                <p className="truncate text-xs font-semibold">Your file</p>
+                <p className="text-[10px] text-muted-foreground">Upload MP4 / MOV / WebM</p>
+              </div>
+              {sourceMode === 'upload' && <Check className="ml-auto h-4 w-4 shrink-0 text-primary" strokeWidth={3} />}
+            </button>
+          </div>
+          {projectMedia?.state === 'failed' && (
+            <p className="flex items-start gap-1.5 text-[11px] text-amber-600 dark:text-amber-400">
+              <AlertCircle className="mt-0.5 h-3 w-3 shrink-0" />
+              Auto-download failed{projectMedia.error ? ` (${projectMedia.error})` : ''} — upload the file below to render.
+            </p>
+          )}
+        </div>
+      )}
+
+      {/* drop zone (upload mode) */}
+      {sourceMode === 'upload' && (
       <div
         onDragOver={(e) => { e.preventDefault(); setDragOver(true) }}
         onDragLeave={() => setDragOver(false)}
@@ -282,6 +376,25 @@ export function UploadRender({ plan }: Props) {
           </div>
         )}
       </div>
+      )}
+
+      {/* server source card (local mode) */}
+      {sourceMode === 'local' && localReady && (
+        <div className="flex items-center gap-3 rounded-xl border border-emerald-500/30 bg-emerald-500/5 p-4">
+          <div className="grid h-10 w-10 place-items-center rounded-lg bg-emerald-500/15 text-emerald-500">
+            <CloudDownload className="h-5 w-5" />
+          </div>
+          <div className="min-w-0 flex-1">
+            <p className="truncate text-sm font-semibold">Source video on server</p>
+            <p className="text-xs text-muted-foreground">
+              {projectMedia?.size ? `${(projectMedia.size / 1024 / 1024).toFixed(1)} MB · ` : ''}rendered directly — no upload needed
+            </p>
+          </div>
+          <Badge variant="outline" className="border-emerald-500/40 bg-emerald-500/10 text-[10px] text-emerald-700 dark:text-emerald-400">
+            render-ready
+          </Badge>
+        </div>
+      )}
 
       {/* plan summary */}
       {plan && (
@@ -410,7 +523,7 @@ export function UploadRender({ plan }: Props) {
             </div>
             {/* stage steps */}
             <div className="flex items-center justify-between text-[10px] text-muted-foreground">
-              {['Upload', 'Extract', 'Concat', 'Encode', 'Done'].map((s, i) => {
+              {[sourceMode === 'local' ? 'Queue' : 'Upload', 'Extract', 'Concat', 'Encode', 'Done'].map((s, i) => {
                 const thresholds = [0, 5, 35, 50, 100]
                 const active = progress >= thresholds[i]
                 const current = progress < (thresholds[i + 1] ?? 100)

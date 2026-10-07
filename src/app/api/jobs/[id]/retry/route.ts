@@ -84,8 +84,9 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string
         ? base.manualTranscript
         : undefined
     const language = typeof base.language === 'string' ? base.language : undefined
+    const downloadMedia = base.downloadMedia !== false
 
-    const payload = JSON.stringify({ url, projectId, manualDuration, manualTranscript, language })
+    const payload = JSON.stringify({ url, projectId, manualDuration, manualTranscript, language, downloadMedia })
     await db.sourceJob.update({
       where: { id },
       data: {
@@ -100,7 +101,7 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string
       },
     })
 
-    void runPrepareJob(id, { url, projectId, manualDuration, manualTranscript, language, ownerId }).catch(() => {})
+    void runPrepareJob(id, { url, projectId, manualDuration, manualTranscript, language, downloadMedia, ownerId }).catch(() => {})
 
     return NextResponse.json({ jobId: id, status: 'QUEUED' }, { status: 202, headers })
   } catch (e) {

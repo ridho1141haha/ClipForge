@@ -61,3 +61,4 @@ db/*.sqlite*
 !/download/README.md
 *.mp3
 !public/**/*.mp4
+tool-results/

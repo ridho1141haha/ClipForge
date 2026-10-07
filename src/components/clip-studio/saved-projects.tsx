@@ -16,6 +16,7 @@ import {
   TrendingUp,
   AlertTriangle,
   X,
+  CloudDownload,
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
@@ -55,6 +56,7 @@ export function SavedProjects({ projects, loading, onSelect, onDelete, onRefresh
   const totalClips = projects.reduce((acc, p) => acc + p.clipCount, 0)
   const totalDuration = projects.reduce((acc, p) => acc + (p.duration ?? 0), 0)
   const analyzedCount = projects.filter((p) => p.status === 'analyzed').length
+  const renderReadyCount = projects.filter((p) => p.localMediaState === 'ready').length
 
   if (loading) {
     return (
@@ -133,6 +135,16 @@ export function SavedProjects({ projects, loading, onSelect, onDelete, onRefresh
             <Sparkles className="h-3.5 w-3.5 text-emerald-500" />
             <span className="text-sm font-semibold tabular-nums">{analyzedCount}</span>
             <span className="text-xs text-muted-foreground">analyzed</span>
+          </div>
+        )}
+        {renderReadyCount > 0 && (
+          <div
+            className="flex items-center gap-2 rounded-lg border border-sky-500/20 bg-sky-500/5 px-3 py-1.5"
+            title="These projects have the source video saved on the server — clips render without re-uploading it"
+          >
+            <CloudDownload className="h-3.5 w-3.5 text-sky-500" />
+            <span className="text-sm font-semibold tabular-nums">{renderReadyCount}</span>
+            <span className="text-xs text-muted-foreground">render-ready</span>
           </div>
         )}
         <UsagePanel />
@@ -225,9 +237,20 @@ export function SavedProjects({ projects, loading, onSelect, onDelete, onRefresh
                     <Clock className="mr-1 h-2.5 w-2.5" />
                     {p.duration ? fmtDuration(p.duration) : '—'}
                   </Badge>
-                  <span className="rounded-md bg-black/60 px-1.5 py-0.5 text-[10px] font-medium text-white backdrop-blur">
-                    {p.status}
-                  </span>
+                  <div className="flex items-center gap-1">
+                    {p.localMediaState === 'ready' && (
+                      <span
+                        className="flex items-center gap-1 rounded-md bg-sky-500/80 px-1.5 py-0.5 text-[10px] font-semibold text-white backdrop-blur"
+                        title="Source video saved on the server — render without re-upload"
+                      >
+                        <CloudDownload className="h-2.5 w-2.5" />
+                        render-ready
+                      </span>
+                    )}
+                    <span className="rounded-md bg-black/60 px-1.5 py-0.5 text-[10px] font-medium text-white backdrop-blur">
+                      {p.status}
+                    </span>
+                  </div>
                 </div>
                 {/* hover overlay */}
                 <div className="absolute inset-0 flex items-center justify-center bg-black/40 opacity-0 transition-opacity group-hover:opacity-100">

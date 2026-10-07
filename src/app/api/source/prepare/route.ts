@@ -36,6 +36,9 @@ export async function POST(req: NextRequest) {
     const manualDuration = Number(body?.manualDuration)
     const manualTranscript: string | undefined = typeof body?.manualTranscript === 'string' && body.manualTranscript.trim() ? body.manualTranscript.trim().slice(0, 400_000) : undefined
     const language: string | undefined = body?.language || undefined
+    // downloadMedia defaults to true — the download makes the project renderable
+    // without a re-upload; callers may opt out explicitly
+    const downloadMedia: boolean = body?.downloadMedia !== false
 
     if (!url || !extractYouTubeId(url)) {
       return NextResponse.json({ error: 'Valid YouTube URL is required' }, { status: 400, headers })
@@ -50,7 +53,7 @@ export async function POST(req: NextRequest) {
     }
 
     // payload persisted → the job can be retried from its failure point later
-    const payload = JSON.stringify({ url, projectId, manualDuration: isFinite(manualDuration) && manualDuration > 0 ? manualDuration : undefined, manualTranscript, language })
+    const payload = JSON.stringify({ url, projectId, manualDuration: isFinite(manualDuration) && manualDuration > 0 ? manualDuration : undefined, manualTranscript, language, downloadMedia })
 
     const job = await db.sourceJob.create({
       data: {
@@ -65,7 +68,7 @@ export async function POST(req: NextRequest) {
     })
 
     // fire-and-forget worker (job state persisted in DB)
-    void runPrepareJob(job.id, { url, projectId, manualDuration, manualTranscript, language, ownerId }).catch(() => {})
+    void runPrepareJob(job.id, { url, projectId, manualDuration, manualTranscript, language, downloadMedia, ownerId }).catch(() => {})
 
     return NextResponse.json({ jobId: job.id }, { status: 202, headers })
   } catch (e) {

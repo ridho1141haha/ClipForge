@@ -81,6 +81,8 @@ export default function Home() {
   const [multiSelected, setMultiSelected] = React.useState<Set<number>>(new Set())
   const [playStart, setPlayStart] = React.useState<number | null>(null)
   const [projectId, setProjectId] = React.useState<string | null>(null)
+  // server-side source media state for the CURRENT project (render-without-upload)
+  const [projectMedia, setProjectMedia] = React.useState<{ state?: string | null; size?: number | null; error?: string | null } | null>(null)
   const [sourceTranscript, setSourceTranscript] = React.useState<string | null>(null)
   const [sourceWords, setSourceWords] = React.useState<{ word: string; start: number; end: number }[] | null>(null)
   const [wordTiming, setWordTiming] = React.useState<'measured' | 'estimated' | null>(null)
@@ -199,8 +201,9 @@ export default function Home() {
       const jobId: string = data.jobId
       prepareJobRef.current = jobId
       prepareJobUrlRef.current = url
-      // poll (max 3 min)
-      for (let i = 0; i < 120; i++) {
+      // poll (max ~22 min — the media-download stage for long videos is slow,
+      // but a poll is cheap; stage text keeps the user informed)
+      for (let i = 0; i < 900; i++) {
         await new Promise((r) => setTimeout(r, 1500))
         let job: Record<string, unknown>
         try {
@@ -254,6 +257,7 @@ export default function Home() {
         setAnalyzeResult(null)
         setClips([])
         setProjectId(null)
+        setProjectMedia(null)
         setSelectedIdx(null)
         setMultiSelected(new Set())
         setPlayStart(null)
@@ -311,6 +315,9 @@ export default function Home() {
               embedUrlAutoplay: ytId ? `https://www.youtube.com/embed/${ytId}?autoplay=1` : '',
             }
             setMeta(localMeta)
+            // surface the downloaded source media state (render-without-upload)
+            const lm = prep.localMedia as { state?: string; sizeBytes?: number; error?: string } | undefined
+            setProjectMedia(lm ? { state: lm.state ?? null, size: lm.sizeBytes ?? null, error: lm.error ?? null } : null)
             const warns = (prep.warnings as string[] | undefined) ?? []
             for (const w of warns.slice(0, 2)) {
               toast({ title: 'Source preparation note', description: w })
@@ -1051,6 +1058,11 @@ export default function Home() {
       }
       setMeta(loadedMeta)
       setProjectId(proj.id)
+      setProjectMedia(
+        proj.localMediaState || proj.localMedia
+          ? { state: proj.localMediaState ?? null, size: proj.localMediaSize ?? null, error: proj.localMediaError ?? null }
+          : null,
+      )
       setSourceTranscript(proj.transcript ?? null)
       setSourceWords(parseDb(proj.transcriptWords) ?? null)
       setWordTiming(proj.wordTiming ?? null)
@@ -1123,6 +1135,7 @@ export default function Home() {
       toast({ title: 'Project deleted' })
       if (projectId === id) {
         setProjectId(null)
+        setProjectMedia(null)
       }
       refreshProjects()
     } catch (e: any) {
@@ -1513,6 +1526,7 @@ export default function Home() {
                             setMeta(null)
                             setClips([])
                             setProjectId(null)
+                            setProjectMedia(null)
                             setMultiSelected(new Set())
                           }}
                           className="gap-2 text-muted-foreground"
@@ -1692,7 +1706,7 @@ export default function Home() {
               />
             ) : (
               <div className="mx-auto max-w-2xl">
-                <UploadRender plan={currentPlan} />
+                <UploadRender plan={currentPlan} projectId={projectId} projectMedia={projectMedia} />
               </div>
             )}
           </div>
