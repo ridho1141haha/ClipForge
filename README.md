@@ -55,10 +55,11 @@ YouTube URL
 
 ## The renderer (mini-services/ffmpeg-renderer, port 3003)
 - `POST /render` (multipart: video + recipe JSON) → job id
-- `GET /jobs/:id` · `GET /jobs/:id/stream` (SSE) · `GET /jobs/:id/download`
+- `GET /jobs/:id` · `GET /jobs/:id/stream` (SSE) · `GET /jobs/:id/download` · `GET /jobs/:id/cover` (JPG when `recipe.cover` was set)
 - Frame-accurate: `filter_complex trim/atrim + concat` (NOT `-c copy`, which snaps to keyframes and desynchronizes duration)
 - Subtitle burn-in via `ass` filter — all event times converted **SOURCE_TIME → OUTPUT_TIME** (cuts removed), cut-covered events dropped, canonical `H:MM:SS.cc` ASS timestamps (libass misparses other formats)
 - Camera punch-in via `zoompan` with **output-time keyframes** (pre-mapped through the cut-removal inverse)
+- Cover frame: `recipe.cover: { timestamp }` (OUTPUT time) → a 1080×1920 JPEG is extracted from the **rendered output** — cuts, zoom and burned subtitles included. The UI previews the exact frame with the same keep-range mapping (preview == render). Extraction failure degrades honestly (`hasCover=false`, MP4 stays valid).
 - Output probed after render: must be H.264 + AAC, dimensions recorded
 
 ## API surface

@@ -37,6 +37,7 @@ export type RecipeValidationCode =
   | 'INVALID_CAMERA'
   | 'INVALID_ASS'
   | 'INVALID_SOURCE'
+  | 'INVALID_COVER'
   | 'LIMIT_EXCEEDED'
 
 export interface ValidatedRecipe {
@@ -47,6 +48,8 @@ export interface ValidatedRecipe {
   sound_effects?: { type: string; start: number; duration: number; intensity: number }[]
   music?: { recommended: boolean; style: string; intensity: number; ducking_percent: number }
   segments?: { type: string; start: number; end: number }[]
+  /** optional cover-frame request — OUTPUT-time second to grab as the Short's cover JPG */
+  cover?: { timestamp: number }
   title?: string
   duration: number
 }
@@ -216,6 +219,23 @@ export function validateRecipe(raw: unknown): ValidateResult {
   const auxErr = capArray(raw.sound_effects, 'sound_effects', 200) ?? capArray(raw.segments, 'segments', 200)
   if (auxErr) return { ok: false, code: 'LIMIT_EXCEEDED', error: auxErr }
 
+  // ---- cover: optional cover-frame request (OUTPUT time). Must be a finite
+  // number within the output duration (+1s tolerance, same slop as the
+  // duration consistency check). The extractor clamps to [0, duration]. ----
+  let cover: ValidatedRecipe['cover']
+  if (raw.cover !== undefined && raw.cover !== null) {
+    if (!isPlainObject(raw.cover) || !isFiniteNum(raw.cover.timestamp)) {
+      return { ok: false, code: 'INVALID_COVER', error: 'cover must be an object with a finite numeric timestamp' }
+    }
+    if (raw.cover.timestamp < 0) {
+      return { ok: false, code: 'INVALID_COVER', error: `cover.timestamp is negative (${raw.cover.timestamp})` }
+    }
+    if (raw.cover.timestamp > duration + 1.0) {
+      return { ok: false, code: 'INVALID_COVER', error: `cover.timestamp (${raw.cover.timestamp}s) is beyond the output duration (${duration.toFixed(2)}s)` }
+    }
+    cover = { timestamp: raw.cover.timestamp }
+  }
+
   // ---- title: bounded (it feeds the output filename via sanitize) ----
   let title: string | undefined
   if (raw.title !== undefined && raw.title !== null) {
@@ -233,6 +253,7 @@ export function validateRecipe(raw: unknown): ValidateResult {
       sound_effects: Array.isArray(raw.sound_effects) ? (raw.sound_effects as ValidatedRecipe['sound_effects']) : undefined,
       music: isPlainObject(raw.music) ? (raw.music as ValidatedRecipe['music']) : undefined,
       segments: Array.isArray(raw.segments) ? (raw.segments as ValidatedRecipe['segments']) : undefined,
+      cover,
       title,
       duration: Math.round(duration * 1000) / 1000,
     },

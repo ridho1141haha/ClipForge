@@ -17,12 +17,14 @@ import {
   Wand2,
   CloudDownload,
   HardDriveUpload,
+  Image as ImageIcon,
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { type EditPlan } from '@/lib/editplan'
 import { buildRenderRecipe, buildRecipeJSON } from '@/lib/render-recipe'
 import { outputDuration as planOutputDuration } from '@/lib/subtitles'
+import { mapKeepRanges, sourceTimeAtOutput } from '@/lib/keep-ranges'
 import { fmtTime, fmtDuration } from '@/lib/youtube'
 import type { Cut } from '@/lib/subtitles'
 
@@ -60,6 +62,17 @@ export function UploadRender({ plan, projectId, projectMedia }: Props) {
   const [cancelling, setCancelling] = React.useState(false)
   const [error, setError] = React.useState<string | null>(null)
   const [timing, setTiming] = React.useState<{ elapsedMs: number; etaMs: number | null }>({ elapsedMs: 0, etaMs: null })
+  const [hasCover, setHasCover] = React.useState(false)
+  const [coverUrl, setCoverUrl] = React.useState<string | null>(null)
+  // ---- cover-frame picker state ----
+  // coverT is OUTPUT time (seconds into the RENDERED video). null = no custom
+  // cover. The preview canvas maps output → source via the SAME keep-range
+  // math the renderer consumes (preview == render parity).
+  const [coverT, setCoverT] = React.useState<number | null>(null)
+  const [coverSeeking, setCoverSeeking] = React.useState(false)
+  const coverVideoRef = React.useRef<HTMLVideoElement | null>(null)
+  const coverCanvasRef = React.useRef<HTMLCanvasElement | null>(null)
+  const coverFileUrlRef = React.useRef<string | null>(null)
   const fileInputRef = React.useRef<HTMLInputElement>(null)
   const pollRef = React.useRef<number>(0)
   const stoppedRef = React.useRef(false)
@@ -85,6 +98,78 @@ export function UploadRender({ plan, projectId, projectMedia }: Props) {
   const emptyEdit = outputDurationSec < 0.2
 
   const canRender = (sourceMode === 'local' ? localReady : !!file) && !!plan && !emptyEdit
+
+  // ---- cover preview: source URL for the hidden <video> ----
+  // server source → owner-scoped media stream; upload mode → local object URL
+  const coverMediaUrl = React.useMemo(() => {
+    if (!plan) return null
+    if (sourceMode === 'local' && projectId && projectMedia?.state === 'ready') return `/api/media/${projectId}`
+    if (sourceMode === 'upload' && file) return coverFileUrlRef.current ?? undefined
+    return null
+  }, [plan, sourceMode, projectId, projectMedia?.state, file])
+
+  // keep (re)creating the object URL in effects (not during render)
+  React.useEffect(() => {
+    if (sourceMode === 'upload' && file) {
+      const url = URL.createObjectURL(file)
+      coverFileUrlRef.current = url
+      return () => {
+        URL.revokeObjectURL(url)
+        if (coverFileUrlRef.current === url) coverFileUrlRef.current = null
+      }
+    }
+  }, [sourceMode, file])
+
+  // keep-range map for the CURRENT plan — output time → source time
+  const coverRanges = React.useMemo(() => {
+    if (!plan) return []
+    const sc = plan.selected_clip
+    const cuts = (sc.cuts ?? []).filter((c: Cut) => c.end > c.start) as Cut[]
+    return mapKeepRanges(sc.start, sc.end, cuts)
+  }, [plan])
+
+  // draw the source frame for the chosen OUTPUT time (9:16 cover-fill crop,
+  // mirroring the renderer's scale+crop filter order)
+  const drawCoverFrame = React.useCallback(() => {
+    const v = coverVideoRef.current
+    const canvas = coverCanvasRef.current
+    if (!v || !canvas || !v.videoWidth) return
+    const ctx = canvas.getContext('2d')
+    if (!ctx) return
+    const W = canvas.width
+    const H = canvas.height
+    const scale = Math.max(W / v.videoWidth, H / v.videoHeight)
+    const dw = v.videoWidth * scale
+    const dh = v.videoHeight * scale
+    ctx.fillStyle = '#000'
+    ctx.fillRect(0, 0, W, H)
+    ctx.drawImage(v, (W - dw) / 2, (H - dh) / 2, dw, dh)
+    setCoverSeeking(false)
+  }, [])
+
+  // when coverT changes: map output → source, seek the hidden video, draw
+  React.useEffect(() => {
+    const v = coverVideoRef.current
+    if (coverT == null || !v || !coverMediaUrl) return
+    const srcT = sourceTimeAtOutput(coverRanges, coverT)
+    setCoverSeeking(true)
+    let cancelled = false
+    const onSeeked = () => {
+      if (cancelled) return
+      drawCoverFrame()
+    }
+    v.addEventListener('seeked', onSeeked)
+    try {
+      if (Math.abs(v.currentTime - srcT) > 0.02) v.currentTime = srcT
+      else drawCoverFrame()
+    } catch {
+      setCoverSeeking(false)
+    }
+    return () => {
+      cancelled = true
+      v.removeEventListener('seeked', onSeeked)
+    }
+  }, [coverT, coverMediaUrl, coverRanges, drawCoverFrame])
 
   const onFileSelect = (f: File) => {
     if (!f.type.startsWith('video/')) {
@@ -122,6 +207,8 @@ export function UploadRender({ plan, projectId, projectMedia }: Props) {
     setNotice(null)
     setRenderedUrl(null)
     setRenderedInfo(null)
+    setHasCover(false)
+    setCoverUrl(null)
     samplesRef.current = []
     startRef.current = Date.now()
     setTiming({ elapsedMs: 0, etaMs: null })
@@ -131,7 +218,7 @@ export function UploadRender({ plan, projectId, projectMedia }: Props) {
       // OUTPUT-time camera keyframes + duration), NOT the raw RenderRecipe.
       // The raw object has none of those — the renderer would silently render
       // the full clip WITHOUT cuts and WITHOUT subtitles.
-      const recipeJson = buildRecipeJSON(recipe)
+      const recipeJson = buildRecipeJSON(recipe, { coverTimestamp: coverT })
       let res: Response
       if (sourceMode === 'local' && projectId && localReady) {
         // project-source render: the proxy streams the server-side media to the
@@ -219,11 +306,22 @@ export function UploadRender({ plan, projectId, projectMedia }: Props) {
             height: job.height ?? 1920,
             durationOk: job.durationOk !== false,
           })
+          setHasCover(job.hasCover === true)
           // fetch the rendered file
           const dlRes = await fetch(`/api/render-proxy/jobs/${id}/download`)
           const blob = await dlRes.blob()
           const url = URL.createObjectURL(blob)
           setRenderedUrl(url)
+          // fetch the cover frame when the renderer extracted one
+          if (job.hasCover) {
+            try {
+              const cRes = await fetch(`/api/render-proxy/jobs/${id}/cover`)
+              if (cRes.ok) {
+                const cBlob = await cRes.blob()
+                setCoverUrl(URL.createObjectURL(cBlob))
+              }
+            } catch { /* cover is optional — never fail the result card */ }
+          }
           return
         }
         if (job.status === 'error') {
@@ -256,13 +354,15 @@ export function UploadRender({ plan, projectId, projectMedia }: Props) {
     return () => {
       clearTimeout(pollRef.current)
       if (renderedUrl) URL.revokeObjectURL(renderedUrl)
+      if (coverUrl) URL.revokeObjectURL(coverUrl)
     }
-  }, [renderedUrl])
+  }, [renderedUrl, coverUrl])
 
   const reset = () => {
     stoppedRef.current = true
     clearTimeout(pollRef.current)
     if (renderedUrl) URL.revokeObjectURL(renderedUrl)
+    if (coverUrl) URL.revokeObjectURL(coverUrl)
     setFile(null)
     setPhase('idle')
     setProgress(0)
@@ -273,6 +373,9 @@ export function UploadRender({ plan, projectId, projectMedia }: Props) {
     setError(null)
     setNotice(null)
     setCancelling(false)
+    setHasCover(false)
+    setCoverUrl(null)
+    setCoverT(null)
     samplesRef.current = []
     setTiming({ elapsedMs: 0, etaMs: null })
   }
@@ -282,6 +385,16 @@ export function UploadRender({ plan, projectId, projectMedia }: Props) {
     const a = document.createElement('a')
     a.href = renderedUrl
     a.download = `clipforge_${(plan?.selected_clip.title ?? 'render').replace(/[^a-z0-9-_]+/gi, '_').slice(0, 40)}.mp4`
+    document.body.appendChild(a)
+    a.click()
+    a.remove()
+  }
+
+  const downloadCover = () => {
+    if (!coverUrl) return
+    const a = document.createElement('a')
+    a.href = coverUrl
+    a.download = `cover_${(plan?.selected_clip.title ?? 'clip').replace(/[^a-z0-9-_]+/gi, '_').slice(0, 40)}.jpg`
     document.body.appendChild(a)
     a.click()
     a.remove()
@@ -490,6 +603,128 @@ export function UploadRender({ plan, projectId, projectMedia }: Props) {
         </div>
       )}
 
+      {/* cover-frame picker ( Shorts cover = first impression; the extracted
+          JPG comes from the RENDERED output at the chosen OUTPUT time — the
+          preview canvas maps it via the same keep-range math) */}
+      {plan && !emptyEdit && (
+        <div className="rounded-lg border border-border/60 bg-card/40 p-3">
+          <div className="mb-2 flex items-center justify-between">
+            <div className="flex items-center gap-1.5 text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">
+              <ImageIcon className="h-3 w-3 text-primary" />
+              Cover frame
+              {coverT != null && (
+                <Badge variant="outline" className="ml-1 border-primary/40 bg-primary/10 text-[9px] text-primary">
+                  @ {fmtDuration(coverT)}
+                </Badge>
+              )}
+            </div>
+            {coverT != null ? (
+              <button
+                type="button"
+                onClick={() => setCoverT(null)}
+                className="flex items-center gap-1 text-[10px] text-muted-foreground transition-colors hover:text-foreground"
+              >
+                <X className="h-3 w-3" />
+                Clear
+              </button>
+            ) : (
+              <span className="text-[10px] text-muted-foreground">optional</span>
+            )}
+          </div>
+
+          <div className="flex gap-3">
+            {/* 9:16 live preview — the EXACT frame the renderer will extract */}
+            <div className="relative w-20 shrink-0 overflow-hidden rounded-md border border-border/60 bg-black" style={{ aspectRatio: '9 / 16' }}>
+              {coverT != null && coverMediaUrl ? (
+                <>
+                  <canvas ref={coverCanvasRef} width={180} height={320} className="h-full w-full" aria-label="Cover frame preview" />
+                  {coverSeeking && (
+                    <div className="absolute inset-0 grid place-items-center bg-black/40">
+                      <Loader2 className="h-3.5 w-3.5 animate-spin text-white/80" />
+                    </div>
+                  )}
+                </>
+              ) : (
+                <div className="flex h-full flex-col items-center justify-center gap-1 text-muted-foreground/50">
+                  <ImageIcon className="h-5 w-5" />
+                  <span className="px-1 text-center text-[8px] leading-tight">
+                    {coverMediaUrl ? 'drag to pick' : 'no preview source'}
+                  </span>
+                </div>
+              )}
+            </div>
+
+            <div className="min-w-0 flex-1 space-y-2">
+              {coverMediaUrl ? (
+                <input
+                  type="range"
+                  min={0}
+                  max={Math.max(0.1, outputDurationSec)}
+                  step={0.1}
+                  value={coverT ?? 0}
+                  aria-label="Cover frame timestamp"
+                  onChange={(e) => setCoverT(Number(e.target.value))}
+                  className="w-full accent-primary"
+                />
+              ) : (
+                <p className="text-[10px] leading-relaxed text-muted-foreground">
+                  {sourceMode === 'local'
+                    ? 'Frame preview needs the server source (or upload a file below) — you can still set the timestamp.'
+                    : 'Frame preview needs a source — pick the server source or upload a file.'}
+                </p>
+              )}
+              <div className="flex flex-wrap items-center gap-1.5">
+                <button
+                  type="button"
+                  onClick={() => setCoverT(0)}
+                  className="rounded-md border border-border/60 bg-muted/40 px-2 py-1 text-[10px] font-medium text-muted-foreground transition hover:bg-muted hover:text-foreground"
+                >
+                  First frame
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setCoverT(Math.round(outputDurationSec / 2 * 10) / 10)}
+                  className="rounded-md border border-border/60 bg-muted/40 px-2 py-1 text-[10px] font-medium text-muted-foreground transition hover:bg-muted hover:text-foreground"
+                >
+                  Middle
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setCoverT(Math.max(0, Math.round((outputDurationSec - 0.1) * 10) / 10))}
+                  className="rounded-md border border-border/60 bg-muted/40 px-2 py-1 text-[10px] font-medium text-muted-foreground transition hover:bg-muted hover:text-foreground"
+                >
+                  Last frame
+                </button>
+                {coverT != null && (
+                  <span className="ml-auto font-mono text-[10px] tabular-nums text-muted-foreground">
+                    output {fmtDuration(coverT)}
+                  </span>
+                )}
+              </div>
+              <p className="text-[10px] leading-relaxed text-muted-foreground">
+                {coverT != null
+                  ? 'Rendered with the plan — a JPG of this exact frame (after cuts, zoom & subtitles) is extracted for your Short\'s cover.'
+                  : 'Pick the moment viewers see first in the Shorts feed. The cover is extracted from the rendered video — cuts, zoom and burned subtitles included.'}
+              </p>
+            </div>
+          </div>
+
+          {/* hidden seek source for the canvas (never displayed) */}
+          {coverMediaUrl && coverT != null && (
+            <video
+              ref={coverVideoRef}
+              src={coverMediaUrl}
+              preload="metadata"
+              muted
+              playsInline
+              className="hidden"
+              aria-hidden="true"
+              tabIndex={-1}
+            />
+          )}
+        </div>
+      )}
+
       {/* render button */}
       {emptyEdit && (
         <div className="flex items-start gap-2 rounded-md border border-amber-500/30 bg-amber-500/10 p-2.5 text-xs text-amber-700 dark:text-amber-400">
@@ -667,21 +902,40 @@ export function UploadRender({ plan, projectId, projectMedia }: Props) {
               )}
             </div>
 
-            {/* video preview */}
-            <div className="overflow-hidden rounded-lg bg-black">
-              <video
-                src={renderedUrl}
-                controls
-                className="mx-auto max-h-[60vh] w-full"
-                style={{ aspectRatio: '9 / 16', maxWidth: 'calc(60vh * 9 / 16)' }}
-              />
+            {/* video preview + cover thumbnail */}
+            <div className="flex items-start gap-3">
+              <div className="overflow-hidden rounded-lg bg-black">
+                <video
+                  src={renderedUrl}
+                  controls
+                  className="mx-auto max-h-[60vh] w-full"
+                  style={{ aspectRatio: '9 / 16', maxWidth: 'calc(60vh * 9 / 16)' }}
+                />
+              </div>
+              {hasCover && coverUrl && (
+                <div className="w-20 shrink-0 space-y-1">
+                  <img
+                    src={coverUrl}
+                    alt="Extracted cover frame"
+                    className="w-full rounded-md border border-border/60"
+                    style={{ aspectRatio: '9 / 16' }}
+                  />
+                  <p className="text-center text-[9px] text-muted-foreground">cover.jpg</p>
+                </div>
+              )}
             </div>
 
-            <div className="flex gap-2">
+            <div className="flex flex-wrap gap-2">
               <Button onClick={downloadRendered} className="gap-2">
                 <Download className="h-4 w-4" />
                 Download MP4
               </Button>
+              {hasCover && coverUrl && (
+                <Button onClick={downloadCover} variant="outline" className="gap-2 border-primary/40">
+                  <ImageIcon className="h-4 w-4" />
+                  Download cover (JPG)
+                </Button>
+              )}
               <Button variant="outline" onClick={reset} className="gap-2">
                 <UploadCloud className="h-4 w-4" />
                 Render another

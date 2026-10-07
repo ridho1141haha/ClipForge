@@ -15,13 +15,14 @@ import { checkDailyUsageLimit, limitHeaders, limitReachedMessage } from '@/lib/u
 // Avoids CORS issues and keeps the mini-service internal (never publicly exposed).
 //
 // ─── SECURITY: JOB OWNERSHIP (10/10 mission, Phase 1.1) ─────────────────────
-// Every job operation (poll, SSE stream, cancel, download) is AUTHORIZED here
-// against the RenderJob table BEFORE touching the renderer:
+// Every job operation (poll, SSE stream, cancel, download, cover frame) is
+// AUTHORIZED here against the RenderJob table BEFORE touching the renderer:
 //   POST /render  → records (jobId, ownerId, projectId) on success
 //   POST /jobs/:id/cancel   → 404 unless the row exists AND ownerId matches
 //   GET  /jobs/:id          → 404 unless owned
 //   GET  /jobs/:id/stream   → 404 unless owned
 //   GET  /jobs/:id/download → 404 unless owned
+//   GET  /jobs/:id/cover    → 404 unless owned
 // Random UUID secrecy is NEVER relied on; ownership lives in the DB.
 // The renderer is a trusted internal service (localhost only); this proxy is
 // the public-facing authorization boundary.
@@ -46,7 +47,7 @@ export const dynamic = 'force-dynamic'
 export const runtime = 'nodejs'
 export const maxDuration = 300
 
-const JOB_PATH_RE = /^\/jobs\/([\w-]+)(\/(stream|download|cancel))?$/
+const JOB_PATH_RE = /^\/jobs\/([\w-]+)(\/(stream|download|cover|cancel))?$/
 
 /** Map a renderer status string to the canonical DB status (upper-snake). */
 function canonicalStatus(s: unknown): string | null {

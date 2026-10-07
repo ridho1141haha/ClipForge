@@ -19,6 +19,8 @@
  *   5. audio stream exists = aac and is NOT silent (mean_volume > -60dB)
  *   6. ASS subtitle events all within [0, outputDuration] (OUTPUT time)
  *   7. renderer's own durationOk flag true
+ *   8. cover frame: recipe.cover @ output 3.5s → hasCover=true, /cover serves
+ *      a real JPEG (magic bytes FFD8FF, non-trivial size)
  */
 
 import { execFile } from 'node:child_process'
@@ -115,13 +117,16 @@ async function main() {
   }
 
   const recipe = buildRenderRecipe(plan, 'golden_test_id')
-  const recipeJson = buildRecipeJSON(recipe)
+  // cover frame requested at OUTPUT 3.5s (inside the first keep range 5–15s →
+  // source 8.5s) — the renderer must extract a JPG from the RENDERED output
+  const recipeJson = buildRecipeJSON(recipe, { coverTimestamp: 3.5 })
   const parsed = JSON.parse(recipeJson)
 
   assert(eq(parsed.output_duration, EXPECTED_OUTPUT), `recipe output_duration = ${EXPECTED_OUTPUT}s`, `got ${parsed.output_duration}`)
   const keep = parsed.keep_ranges
   assert(keep.length === 2 && eq(keep[0].end - keep[0].start, 10) && eq(keep[1].end - keep[1].start, 10), 'keep ranges [5-15],[25-35]', JSON.stringify(keep))
   assert(parsed.camera_keyframes.every((k: any) => k.time >= 0 && k.time <= EXPECTED_OUTPUT + 0.01), 'camera keyframes pre-mapped into OUTPUT time', JSON.stringify(parsed.camera_keyframes))
+  assert(parsed.cover && eq(parsed.cover.timestamp, 3.5), 'cover request carried into recipe JSON @ output 3.5s', JSON.stringify(parsed.cover))
 
   // ASS sanity (pre-render): all events within output duration, no event in removed range
   const ass = generateASS(recipe)
@@ -151,6 +156,7 @@ async function main() {
   }
   assert(job && job.status === 'done', 'render job completes (status=done)', `status=${job?.status} error=${job?.error}`)
   assert(job?.durationOk === true, 'renderer duration check durationOk=true', `duration=${job?.duration} vs ${EXPECTED_OUTPUT}`)
+  assert(job?.hasCover === true, 'cover frame extracted (job.hasCover=true)', `hasCover=${job?.hasCover}`)
 
   console.log('\n== Golden E2E: output file validation (ffprobe / volumedetect) ==')
   const dl = await fetch(`${RENDERER}/jobs/${startJson.id}/download`)
@@ -169,6 +175,19 @@ async function main() {
   assert(a?.codec_name === 'aac', 'audio stream exists = aac', `got ${a?.codec_name}`)
   const mv = await meanVolume(outPath)
   assert(mv > -60, 'audio is NOT silent (mean_volume > -60dB)', `mean_volume=${mv}dB`)
+
+  console.log('\n== Golden E2E: cover-frame extraction (Shorts cover) ==')
+  const coverRes = await fetch(`${RENDERER}/jobs/${startJson.id}/cover`)
+  assert(coverRes.ok, 'cover endpoint returns 200', `status=${coverRes.status}`)
+  assert((coverRes.headers.get('content-type') ?? '').includes('image/jpeg'), 'cover content-type = image/jpeg', coverRes.headers.get('content-type') ?? '')
+  const coverBuf = Buffer.from(await coverRes.arrayBuffer())
+  assert(coverBuf.length > 2048, 'cover has real size (>2KB)', `${coverBuf.length} bytes`)
+  assert(coverBuf[0] === 0xff && coverBuf[1] === 0xd8 && coverBuf[2] === 0xff, 'cover magic bytes = JPEG (FFD8FF)', coverBuf.subarray(0, 4).toString('hex'))
+  writeFileSync('/tmp/clipforge-e2e-cover.jpg', coverBuf)
+  const coverProbe2 = await ffprobeJson('/tmp/clipforge-e2e-cover.jpg').catch(() => null)
+  const coverStream = (coverProbe2?.streams ?? [])[0]
+  assert(coverStream?.codec_name === 'mjpeg' || coverStream?.codec_name === 'jpeg' || coverStream?.codec_name === 'png', 'cover decodes as a real image', JSON.stringify(coverStream))
+  assert(coverStream?.width === 1080 && coverStream?.height === 1920, 'cover is a 9:16 frame (1080x1920)', `${coverStream?.width}x${coverStream?.height}`)
 
   console.log(`\n════════════════════════════════`)
   console.log(`GOLDEN E2E RESULT: ${passed} passed, ${failed} failed`)

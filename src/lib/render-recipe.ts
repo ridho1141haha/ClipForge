@@ -563,25 +563,37 @@ function sanitize(s: string): string {
 
 // Build a JSON "render recipe" that the renderer mini-service executes.
 // camera_keyframes are pre-mapped to OUTPUT time (the mini-service works in output time).
-export function buildRecipeJSON(recipe: RenderRecipe): string {
+// options.coverTimestamp — optional OUTPUT-time second for the Short's cover
+// frame; the renderer extracts a JPG from the RENDERED output at that exact
+// time (the same frame the UI previews via the keep-range mapping).
+export function buildRecipeJSON(recipe: RenderRecipe, options: { coverTimestamp?: number | null } = {}): string {
   const keep = buildKeepRanges(recipe.clipStart, recipe.clipEnd, recipe.cuts)
   // pre-map camera keyframes to output time for the renderer
   const cameraKeyframesOutput = recipe.cameraKeyframes
     .map((kf) => ({ time: Math.max(0, sourceToOutputTime(kf.time, recipe.clipStart, recipe.cuts)), scale: kf.scale }))
     .sort((a, b) => a.time - b.time)
+  const outDur = outputDuration(recipe)
+  // cover: emit ONLY when a finite, in-bounds timestamp was chosen — the
+  // renderer validates independently, but we never send known-bad data
+  const ct = options.coverTimestamp
+  const cover =
+    typeof ct === 'number' && isFinite(ct) && ct >= 0 && ct <= outDur + 1.0
+      ? { timestamp: Math.min(ct, Math.max(0, outDur - 0.05)) }
+      : undefined
   return JSON.stringify(
     {
       source: { youtube_id: recipe.youtubeId, clip_start: recipe.clipStart, clip_end: recipe.clipEnd },
       keep_ranges: keep,
-      output_duration: outputDuration(recipe),
+      output_duration: outDur,
       cuts: recipe.cuts,
       subtitles_ass: generateASS(recipe),
       camera_keyframes: cameraKeyframesOutput,
       sound_effects: recipe.soundEffects,
       music: recipe.music,
       segments: recipe.segments,
+      cover,
       title: recipe.title,
-      duration: outputDuration(recipe),
+      duration: outDur,
     },
     null,
     2,

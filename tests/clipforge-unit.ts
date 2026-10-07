@@ -522,6 +522,15 @@ console.log('\n== RenderRecipe runtime validation (renderer NEVER trusts JSON) =
   expectFail('output over the cap', (r) => ({ ...r, keep_ranges: [{ start: 0, end: RECIPE_LIMITS.MAX_OUTPUT_DURATION + 1 }], duration: RECIPE_LIMITS.MAX_OUTPUT_DURATION + 1 }), 'LIMIT_EXCEEDED')
   expectFail('subtitles_ass too large', (r) => ({ ...r, subtitles_ass: 'x'.repeat(RECIPE_LIMITS.MAX_ASS_BYTES + 1) }), 'LIMIT_EXCEEDED')
   expectFail('invalid source block', (r) => ({ ...r, source: { clip_start: 10, clip_end: 5 } }), 'INVALID_SOURCE')
+  // cover-frame contract (OUTPUT-time; within duration +1s tolerance)
+  const withCover = validateRecipe({ ...good, cover: { timestamp: 2.5 } })
+  assert(withCover.ok && withCover.recipe.cover?.timestamp === 2.5, 'cover accepted and preserved')
+  expectFail('cover not an object', (r) => ({ ...r, cover: '2' }), 'INVALID_COVER')
+  expectFail('cover NaN timestamp', (r) => ({ ...r, cover: { timestamp: Number.NaN } }), 'INVALID_COVER')
+  expectFail('cover negative timestamp', (r) => ({ ...r, cover: { timestamp: -0.5 } }), 'INVALID_COVER')
+  expectFail('cover beyond duration', (r) => ({ ...r, cover: { timestamp: 11.5 } }), 'INVALID_COVER')
+  const edgeCover = validateRecipe({ ...good, cover: { timestamp: 10.9 } })
+  assert(edgeCover.ok, 'cover within duration + 1s tolerance accepted', edgeCover.ok ? '' : edgeCover.code)
   // absurd-but-legal still passes: 30 min output allowed
   const big = validateRecipe({ keep_ranges: [{ start: 0, end: RECIPE_LIMITS.MAX_OUTPUT_DURATION }], duration: RECIPE_LIMITS.MAX_OUTPUT_DURATION })
   assert(big.ok, '30-minute output allowed (sensible cap, not arbitrary)')
@@ -630,6 +639,59 @@ console.log('\n== Diversity: near-duplicate moments collapsed, distinct moments 
   const kr4 = mapKeepRanges(30, 90, [])
   assert(kr4.length === 1 && kr4[0].srcStart === 30 && kr4[0].outStart === 0, 'no cuts → single identity range')
   assert(sourceTimeAtOutput(kr4, 12) === 42, 'identity: output 12 → source 42')
+}
+
+// ===========================================================================
+// Cover-frame recipe emission (buildRecipeJSON coverTimestamp option)
+// ===========================================================================
+{
+  console.log('\n== Cover-frame recipe emission (preview == render parity) ==')
+  const { buildRenderRecipe, buildRecipeJSON } = await import('../src/lib/render-recipe')
+  const plan = {
+    selected_clip: {
+      id: 'clip_cover',
+      title: 'Cover test',
+      start: 10,
+      end: 30,
+      duration: 20,
+      cuts: [{ start: 15, end: 18 }],
+      camera: [],
+      subtitles: [],
+      segments: [],
+      visuals: [],
+      sound_effects: [],
+      music: { recommended: false, style: '', intensity: 0, ducking_percent: 0 },
+      generated_hook: '',
+    },
+  } as any
+  const recipe = buildRenderRecipe(plan, 'unittest')
+
+  // no cover requested → field absent (renderer default: no extraction)
+  const plain = JSON.parse(buildRecipeJSON(recipe))
+  assert(plain.cover === undefined, 'no coverTimestamp → cover absent from recipe JSON')
+  assert(Math.abs(plain.duration - 17) < 0.001, 'output duration 17s after the cut')
+
+  // cover requested → emitted at OUTPUT time, clamped inside duration
+  const withCover = JSON.parse(buildRecipeJSON(recipe, { coverTimestamp: 5 }))
+  assert(withCover.cover && Math.abs(withCover.cover.timestamp - 5) < 0.001, 'cover emitted at requested output time')
+
+  const endCover = JSON.parse(buildRecipeJSON(recipe, { coverTimestamp: 17 }))
+  assert(endCover.cover && Math.abs(endCover.cover.timestamp - 16.95) < 0.001, 'cover at exact end clamped to duration - 0.05')
+
+  // out-of-bounds / garbage → never emitted (renderer validates independently)
+  const badCover = JSON.parse(buildRecipeJSON(recipe, { coverTimestamp: 999 }))
+  assert(badCover.cover === undefined, 'cover beyond duration + tolerance → omitted, not sent')
+  const nanCover = JSON.parse(buildRecipeJSON(recipe, { coverTimestamp: Number.NaN }))
+  assert(nanCover.cover === undefined, 'NaN cover → omitted, not sent')
+  const negCover = JSON.parse(buildRecipeJSON(recipe, { coverTimestamp: -3 }))
+  assert(negCover.cover === undefined, 'negative cover → omitted, not sent')
+
+  // the UI's preview mapping must agree with the emitted output timestamp:
+  // clip 10..30, cut 15..18 → keep [10,15](out 0-5) + [18,30](out 5-17)
+  const { mapKeepRanges, sourceTimeAtOutput } = await import('../src/lib/keep-ranges')
+  const kr = mapKeepRanges(10, 30, [{ start: 15, end: 18 }])
+  assert(Math.abs(sourceTimeAtOutput(kr, 5) - 18) < 0.001, 'preview maps output 5s → source 18s (first frame after the cut)')
+  assert(Math.abs(sourceTimeAtOutput(kr, 7) - 20) < 0.001, 'preview maps output 7s → source 20s (jumped the 3s cut)')
 }
 
 // ---- media cache LRU eviction planner (pure) ----

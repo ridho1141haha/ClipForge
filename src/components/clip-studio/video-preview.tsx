@@ -26,17 +26,24 @@ export function VideoPreview({ meta, playStart, mediaUrl, mediaSize, mediaKey, o
   // 'ok' = playing/neutral; 'missing' = probed endpoint, file confirmed gone;
   // 'error' = playback failed for a non-missing reason (generic message only)
   const [probeState, setProbeState] = React.useState<'ok' | 'checking' | 'missing' | 'error'>('ok')
+  // WHY the source is unavailable — the heal card must tell the truth about
+  // the difference between "file was on disk and is gone" (410) and "the
+  // download never produced a file" (409 state: failed|skipped|unavailable).
+  const [missingReason, setMissingReason] = React.useState<'file-gone' | 'download-failed' | 'never-downloaded'>('file-gone')
 
   // reset the probe whenever the source (or reload key) changes
   React.useEffect(() => {
     setProbeState('ok')
+    setMissingReason('file-gone')
   }, [mediaUrl, mediaKey])
 
   /**
    * The <video> error event is ambiguous (code 4 covers missing, blocked,
    * unsupported). Probe our own owner-scoped endpoint ONCE to learn the real
-   * reason: 410 = file missing on disk (evicted/removed) → offer auto-heal;
-   * 409 = state changed server-side → treat as missing too; anything else is
+   * reason: 410 = file was on disk and is gone (evicted/removed) → offer
+   * auto-heal; 409 = DB state says no streamable source — the body names the
+   * exact state ('failed' = download attempted and failed, 'skipped'/'unavailable'
+   * = never downloaded) so the heal card can say WHICH truth; anything else is
    * a generic error. No speculative requests while playback is healthy.
    */
   const onVideoError = React.useCallback(async () => {
@@ -44,8 +51,18 @@ export function VideoPreview({ meta, playStart, mediaUrl, mediaSize, mediaKey, o
     setProbeState('checking')
     try {
       const r = await fetch(mediaUrl, { headers: { Range: 'bytes=0-1' } })
-      if (r.status === 410 || r.status === 409) setProbeState('missing')
-      else setProbeState('error')
+      if (r.status === 410) {
+        setMissingReason('file-gone')
+        setProbeState('missing')
+      } else if (r.status === 409) {
+        // body: { error: '... (state: failed)' } — extract the state for honest copy
+        const body = (await r.json().catch(() => null)) as { error?: string } | null
+        const state = /state:\s*(\w+)/.exec(body?.error ?? '')?.[1]
+        setMissingReason(state === 'failed' ? 'download-failed' : 'never-downloaded')
+        setProbeState('missing')
+      } else {
+        setProbeState('error')
+      }
     } catch {
       setProbeState('error')
     }
@@ -82,9 +99,19 @@ export function VideoPreview({ meta, playStart, mediaUrl, mediaSize, mediaKey, o
           <div className="grid h-14 w-14 place-items-center rounded-2xl bg-amber-500/15 text-amber-400 ring-1 ring-amber-500/30">
             <FolderX className="h-7 w-7" />
           </div>
-          <p className="text-sm font-semibold text-foreground">Source file is missing on disk</p>
+          <p className="text-sm font-semibold text-foreground">
+            {missingReason === 'file-gone'
+              ? 'Source file is missing on disk'
+              : missingReason === 'download-failed'
+                ? 'Source download never completed'
+                : 'Source was never downloaded'}
+          </p>
           <p className="max-w-sm text-center text-xs leading-relaxed text-muted-foreground">
-            The cached source was removed (media cache policy or manual cleanup). Your clips, scores, and edit plans are all intact — re-prepare re-downloads the source and re-enables preview + direct rendering.
+            {missingReason === 'file-gone'
+              ? 'The cached source was removed (media cache policy or manual cleanup). Your clips, scores, and edit plans are all intact — re-prepare re-downloads the source and re-enables preview + direct rendering.'
+              : missingReason === 'download-failed'
+                ? 'The server tried to download this source before and the download failed. Your clips, scores, and edit plans are all intact — re-prepare retries the download (or upload the file manually below).'
+                : 'No source video is stored for this project. Your clips, scores, and edit plans are all intact — re-prepare downloads the source so preview and one-click rendering work without a manual upload.'}
           </p>
           {onMediaMissing && (
             <button

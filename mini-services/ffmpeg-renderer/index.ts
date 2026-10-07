@@ -52,6 +52,8 @@ interface RenderJob {
   height?: number
   /** false when rendered duration deviates from the recipe beyond tolerance */
   durationOk?: boolean
+  /** true when a cover-frame JPG was extracted from the OUTPUT at recipe.cover.timestamp */
+  hasCover?: boolean
   error?: string
   createdAt: number
   finishedAt?: number
@@ -230,6 +232,7 @@ function broadcast(job: RenderJob) {
     width: job.width,
     height: job.height,
     durationOk: job.durationOk,
+    hasCover: job.hasCover,
   })
   for (const send of job.subscribers) {
     try { send(`data: ${payload}\n\n`) } catch {}
@@ -373,6 +376,30 @@ async function processJob(jobId: string, file: File, recipe: ValidatedRecipe) {
     // duration sanity vs recipe (tolerance 1.5s) — reported, surfaced to UI/tests
     const expected = recipe.duration ?? (recipe.source ? recipe.source.clip_end! - recipe.source.clip_start! : 0)
     job.durationOk = !(expected > 0 && Math.abs((job.duration ?? 0) - expected) > 1.5)
+
+    // ---- cover frame (optional): extract a JPG from the RENDERED output at
+    // the requested OUTPUT time — the exact frame users previewed in the UI
+    // (same keep-range math), NOT a re-decode of the source. A failed cover
+    // extraction degrades honestly (no cover, MP4 still valid) — it must never
+    // fail a finished render.
+    if (recipe.cover) {
+      const coverStart = Date.now()
+      const t = Math.min(Math.max(0, recipe.cover.timestamp), Math.max(0, (job.duration ?? recipe.duration) - 0.05))
+      const coverPath = join(jobDir, 'cover.jpg')
+      const coverRes = await run(
+        ['ffmpeg', '-nostdin', '-y', '-ss', timeToFFmpeg(t), '-i', outPath, '-frames:v', '1', '-q:v', '2', coverPath],
+        jobDir, job, 'Extracting cover frame', 96, 98, 60_000,
+      )
+      if (coverRes.code === 0 && existsSync(coverPath) && statSync(coverPath).size > 1024) {
+        job.hasCover = true
+        stageTiming(job, 'cover-extract', coverStart)
+        console.log(`[${jobId}] cover extracted @ output ${t.toFixed(2)}s (${statSync(coverPath).size} bytes)`)
+      } else {
+        job.hasCover = false
+        console.warn(`[${jobId}] cover extraction failed (code ${coverRes.code}) — rendering without cover`) 
+        try { rmSync(coverPath) } catch {}
+      }
+    }
 
     stageTiming(job, 'finalize', finalizeStart)
     transition(job, 'done')
@@ -531,12 +558,35 @@ serve({
       return cors(res)
     }
 
+    // GET /jobs/:id/cover — download the extracted cover-frame JPG (when requested)
+    const coverMatch = url.pathname.match(/^\/jobs\/([^/]+)\/cover$/)
+    if (req.method === 'GET' && coverMatch) {
+      const job = jobs.get(coverMatch[1])
+      if (!job || job.status !== 'done') return cors(json({ error: 'render not ready' }, 404))
+      if (!job.hasCover) return cors(json({ error: 'no cover was requested for this render' }, 404))
+      const coverPath = join(WORKDIR, job.id, 'cover.jpg')
+      if (!existsSync(coverPath)) return cors(json({ error: 'file expired' }, 410))
+      const buf = readFileSync(coverPath)
+      const base = sanitize(job.filename?.replace(/\.mp4$/i, '') ?? 'clip')
+      const res = new Response(buf, {
+        status: 200,
+        headers: {
+          'Content-Type': 'image/jpeg',
+          'Content-Disposition': `attachment; filename="cover_${base}.jpg"`,
+          'Content-Length': String(buf.length),
+          'Cache-Control': 'private, max-age=300',
+        },
+      })
+      return cors(res)
+    }
+
     // GET / — health
     return cors(json({ service: 'ClipForge ffmpeg renderer', port: PORT, endpoints: {
       'POST /render': 'multipart (video, recipe) → {id}',
       'GET /jobs/:id': 'poll status',
       'GET /jobs/:id/stream': 'SSE progress',
       'GET /jobs/:id/download': 'download MP4',
+      'GET /jobs/:id/cover': 'download cover-frame JPG (when recipe.cover was set)',
     } }))
   },
 })
