@@ -76,7 +76,7 @@ export function SourceStatusPanel({
   analyzeResult: AnalyzeResult | null
   transcript?: string | null
   words?: { word: string; start: number; end: number }[] | null
-  wordTiming?: 'measured' | 'estimated' | null
+  wordTiming?: 'measured' | 'estimated' | 'mixed' | null
   onOpenTranscript?: () => void
 }) {
   if (!meta && !analyzeResult) return null
@@ -114,6 +114,14 @@ export function SourceStatusPanel({
             >
               <AlertTriangle className="h-3 w-3" />
               {wordCount.toLocaleString()} word timestamps · estimated
+            </Chip>
+          ) : wordTiming === 'mixed' ? (
+            <Chip
+              tone="warn"
+              title="Word timestamps are PARTIALLY measured — some words carry real source offsets, others are interpolated from segment timings. Karaoke highlights only where timing is verified."
+            >
+              <AlertTriangle className="h-3 w-3" />
+              {wordCount.toLocaleString()} word timestamps · mixed precision
             </Chip>
           ) : (
             <Chip tone="good" title="Word-level timestamps MEASURED from the source (json3/srv3 offsets or ASR) — subtitle & context validation fully grounded">

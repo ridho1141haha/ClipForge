@@ -77,6 +77,11 @@ archaeology.
   - render jobs live in the renderer mini-service memory
     (queued → extracting → rendering → finalizing → done / error / **cancelled**),
     with SSE progress + polling; outputs expire in 10 min.
+  - `RenderJob` table (added 2026-02) is the **ownership + lifecycle record**:
+    every render start persists `(jobId, ownerId, projectId)` and the public
+    proxy authorizes poll/stream/cancel/download against it. The state machine
+    is enforced in the renderer (terminal states are final — a cancelled job
+    can never become completed later).
 - **Later**: durable queue (Postgres-backed table is enough at first — no
   Redis required) with `Job { id, type, payload, state, attempt, lastError }`
   and idempotent stages. Stage results should be checkpointed so a retry does

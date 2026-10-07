@@ -37,13 +37,17 @@ export interface ResolvedTranscript {
   source: TranscriptSource
   language?: string
   /**
-   * 'measured'  — each word start/end comes from the source's own word-level
-   *               timing data (json3 tOffsetMs, srv3 word offsets, or ASR).
-   * 'estimated' — no true word timing in the source; word times are evenly
-   *               distributed within segment timings (clearly labeled, never
-   *               treated as true word timestamps downstream).
+   * TIMING PROVENANCE (mission Phase 2 — never lie about precision):
+   * 'measured'  — ≥80% of caption segments carry REAL per-word offsets (json3
+   *               tOffsetMs, srv3 word attrs, or ASR) → true word-level timing.
+   * 'mixed'     — 20–80% measured: part of the words are measured, the rest
+   *               interpolated from segment timings.
+   * 'estimated' — no (or almost no) real word timing; word times are evenly
+   *               distributed within segment timings.
+   * Downstream (karaoke, export) must NEVER treat estimated/mixed timing as
+   * exact — the plan route only emits karaoke for verified measured windows.
    */
-  wordTiming: 'measured' | 'estimated'
+  wordTiming: 'measured' | 'estimated' | 'mixed'
   error?: string
 }
 
@@ -167,27 +171,18 @@ async function ytDlpCaptions(youtubeId: string, langPref = 'en,id'): Promise<{ j
       files = readdirSync(dir).filter((f) => f.startsWith('subs') && (f.endsWith('.json3') || f.endsWith('.vtt') || f.endsWith('.srv3')))
     }
     if (files.length === 0) return null
-    // prefer json3 (word timings) > srv3 > vtt — and among json3 tracks,
-    // prefer the one that actually carries per-word tOffsetMs (the ASR
-    // 'en-orig' track) over word-offset-less manual tracks.
-    const offsetRatio = (f: string): number => {
-      if (!f.endsWith('.json3')) return -1
-      try {
-        const j = JSON.parse(readFileSync(join(dir, f), 'utf-8')) as { events?: { segs?: { tOffsetMs?: number }[] }[] }
-        const segs = (j.events ?? []).flatMap((e) => e.segs ?? [])
-        if (segs.length === 0) return 0
-        return segs.filter((s) => typeof s.tOffsetMs === 'number' && isFinite(s.tOffsetMs)).length / segs.length
-      } catch {
-        return 0
-      }
-    }
+    // TRACK SELECTION = TIMING QUALITY FIRST (mission Phase 2.6 — never prefer
+    // a container merely because of its format). The best-quality track wins;
+    // ties break by format (json3 > srv3 > vtt), then deterministic filename
+    // order. So a srv3 track WITH word offsets beats a json3 track WITHOUT them.
+    const offsetRatio = (f: string): number => captionTrackTimingQuality(f, () => readFileSync(join(dir, f), 'utf-8'))
     files.sort((a, b) => {
+      const qa = offsetRatio(a)
+      const qb = offsetRatio(b)
+      if (Math.abs(qa - qb) > 0.05) return qb - qa // REAL word timing wins regardless of container
       const ra = rank(a)
       const rb = rank(b)
       if (ra !== rb) return ra - rb
-      const oa = offsetRatio(a)
-      const ob = offsetRatio(b)
-      if (Math.abs(oa - ob) > 0.05) return ob - oa // more word offsets first
       return a.localeCompare(b)
     })
     const content = readFileSync(join(dir, files[0]), 'utf-8')
@@ -211,6 +206,33 @@ async function ytDlpCaptions(youtubeId: string, langPref = 'en,id'): Promise<{ j
     if (f.endsWith('.srv3')) return 1
     return 2
   }
+}
+
+/**
+ * Timing quality of a caption track file (0..1): the fraction of caption
+ * segments carrying REAL per-word offsets. Used to RANK candidate tracks by
+ * actual usable timing instead of container format (mission Phase 2.6).
+ * Pure: reads content via the injected reader (unit-testable).
+ */
+export function captionTrackTimingQuality(fileName: string, readText: () => string): number {
+  try {
+    if (fileName.endsWith('.json3')) {
+      const j = JSON.parse(readText()) as { events?: { segs?: { tOffsetMs?: number }[] }[] }
+      const segs = (j.events ?? []).flatMap((e) => e.segs ?? [])
+      if (segs.length === 0) return 0
+      return segs.filter((s) => typeof s.tOffsetMs === 'number' && isFinite(s.tOffsetMs)).length / segs.length
+    }
+    if (fileName.endsWith('.srv3')) {
+      const xml = readText()
+      const sElems = xml.match(/<s\b[^>]*>/g) ?? []
+      if (sElems.length === 0) return 0
+      const withOffset = sElems.filter((s) => /\bac-as="\d+"/.test(s) || /\bt="\d+"/.test(s)).length
+      return withOffset / sElems.length
+    }
+  } catch {
+    return 0 // unreadable/corrupt track ranks last
+  }
+  return 0 // vtt has no word timing
 }
 
 /** Minimal VTT → json3-ish converter so downstream parsing stays uniform. */
@@ -415,7 +437,7 @@ interface Json3Event { tStartMs: number; dDurationMs?: number; segs?: { utf8: st
  * and that is explicitly labeled 'estimated', never treated as true word
  * timestamps downstream.
  */
-function parseJson3(json3: unknown): { words: WordTimestamp[]; text: string; wordTiming: 'measured' | 'estimated' } {
+function parseJson3(json3: unknown): { words: WordTimestamp[]; text: string; wordTiming: 'measured' | 'estimated' | 'mixed' } {
   const words: WordTimestamp[] = []
   const lines: string[] = []
   const events = (json3 as { events?: Json3Event[] })?.events ?? []
@@ -477,7 +499,11 @@ function parseJson3(json3: unknown): { words: WordTimestamp[]; text: string; wor
     }
   }
 
-  const wordTiming: 'measured' | 'estimated' = totalSegs > 0 && measuredSegs / totalSegs >= 0.8 ? 'measured' : 'estimated'
+  // provenance: ≥80% measured segments → 'measured'; 20–80% → 'mixed';
+  // below → 'estimated' (honest labeling all the way down)
+  const measuredRatio = totalSegs > 0 ? measuredSegs / totalSegs : 0
+  const wordTiming: 'measured' | 'estimated' | 'mixed' =
+    measuredRatio >= 0.8 ? 'measured' : measuredRatio >= 0.2 ? 'mixed' : 'estimated'
   return { words, text: lines.length > 0 ? lines.join('\n') : words.map((w) => w.word).join(' '), wordTiming }
 }
 

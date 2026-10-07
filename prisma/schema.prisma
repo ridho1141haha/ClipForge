@@ -130,6 +130,29 @@ model SourceJob {
   @@index([ownerId])
 }
 
+// Render job ownership + lifecycle (security invariant: "a user must never be
+// able to read, cancel, stream, retry, or download another user's render job").
+// The renderer mini-service keeps jobs in memory; THIS table is the public-facing
+// authorization record. Every /api/render-proxy job operation verifies
+// (id, ownerId) here before touching the renderer — random UUID secrecy is
+// never relied on.
+// Status mirrors the renderer: QUEUED | EXTRACTING | RENDERING | FINALIZING |
+// DONE | ERROR | CANCELLED (synced opportunistically on poll).
+model RenderJob {
+  id        String   @id // equals the renderer's job id (UUID)
+  ownerId   String // session ownership — enforced on every job API call
+  projectId String? // set for project-source (JSON) renders
+  // QUEUED | EXTRACTING | RENDERING | FINALIZING | DONE | ERROR | CANCELLED
+  status    String   @default("QUEUED")
+  stage     String   @default("Queued")
+  filename  String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([ownerId])
+  @@index([ownerId, createdAt])
+}
+
 // Usage metering (light, SaaS-ready): one row per billable engine action.
 // Enforcement points are the 4 already-rate-limited expensive routes
 // (analyze, transcribe, render-proxy, prepare) — see docs/SAAS-MIGRATION.md §7-8.

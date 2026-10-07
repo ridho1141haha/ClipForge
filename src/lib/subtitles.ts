@@ -20,7 +20,11 @@ export interface SubtitleBlock {
   emphasis_type?: string
 }
 
-/** Keep ranges = clip window minus cuts (sorted, clipped to [clipStart, clipEnd]). */
+/** Keep ranges = clip window minus cuts (sorted, clipped to [clipStart, clipEnd]).
+ *  FULL-CUT CONTRACT: when cuts cover the ENTIRE window this returns [] —
+ *  never a silent fallback to the full clip (a fully-cut edit must produce
+ *  outputDuration 0 and the renderer must reject it, not render a phantom
+ *  full video). */
 export function buildKeepRanges(clipStart: number, clipEnd: number, cuts: Cut[]): { start: number; end: number }[] {
   const sorted = [...cuts]
     .filter((c) => c.end > c.start)
@@ -36,7 +40,6 @@ export function buildKeepRanges(clipStart: number, clipEnd: number, cuts: Cut[])
     cursor = Math.max(cursor, ce)
   }
   if (cursor < clipEnd) ranges.push({ start: cursor, end: clipEnd })
-  if (ranges.length === 0) ranges.push({ start: clipStart, end: clipEnd })
   return ranges
 }
 

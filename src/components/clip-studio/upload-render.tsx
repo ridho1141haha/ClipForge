@@ -22,7 +22,9 @@ import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { type EditPlan } from '@/lib/editplan'
 import { buildRenderRecipe, buildRecipeJSON } from '@/lib/render-recipe'
+import { outputDuration as planOutputDuration } from '@/lib/subtitles'
 import { fmtTime, fmtDuration } from '@/lib/youtube'
+import type { Cut } from '@/lib/subtitles'
 
 interface Props {
   plan: EditPlan | null
@@ -59,7 +61,18 @@ export function UploadRender({ plan, projectId, projectMedia }: Props) {
     setSourceMode(localReady ? 'local' : 'upload')
   }, [localReady])
 
-  const canRender = (sourceMode === 'local' ? localReady : !!file) && !!plan
+  // output duration after cuts — a FULLY-CUT plan produces 0s and must NOT
+  // reach the renderer (it would be rejected with EMPTY_OUTPUT; the button is
+  // disabled here with an honest explanation instead)
+  const outputDurationSec = React.useMemo(() => {
+    if (!plan) return 0
+    const sc = plan.selected_clip
+    const cuts = (sc.cuts ?? []).filter((c: Cut) => c.end > c.start) as Cut[]
+    return planOutputDuration(sc.start, sc.end, cuts)
+  }, [plan])
+  const emptyEdit = outputDurationSec < 0.2
+
+  const canRender = (sourceMode === 'local' ? localReady : !!file) && !!plan && !emptyEdit
 
   const onFileSelect = (f: File) => {
     if (!f.type.startsWith('video/')) {
@@ -84,6 +97,11 @@ export function UploadRender({ plan, projectId, projectMedia }: Props) {
 
   const startRender = async () => {
     if (!plan) return
+    if (emptyEdit) {
+      setPhase('error')
+      setError('This edit removes the entire clip — there is nothing left to render. Reduce the cut ranges in the editor.')
+      return
+    }
     if (sourceMode === 'upload' && !file) return
     setPhase('rendering')
     setProgress(0)
@@ -176,6 +194,13 @@ export function UploadRender({ plan, projectId, projectMedia }: Props) {
         if (job.status === 'error') {
           setPhase('error')
           setError(job.error ?? 'Render failed')
+          return
+        }
+        // 404 = job unknown to the proxy (expired after 10 min, or not owned).
+        // Surface it instead of polling forever.
+        if (res.status === 404) {
+          setPhase('error')
+          setError('Render job not found — it may have expired (results are kept for 10 minutes) or belongs to another session.')
           return
         }
         if (job.status === 'cancelled') {
@@ -429,6 +454,15 @@ export function UploadRender({ plan, projectId, projectMedia }: Props) {
       )}
 
       {/* render button */}
+      {emptyEdit && (
+        <div className="flex items-start gap-2 rounded-md border border-amber-500/30 bg-amber-500/10 p-2.5 text-xs text-amber-700 dark:text-amber-400">
+          <AlertCircle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+          <span>
+            This edit cuts away the entire clip ({outputDurationSec.toFixed(1)}s of output would remain) — nothing to render.
+            Reduce the cut ranges in the editor first.
+          </span>
+        </div>
+      )}
       <div className="flex gap-2">
         <Button
           onClick={startRender}

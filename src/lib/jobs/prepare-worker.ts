@@ -62,7 +62,7 @@ export async function runPrepareJob(jobId: string, opts: PreparePayload) {
     let transcriptText: string | null = null
     let transcriptWords: string | null = null
     let transcriptSource = 'none'
-    let wordTiming: 'measured' | 'estimated' | null = null
+    let wordTiming: 'measured' | 'estimated' | 'mixed' | null = null
     let transcriptError: string | null = null
 
     const caps = await resolveYoutubeTranscript(meta.youtubeId, opts.language && opts.language !== 'auto' ? `${opts.language},en,id` : 'en,id')
@@ -161,6 +161,7 @@ export async function runPrepareJob(jobId: string, opts: PreparePayload) {
         ...(duration === null ? ['Real duration unavailable — provide manual duration before analysis.'] : []),
         ...(transcriptSource === 'none' ? ['No transcript available — analysis will run WITHOUT content grounding (hooks unverified).'] : []),
         ...(wordTiming === 'estimated' ? ['Word timestamps are ESTIMATED from segment timings (source has no word-level timing data).'] : []),
+        ...(wordTiming === 'mixed' ? ['Word timestamps are PARTIALLY measured — some words are interpolated from segment timings, so word-precision features (karaoke) may fall back to plain subtitles.'] : []),
         ...(localMediaState === 'failed'
           ? [`Source video could not be downloaded (${localMediaError ?? 'unknown reason'}). You can still analyze — upload the file when rendering.`]
           : []),

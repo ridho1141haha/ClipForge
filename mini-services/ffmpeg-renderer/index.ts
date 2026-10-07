@@ -8,10 +8,36 @@ import { existsSync, mkdirSync, rmSync, writeFileSync, readFileSync, statSync } 
 import { join } from 'node:path'
 import { spawn } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
+import { validateRecipe, RECIPE_LIMITS, type ValidatedRecipe } from './recipe-validation'
 
 const PORT = 3003
 const WORKDIR = '/home/z/my-project/upload/ffmpeg-render'
 if (!existsSync(WORKDIR)) mkdirSync(WORKDIR, { recursive: true })
+
+// ---- Job state machine (deterministic transitions; mission Phase 6) ----
+//   QUEUED → EXTRACTING → RENDERING → FINALIZING → DONE
+//   any active state → CANCELLED (explicit user action, kills ffmpeg)
+//   any active state → ERROR
+//   terminal states (DONE/ERROR/CANCELLED) are final — a cancelled job can
+//   NEVER later become RUNNING/COMPLETED again.
+type JobStatus = RenderJob['status']
+const ALLOWED_TRANSITIONS: Record<JobStatus, JobStatus[]> = {
+  queued: ['extracting', 'cancelled', 'error'],
+  extracting: ['rendering', 'cancelled', 'error'],
+  rendering: ['finalizing', 'cancelled', 'error'],
+  finalizing: ['done', 'cancelled', 'error'],
+  done: [],
+  error: [],
+  cancelled: [],
+}
+function transition(job: RenderJob, next: JobStatus): boolean {
+  if (!ALLOWED_TRANSITIONS[job.status]?.includes(next)) return false
+  job.status = next
+  return true
+}
+function isActive(status: JobStatus): boolean {
+  return status === 'queued' || status === 'extracting' || status === 'rendering' || status === 'finalizing'
+}
 
 // ---- Job registry (in-memory) ----
 interface RenderJob {
@@ -38,19 +64,6 @@ interface RenderJob {
 
 const jobs = new Map<string, RenderJob>()
 
-interface RenderRecipe {
-  source?: { youtube_id?: string; clip_start?: number; clip_end?: number }
-  keep_ranges?: { start: number; end: number }[]
-  subtitles_ass?: string
-  // camera keyframes are OUTPUT-time (pre-mapped by the API — after cuts removal)
-  camera_keyframes?: { time: number; scale: number }[]
-  sound_effects?: { type: string; start: number; duration: number; intensity: number }[]
-  music?: { recommended: boolean; style: string; intensity: number; ducking_percent: number }
-  segments?: { type: string; start: number; end: number }[]
-  title?: string
-  duration?: number
-}
-
 function timeToFFmpeg(sec: number): string {
   const s = Math.max(0, sec)
   const h = Math.floor(s / 3600)
@@ -65,10 +78,14 @@ function sanitize(s: string): string {
   return s.replace(/[^a-z0-9-_]+/gi, '_').slice(0, 60)
 }
 
-function buildZoompanFilter(recipe: RenderRecipe, fps = 30): string | null {
+function buildZoompanFilter(recipe: ValidatedRecipe, fps = 30): string | null {
   const kfs = recipe.camera_keyframes ?? []
   if (!kfs || kfs.length < 2) return null
-  const totalFrames = Math.max(1, Math.round((recipe.duration ?? 10) * fps))
+  const rawFrames = Math.round((recipe.duration ?? 10) * fps)
+  // NaN/absurd-duration guard: recipe.duration is validated finite, but this
+  // filter must never emit a broken zoompan expression regardless.
+  if (!Number.isFinite(rawFrames) || rawFrames <= 0) return null
+  const totalFrames = Math.max(1, Math.min(rawFrames, RECIPE_LIMITS.MAX_OUTPUT_DURATION * fps))
   const sortedKfs = [...kfs].sort((a, b) => a.time - b.time)
   const scales: number[] = []
   // keyframes are OUTPUT-time: frame f → output time f/fps directly
@@ -101,6 +118,12 @@ function scaleAtTime(time: number, sorted: { time: number; scale: number }[]): n
     }
   }
   return 1
+}
+
+/** Log a completed stage with its wall duration (observability, mission Phase 12). */
+function stageTiming(job: RenderJob, label: string, startedAt: number) {
+  const secs = ((Date.now() - startedAt) / 1000).toFixed(1)
+  console.log(`[${job.id}] stage "${label}" done in ${secs}s`)
 }
 
 // Run a command, capturing output for progress parsing.
@@ -218,18 +241,24 @@ function publicJob(job: RenderJob) {
   return rest
 }
 
-async function processJob(jobId: string, file: File, recipe: RenderRecipe) {
+async function processJob(jobId: string, file: File, recipe: ValidatedRecipe) {
   const job = jobs.get(jobId)!
+  const jobStart = Date.now()
   try {
     const jobDir = join(WORKDIR, jobId)
     mkdirSync(jobDir, { recursive: true })
     const inputPath = join(jobDir, 'input' + (file.name.match(/\.[a-z0-9]+$/)?.[0] ?? '.mp4'))
-    const buf = new Uint8Array(await file.arrayBuffer())
-    writeFileSync(inputPath, buf)
-    console.log(`[${jobId}] received ${file.name} (${buf.length} bytes)`)
-    job.recipeDuration = recipe.duration ?? 10
+    // Bun.write streams the Blob to disk without materializing it a second time
+    // in the JS heap (the old arrayBuffer() path held up to 1.5 GB in RAM).
+    await Bun.write(inputPath, file)
+    const inSize = statSync(inputPath).size
+    console.log(`[${jobId}] received ${file.name} (${inSize} bytes)`)
+    job.recipeDuration = recipe.duration
 
-    const ranges = recipe.keep_ranges && recipe.keep_ranges.length > 0 ? recipe.keep_ranges : [{ start: recipe.source?.clip_start ?? 0, end: recipe.source?.clip_end ?? 10 }]
+    // keep_ranges are REQUIRED and validated — no silent full-clip fallback.
+    // (The old fallback rendered the FULL window when keep_ranges was empty,
+    // turning a fully-cut edit into a phantom full video.)
+    const ranges = recipe.keep_ranges
 
     // Probe the input ONCE: does it have audio? This decides the render path —
     // we NEVER mask a failed render with a silent-audio retry (that produced
@@ -243,7 +272,8 @@ async function processJob(jobId: string, file: File, recipe: RenderRecipe) {
     // Stage 1-3 (single accurate pass): trim keep ranges → concat → burn subs → zoom → 9:16
     // Frame-accurate: filter_complex trim/atrim (NOT -c copy, which snaps to keyframes
     // and desynchronizes output duration from the edit plan).
-    job.status = 'extracting'
+    if (!transition(job, 'extracting')) return // cancelled while queued
+    const extractingStart = Date.now()
     job.stage = `Preparing ${ranges.length} keep range${ranges.length === 1 ? '' : 's'} (frame-accurate trim)…`
     job.progress = 8
     broadcast(job)
@@ -273,7 +303,9 @@ async function processJob(jobId: string, file: File, recipe: RenderRecipe) {
     if (recipe.subtitles_ass) postParts.push(`ass='${join(jobDir, 'subs.ass')}'`)
     fcParts.push(`[vc]${postParts.join(',')}[vf]`)
 
-    job.status = 'rendering'
+    stageTiming(job, 'prepare', extractingStart)
+    if (!transition(job, 'rendering')) return // cancelled during prep
+    const renderingStart = Date.now()
     job.stage = `Rendering: trim+concat+${postParts.length} filters (single pass)…`
     job.progress = 25
     broadcast(job)
@@ -309,8 +341,9 @@ async function processJob(jobId: string, file: File, recipe: RenderRecipe) {
       }
     }
 
-    // Stage 4: probe + done
-    job.status = 'finalizing'
+    stageTiming(job, 'render', renderingStart)
+    if (!transition(job, 'finalizing')) return // cancelled during encode
+    const finalizeStart = Date.now()
     job.stage = 'Finalizing…'
     job.progress = 95
     broadcast(job)
@@ -341,12 +374,13 @@ async function processJob(jobId: string, file: File, recipe: RenderRecipe) {
     const expected = recipe.duration ?? (recipe.source ? recipe.source.clip_end! - recipe.source.clip_start! : 0)
     job.durationOk = !(expected > 0 && Math.abs((job.duration ?? 0) - expected) > 1.5)
 
-    job.status = 'done'
+    stageTiming(job, 'finalize', finalizeStart)
+    transition(job, 'done')
     job.stage = 'Render complete'
     job.progress = 100
     job.finishedAt = Date.now()
     broadcast(job)
-    console.log(`[${jobId}] done: ${outName} (${job.size} bytes, ${job.duration}s, ${job.width}x${job.height})`)
+    console.log(`[${jobId}] done: ${outName} (${job.size} bytes, ${job.duration}s, ${job.width}x${job.height}) total=${((Date.now() - jobStart) / 1000).toFixed(1)}s`)
 
     // schedule cleanup of the output after 10 minutes
     setTimeout(() => {
@@ -387,16 +421,31 @@ serve({
     if (req.method === 'POST' && url.pathname === '/render') {
       const contentType = req.headers.get('content-type') ?? ''
       if (!contentType.includes('multipart/form-data')) return cors(json({ error: 'Expected multipart/form-data' }, 400))
+      // resource guard: reject oversized uploads BEFORE parsing the body
+      const lenHeader = req.headers.get('content-length')
+      const declaredLen = lenHeader ? Number(lenHeader) : NaN
+      if (isFinite(declaredLen) && declaredLen > RECIPE_LIMITS.MAX_UPLOAD_BYTES) {
+        return cors(json({ error: `Upload exceeds the ${Math.round(RECIPE_LIMITS.MAX_UPLOAD_BYTES / (1024 * 1024))} MB cap` }, 413))
+      }
       const form = await req.formData()
       const file = form.get('video') as File | null
       const recipeRaw = form.get('recipe') as string | File | null
       if (!file) return cors(json({ error: 'video file required' }, 400))
       if (!recipeRaw) return cors(json({ error: 'recipe JSON required' }, 400))
-      let recipe: RenderRecipe
+      let parsedRecipe: unknown
       try {
-        recipe = typeof recipeRaw === 'string' ? JSON.parse(recipeRaw) : JSON.parse(await recipeRaw.text())
+        const rawText = typeof recipeRaw === 'string' ? recipeRaw : await recipeRaw.text()
+        if (Buffer.byteLength(rawText, 'utf8') > RECIPE_LIMITS.MAX_RECIPE_BYTES) {
+          return cors(json({ error: `Recipe JSON exceeds the ${Math.round(RECIPE_LIMITS.MAX_RECIPE_BYTES / 1024)} KB limit`, code: 'RECIPE_TOO_LARGE' }, 413))
+        }
+        parsedRecipe = JSON.parse(rawText)
       } catch {
         return cors(json({ error: 'invalid recipe JSON' }, 400))
+      }
+      // STRICT contract enforcement — the renderer never executes unvalidated JSON
+      const v = validateRecipe(parsedRecipe)
+      if (!v.ok) {
+        return cors(json({ error: v.error, code: v.code }, 400))
       }
       const id = randomUUID()
       const job: RenderJob = {
@@ -404,7 +453,7 @@ serve({
       }
       jobs.set(id, job)
       // start async processing
-      processJob(id, file, recipe)
+      processJob(id, file, v.recipe)
       return cors(json({ id, status: 'queued', progress: 0 }))
     }
 
@@ -450,10 +499,11 @@ serve({
     if (req.method === 'POST' && cancelMatch) {
       const job = jobs.get(cancelMatch[1])
       if (!job) return cors(json({ error: 'job not found' }, 404))
-      if (job.status === 'done' || job.status === 'error' || job.status === 'cancelled') {
+      if (!isActive(job.status)) {
+        // terminal states are final — a cancelled/completed job cannot be re-cancelled
         return cors(json({ id: job.id, status: job.status, progress: job.progress }))
       }
-      job.status = 'cancelled'
+      transition(job, 'cancelled')
       job.stage = 'Cancelled by user'
       job.finishedAt = Date.now()
       try { job.currentChild?.kill('SIGKILL') } catch {}

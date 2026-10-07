@@ -72,7 +72,7 @@ export interface AnalyzeResult {
   estimatedDuration: number
   transcriptSource?: string
   transcriptGrounded?: boolean
-  wordTiming?: 'measured' | 'estimated' | null
+  wordTiming?: 'measured' | 'estimated' | 'mixed' | null
   meta?: {
     serverScored?: boolean
     requestedCount?: number
@@ -99,7 +99,7 @@ export interface Project {
   duration: number | null
   durationSource?: string
   transcriptSource?: string
-  wordTiming?: 'measured' | 'estimated' | null
+  wordTiming?: 'measured' | 'estimated' | 'mixed' | null
   // server-side source media (render without upload) — 'ready' when downloadable/saved
   localMediaState?: string | null
   localMediaSize?: number | null

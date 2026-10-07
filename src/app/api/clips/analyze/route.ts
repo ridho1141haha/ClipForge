@@ -48,8 +48,8 @@ interface AnalyzeBody {
   transcript?: string
   words?: WordInput[]
   transcriptSource?: string
-  /** 'measured' = real word-level timing from the source; 'estimated' = distributed from segment timings */
-  wordTiming?: 'measured' | 'estimated'
+  /** 'measured' = real word-level timing from the source; 'estimated' = distributed from segment timings; 'mixed' = part measured, part interpolated */
+  wordTiming?: 'measured' | 'estimated' | 'mixed'
   save?: boolean
 }
 
@@ -259,8 +259,10 @@ export async function POST(req: NextRequest) {
       ?? project?.transcriptSource
       ?? (transcript ? 'manual' : 'none')
     // word-timing provenance: persisted project flag wins, then explicit body flag, then honest default
-    const wordTiming: 'measured' | 'estimated' | null =
-      (project?.wordTiming === 'measured' || project?.wordTiming === 'estimated' ? project.wordTiming : null)
+    const wordTiming: 'measured' | 'estimated' | 'mixed' | null =
+      (project?.wordTiming === 'measured' || project?.wordTiming === 'estimated' || project?.wordTiming === 'mixed'
+        ? (project.wordTiming as 'measured' | 'estimated' | 'mixed')
+        : null)
       ?? body.wordTiming
       ?? (autoCaptionsNote ? 'measured' : null)
       ?? (words.length > 0 ? 'estimated' : null)

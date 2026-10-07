@@ -411,6 +411,174 @@ console.log('\n== Karaoke: \\k word-highlight from REAL word timings ==')
   assert(resolveLocalMediaPath('') === null, 'empty path rejected')
 }
 
+// ---------------------------------------------------------------------------
+// 10/10 mission — PHASE 1.4: timeline edge cases A–M (critical infrastructure)
+// ---------------------------------------------------------------------------
+console.log('\n== Timeline edge cases A–M (buildKeepRanges is critical infrastructure) ==')
+{
+  // A. no cuts → the full window
+  assert(JSON.stringify(buildKeepRanges(10, 30, [])) === JSON.stringify([{ start: 10, end: 30 }]), 'A no cuts → full window')
+  // B. cut at the beginning
+  assert(JSON.stringify(buildKeepRanges(0, 20, [{ start: 0, end: 5 }])) === JSON.stringify([{ start: 5, end: 20 }]), 'B cut at beginning')
+  // C. cut in the middle
+  assert(JSON.stringify(buildKeepRanges(0, 20, [{ start: 8, end: 12 }])) === JSON.stringify([{ start: 0, end: 8 }, { start: 12, end: 20 }]), 'C cut in middle')
+  // D. cut at the end
+  assert(JSON.stringify(buildKeepRanges(0, 20, [{ start: 15, end: 20 }])) === JSON.stringify([{ start: 0, end: 15 }]), 'D cut at end')
+  // E. multiple cuts
+  const eRanges = buildKeepRanges(0, 30, [{ start: 5, end: 8 }, { start: 12, end: 15 }, { start: 22, end: 25 }])
+  assert(eRanges.length === 4 && eq(eRanges.reduce((a, r) => a + (r.end - r.start), 0), 21), 'E multiple cuts → 4 ranges, 21s kept')
+  // F. adjacent cuts merge (no zero-length keep between them)
+  const fRanges = buildKeepRanges(0, 20, [{ start: 5, end: 10 }, { start: 10, end: 15 }])
+  assert(JSON.stringify(fRanges) === JSON.stringify([{ start: 0, end: 5 }, { start: 15, end: 20 }]), 'F adjacent cuts → no phantom 0-length keep')
+  // G. overlapping cuts
+  const gRanges = buildKeepRanges(0, 20, [{ start: 5, end: 12 }, { start: 8, end: 16 }])
+  assert(JSON.stringify(gRanges) === JSON.stringify([{ start: 0, end: 5 }, { start: 16, end: 20 }]), 'G overlapping cuts treated as union')
+  // H. cut completely outside the clip window
+  assert(JSON.stringify(buildKeepRanges(10, 20, [{ start: 0, end: 5 }, { start: 25, end: 30 }])) === JSON.stringify([{ start: 10, end: 20 }]), 'H outside cuts ignored')
+  // I. cut covering the ENTIRE clip → EMPTY (never a phantom full-clip fallback)
+  assert(buildKeepRanges(10, 30, [{ start: 0, end: 40 }]).length === 0, 'I full cut → keepRanges EMPTY (no silent fallback)')
+  assert(buildKeepRanges(10, 30, [{ start: 10, end: 30 }]).length === 0, 'I full cut (exact window) → EMPTY')
+  assert(eq(outputDuration(10, 30, [{ start: 0, end: 40 }]), 0), 'I full cut → outputDuration 0', String(outputDuration(10, 30, [{ start: 0, end: 40 }])))
+  assert(eq(totalCutDuration(10, 30, [{ start: 0, end: 40 }]), 20), 'I full cut → totalCutDuration = clip length')
+  // J. zero-length / invalid cuts ignored
+  assert(JSON.stringify(buildKeepRanges(0, 10, [{ start: 3, end: 3 }, { start: 5, end: 2 }])) === JSON.stringify([{ start: 0, end: 10 }]), 'J zero/negative-length cuts ignored')
+  // K. subtitle crossing a cut → dropped when >half is inside the cut
+  assert(isDroppedByCuts(4, 9, 0, 20, [{ start: 5, end: 15 }]), 'K subtitle mostly inside cut → dropped')
+  assert(!isDroppedByCuts(2, 6, 0, 20, [{ start: 5, end: 15 }]), 'K subtitle mostly outside cut → kept')
+  // L/M. camera keyframes crossing + exactly on a cut boundary (mapping math)
+  const kfCuts = [{ start: 10, end: 20 }]
+  const before = sourceToOutputTime(9, 0, kfCuts) // keyframe just before cut
+  const onBoundary = sourceToOutputTime(10, 0, kfCuts) // exactly at cut start → snaps to output 10
+  const after = sourceToOutputTime(20, 0, kfCuts) // cut end → snaps to 10 (cut removed)
+  const later = sourceToOutputTime(21, 0, kfCuts) // after cut → 11
+  assert(eq(before, 9) && eq(onBoundary, 10) && eq(after, 10) && eq(later, 11), 'L/M keyframes on/around cut map without NaN or jumps', `${before},${onBoundary},${after},${later}`)
+  // no NaN anywhere under adversarial inputs
+  const adv = sourceToOutputTime(15, 0, [{ start: -5, end: 3 }, { start: Number.NaN, end: 8 }])
+  assert(isFinite(adv), 'adversarial cuts → finite output time', String(adv))
+  // inverse mapping round-trip on a multi-cut timeline
+  const cuts = [{ start: 5, end: 8 }, { start: 12, end: 15 }]
+  for (const outT of [0, 2, 4.9, 5, 7.2, 9, 11.9, 14.5]) {
+    const src = outputToSourceTime(outT, 0, cuts, 20)
+    assert(isFinite(src) && src >= 0 && src <= 20, `inverse map ${outT} → finite source time`, String(src))
+  }
+  assert(eq(outputToSourceTime(0, 0, cuts, 20), 0), 'output 0 → first kept frame')
+  assert(eq(outputToSourceTime(14, 0, cuts, 20), 20), 'output beyond end clamps to clip end')
+}
+
+// ---------------------------------------------------------------------------
+// 10/10 mission — PHASE 1.2: renderer recipe validation (strict contract)
+// ---------------------------------------------------------------------------
+console.log('\n== RenderRecipe runtime validation (renderer NEVER trusts JSON) ==')
+{
+  const { validateRecipe, RECIPE_LIMITS } = await import('../mini-services/ffmpeg-renderer/recipe-validation')
+  const good = {
+    keep_ranges: [{ start: 0, end: 5 }, { start: 10, end: 15 }],
+    duration: 10,
+    camera_keyframes: [{ time: 0, scale: 1 }, { time: 5, scale: 1.2 }],
+    subtitles_ass: '[Script Info]\n',
+    title: 'Test clip',
+    source: { clip_start: 0, clip_end: 15 },
+  }
+  const v = validateRecipe(good)
+  assert(v.ok, 'valid recipe accepted')
+  if (v.ok) {
+    assert(v.recipe.keep_ranges.length === 2 && v.recipe.duration === 10, 'valid recipe fields preserved')
+  }
+  const expectFail = (name: string, mutate: (r: any) => unknown, code?: string) => {
+    const res = validateRecipe(mutate({ ...good }))
+    assert(!res.ok && (!code || res.code === code), `rejected: ${name}`, res.ok ? 'ACCEPTED (bad!)' : res.code)
+  }
+  expectFail('not an object', () => 'string', 'NOT_OBJECT')
+  expectFail('missing keep_ranges', (r) => ({ ...r, keep_ranges: undefined }), 'EMPTY_OUTPUT')
+  expectFail('empty keep_ranges (full cut)', (r) => ({ ...r, keep_ranges: [] }), 'EMPTY_OUTPUT')
+  expectFail('NaN duration', (r) => ({ ...r, duration: Number.NaN }), 'INVALID_DURATION')
+  expectFail('Infinity duration (1e999)', (r) => ({ ...r, duration: JSON.parse('1e999') }), 'INVALID_DURATION')
+  expectFail('duration disagrees with ranges', (r) => ({ ...r, duration: 42 }), 'INVALID_DURATION')
+  expectFail('negative timestamp in range', (r) => ({ ...r, keep_ranges: [{ start: -1, end: 5 }] }), 'INVALID_KEEP_RANGES')
+  expectFail('end <= start', (r) => ({ ...r, keep_ranges: [{ start: 5, end: 5 }] }), 'INVALID_KEEP_RANGES')
+  expectFail('unsorted ranges', (r) => ({ ...r, keep_ranges: [{ start: 10, end: 15 }, { start: 0, end: 5 }] }), 'INVALID_KEEP_RANGES')
+  expectFail('overlapping ranges', (r) => ({ ...r, keep_ranges: [{ start: 0, end: 8 }, { start: 5, end: 12 }] }), 'INVALID_KEEP_RANGES')
+  expectFail('non-numeric range', (r) => ({ ...r, keep_ranges: [{ start: '0', end: 5 }] }), 'INVALID_KEEP_RANGES')
+  expectFail('string scale (filter injection)', (r) => ({ ...r, camera_keyframes: [{ time: 0, scale: '1.5,format=yuv444p)' }] }), 'INVALID_CAMERA')
+  expectFail('absurd scale', (r) => ({ ...r, camera_keyframes: [{ time: 0, scale: 900 }] }), 'INVALID_CAMERA')
+  expectFail('negative keyframe time', (r) => ({ ...r, camera_keyframes: [{ time: -1, scale: 1 }] }), 'INVALID_CAMERA')
+  expectFail('too many ranges', (r) => ({ ...r, keep_ranges: Array.from({ length: 51 }, (_, i) => ({ start: i * 10, end: i * 10 + 5 })) }), 'LIMIT_EXCEEDED')
+  expectFail('too many keyframes', (r) => ({ ...r, camera_keyframes: Array.from({ length: 401 }, (_, i) => ({ time: i, scale: 1 })) }), 'LIMIT_EXCEEDED')
+  expectFail('output over the cap', (r) => ({ ...r, keep_ranges: [{ start: 0, end: RECIPE_LIMITS.MAX_OUTPUT_DURATION + 1 }], duration: RECIPE_LIMITS.MAX_OUTPUT_DURATION + 1 }), 'LIMIT_EXCEEDED')
+  expectFail('subtitles_ass too large', (r) => ({ ...r, subtitles_ass: 'x'.repeat(RECIPE_LIMITS.MAX_ASS_BYTES + 1) }), 'LIMIT_EXCEEDED')
+  expectFail('invalid source block', (r) => ({ ...r, source: { clip_start: 10, clip_end: 5 } }), 'INVALID_SOURCE')
+  // absurd-but-legal still passes: 30 min output allowed
+  const big = validateRecipe({ keep_ranges: [{ start: 0, end: RECIPE_LIMITS.MAX_OUTPUT_DURATION }], duration: RECIPE_LIMITS.MAX_OUTPUT_DURATION })
+  assert(big.ok, '30-minute output allowed (sensible cap, not arbitrary)')
+}
+
+// ---------------------------------------------------------------------------
+// 10/10 mission — PHASE 2.5/2.6: timing provenance + track selection
+// ---------------------------------------------------------------------------
+console.log('\n== Caption track selection by TIMING QUALITY (not container format) ==')
+{
+  const { captionTrackTimingQuality } = await import('../src/lib/media')
+  const json3Measured = JSON.stringify({ events: [{ segs: [{ utf8: 'a', tOffsetMs: 0 }, { utf8: 'b', tOffsetMs: 120 }] }, { segs: [{ utf8: 'c', tOffsetMs: 50 }] }] })
+  const json3Plain = JSON.stringify({ events: [{ segs: [{ utf8: 'a' }, { utf8: 'b' }] }] })
+  const srv3WithOffsets = '<p t="1000" d="500"><s ac-as="0">he</s><s ac-as="120">llo</s></p>'
+  const srv3Plain = '<p t="1000" d="500"><s>hello world</s></p>'
+  const vtt = 'WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nhello'
+  assert(captionTrackTimingQuality('subs.en.json3', () => json3Measured) === 1, 'json3 with offsets → 1.0')
+  assert(captionTrackTimingQuality('subs.en.json3', () => json3Plain) === 0, 'json3 without offsets → 0')
+  assert(captionTrackTimingQuality('subs.en.srv3', () => srv3WithOffsets) === 1, 'srv3 with ac-as offsets → 1.0')
+  assert(captionTrackTimingQuality('subs.en.srv3', () => srv3Plain) === 0, 'srv3 without offsets → 0')
+  assert(captionTrackTimingQuality('subs.en.vtt', () => vtt) === 0, 'vtt → 0 (cue timing only)')
+  assert(captionTrackTimingQuality('subs.en.json3', () => '{corrupt') === 0, 'corrupt track → 0 (ranks last)')
+  // deterministic selection: srv3 WITH offsets beats json3 WITHOUT (quality > format)
+  const files = ['subs.en.json3', 'subs.en-orig.srv3', 'subs.en.vtt']
+  const q = (f: string) => captionTrackTimingQuality(f, () => (f.endsWith('.srv3') ? srv3WithOffsets : f.endsWith('.json3') ? json3Plain : vtt))
+  const rankTrack = (a: string, b: string) => (Math.abs(q(a) - q(b)) > 0.05 ? q(b) - q(a) : 0)
+  assert(files.sort(rankTrack)[0] === 'subs.en-orig.srv3', 'srv3 with offsets wins over offset-less json3', files.join(','))
+}
+
+console.log('\n== wordTiming provenance: measured / mixed / estimated ==')
+{
+  const { parseJson3 } = (await import('../src/lib/media')).__testHelpers
+  // 100% measured
+  const measured = { events: [{ tStartMs: 1000, dDurationMs: 500, segs: [{ utf8: 'hi', tOffsetMs: 0 }] }] }
+  assert(parseJson3(measured).wordTiming === 'measured', 'all offsets → measured')
+  // 50% measured → mixed
+  const half = {
+    events: [
+      { tStartMs: 1000, dDurationMs: 400, segs: [{ utf8: 'one', tOffsetMs: 0 }, { utf8: 'two', tOffsetMs: 100 }] },
+      { tStartMs: 2000, dDurationMs: 400, segs: [{ utf8: 'three' }, { utf8: 'four' }] },
+    ],
+  }
+  const mixed = parseJson3(half)
+  assert(mixed.wordTiming === 'mixed', '50% offsets → mixed', mixed.wordTiming)
+  // 0% measured → estimated
+  const est = { events: [{ tStartMs: 1000, dDurationMs: 400, segs: [{ utf8: 'a' }, { utf8: 'b' }] }] }
+  assert(parseJson3(est).wordTiming === 'estimated', 'no offsets → estimated')
+  assert(mixed.words.length === 4, 'mixed parse still yields all words')
+}
+
+// ---------------------------------------------------------------------------
+// 10/10 mission — PHASE 3.11: diversity (temporal near-duplicate penalty)
+// ---------------------------------------------------------------------------
+console.log('\n== Diversity: near-duplicate moments collapsed, distinct moments kept ==')
+{
+  const mk = (id: string, start: number, end: number, total: number, excerpt: string) => ({
+    start, end, title: id, transcriptExcerpt: excerpt,
+    scores: { hook: 8, curiosity: 8, emotion: 8, payoff: 8, standalone: 8, shareability: 8, context_safety: 8, total },
+  })
+  // same moment continued: A 600-645, B 650-695 (non-overlapping, 5s apart, same content)
+  const a = mk('A', 600, 645, 90, 'the one thing nobody tells you about building a startup is that it never gets easier')
+  const b = mk('B', 650, 695, 85, 'the one thing nobody tells you about building a startup is that it never gets easier')
+  const c = mk('C', 1200, 1245, 88, 'completely different topic about the ocean and why whales sing at night')
+  const out = dedupeAndRank([a, b, c], 3)
+  assert(out.length === 2, 'near-duplicate (temporal + semantic) dropped', `got ${out.length}`)
+  assert(out.some((x) => x.title === 'A') && out.some((x) => x.title === 'C'), 'stronger of the near-dupes kept (A 90 > B 85)')
+  // far-apart content (different moment, similar-but-not-identical phrasing) still kept
+  const d = mk('D', 1800, 1845, 84, 'another angle on building a startup: it never gets easier but it keeps getting better')
+  const out2 = dedupeAndRank([a, d], 2)
+  assert(out2.length === 2, 'temporally distant similar excerpt NOT collapsed (different moment)')
+}
+
 console.log(`\n════════════════════════════════`)
 console.log(`RESULT: ${passed} passed, ${failed} failed`)
 process.exit(failed > 0 ? 1 : 0)

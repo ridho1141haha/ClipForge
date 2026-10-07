@@ -1,0 +1,81 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  check:
+    name: typecheck · lint · unit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+      - name: Generate Prisma client
+        run: bun run db:generate
+      - name: Typecheck (tsc --noEmit)
+        run: bun run typecheck
+      - name: Lint (eslint)
+        run: bun run lint
+      - name: Unit tests
+        run: bun run test:unit
+
+  build:
+    name: production build
+    runs-on: ubuntu-latest
+    needs: check
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+      - name: Generate Prisma client + push schema
+        run: |
+          bun run db:generate
+          DATABASE_URL="file:./db/custom.db" bun run db:push
+      - name: Build (strict gates: type errors fail the build)
+        run: bun run build
+
+  e2e:
+    name: render E2E (golden · security)
+    runs-on: ubuntu-latest
+    needs: check
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      - name: Install ffmpeg
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+      - name: Generate Prisma client + push schema
+        run: |
+          bun run db:generate
+          DATABASE_URL="file:./db/custom.db" bun run db:push
+      - name: Start ffmpeg-renderer mini-service
+        run: |
+          cd mini-services/ffmpeg-renderer
+          nohup bun run index.ts > /tmp/renderer.log 2>&1 &
+          for i in $(seq 1 30); do curl -sf http://localhost:3003/ && break || sleep 1; done
+      - name: Start Next.js dev server
+        run: |
+          nohup bun run dev > /tmp/next.log 2>&1 &
+          for i in $(seq 1 60); do curl -sf http://localhost:3000/ && break || sleep 2; done
+      - name: Golden render E2E (frame-accurate cuts, 9:16, A/V sync)
+        run: bun run test:e2e
+      - name: Render-security E2E (job ownership · recipe validation · full-cut rejection)
+        run: bun run test:render-security
+      - name: Dump service logs on failure
+        if: failure()
+        run: |
+          tail -50 /tmp/renderer.log || true
+          tail -80 /tmp/next.log || true

@@ -85,7 +85,7 @@ export default function Home() {
   const [projectMedia, setProjectMedia] = React.useState<{ state?: string | null; size?: number | null; error?: string | null } | null>(null)
   const [sourceTranscript, setSourceTranscript] = React.useState<string | null>(null)
   const [sourceWords, setSourceWords] = React.useState<{ word: string; start: number; end: number }[] | null>(null)
-  const [wordTiming, setWordTiming] = React.useState<'measured' | 'estimated' | null>(null)
+  const [wordTiming, setWordTiming] = React.useState<'measured' | 'estimated' | 'mixed' | null>(null)
   const [transcriptOpen, setTranscriptOpen] = React.useState(false)
   const [error, setError] = React.useState<string | null>(null)
   const [currentPlatform, setCurrentPlatform] = React.useState('shorts')

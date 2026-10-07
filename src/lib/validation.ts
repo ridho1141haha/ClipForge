@@ -543,14 +543,21 @@ function titleSimilarity(a: string, b: string): number {
  * Server-side dedupe + rank:
  *  1. sort by server-calculated total desc
  *  2. drop exact/overlapping candidates (>overlapThreshold of the shorter clip)
- *  3. drop semantically equivalent candidates (title or excerpt similarity)
- *  4. keep top `requestedCount`, return sorted by start
+ *  3. drop near-duplicates: same moment continued in a NON-overlapping window —
+ *     clips starting within `minTemporalGap` seconds of an already-kept clip
+ *     AND sharing ≥nearDupSimilarity excerpt/title similarity are the same
+ *     moment (diversity rule: the final set must represent DIFFERENT moments)
+ *  4. drop semantically equivalent candidates (title or excerpt similarity)
+ *  5. keep top `requestedCount`, return sorted by start
  */
 export function dedupeAndRank<T extends DedupeClip>(
   clips: T[],
   requestedCount: number,
   overlapThreshold = 0.5,
+  opts: { minTemporalGap?: number; nearDupSimilarity?: number } = {},
 ): T[] {
+  const minGap = opts.minTemporalGap ?? 30
+  const nearSim = opts.nearDupSimilarity ?? 0.6
   const sorted = [...clips].sort((a, b) => b.scores.total - a.scores.total)
   const kept: T[] = []
   for (const clip of sorted) {
@@ -564,7 +571,11 @@ export function dedupeAndRank<T extends DedupeClip>(
     const isDupe = kept.some((k) => {
       const tSim = clip.title && k.title ? titleSimilarity(clip.title, k.title) : 0
       const eSim = clip.transcriptExcerpt && k.transcriptExcerpt ? jaccard(clip.transcriptExcerpt, k.transcriptExcerpt) : 0
-      return tSim > 0.8 || eSim > 0.85
+      // near-duplicate moment: temporally adjacent AND substantially same content
+      const gap = Math.max(clip.start, k.start) - Math.min(clip.end, k.end) // negative when overlapping
+      const temporallyAdjacent = gap >= 0 && gap < minGap
+      const nearDupe = temporallyAdjacent && eSim >= nearSim
+      return tSim > 0.8 || eSim > 0.85 || nearDupe
     })
     if (isDupe) continue
     kept.push(clip)

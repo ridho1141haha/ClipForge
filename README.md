@@ -89,24 +89,33 @@ No fake values are substituted — this is by design.
 
 ## Tests
 ```bash
-bun run tests/clipforge-unit.ts   # 102 assertions: scoring scale, hook grounding, dedupe/overlap/count,
-                                  # timeline mapping (incl. totalCutDuration/outputDuration semantics),
-                                  # bounded mapping, drop-by-cuts rule, measured-vs-estimated word timing,
-                                  # clamps, context validation, JSON extraction, SRT/VTT,
-                                  # local-media path safety (traversal/absolute/non-upload rejection)
+bun run tests/clipforge-unit.ts   # 169 assertions: scoring scale, hook grounding, dedupe/overlap/count/near-dup diversity,
+                                  # timeline mapping (incl. totalCutDuration/outputDuration semantics + FULL edge-case
+                                  # matrix A–M: no cuts/beginning/middle/end/multiple/adjacent/overlapping/outside/
+                                  # FULL-CUT→empty/zero-length/crossing subs/keyframes), renderer recipe-validation
+                                  # rejection matrix (NaN/Infinity/negative/overlapping/unsorted/injection/limits),
+                                  # caption-track TIMING-QUALITY selection, measured/mixed/estimated provenance,
+                                  # bounded mapping, drop-by-cuts rule, clamps, context validation, JSON extraction,
+                                  # SRT/VTT, local-media path safety (traversal/absolute/non-upload rejection)
 bun run tests/e2e-render.ts       # GOLDEN E2E: synthetic fixture → plan → recipe → real FFmpeg render →
                                   # ffprobe/volumedetect assertions (duration, 1080x1920, h264+aac, non-silent audio)
+bun run tests/render-security-e2e.ts  # RENDER-SECURITY E2E (via the public proxy): job ownership invariant
+                                  # (owner poll/stream/cancel/download OK; foreign session → 404 on all; unknown → 404),
+                                  # full-cut recipe → 400 EMPTY_OUTPUT, NaN/negative recipe → 400, real MP4 download
 bun run tests/url-render-e2e.ts   # URL-FLOW E2E: bare URL → prepare (metadata+captions+MEDIA DOWNLOAD) →
                                   # JSON project-source render via render-proxy → real MP4 verified
                                   # (+ ownership: foreign session render → 404); skips honestly when YouTube blocks
 bash tests/clipforge-live.sh      # live API tests: duration honesty, transcript grounding, security, duplicate save, exports
 ```
 
+CI (`.github/workflows/ci.yml`) runs typecheck · lint · unit on every push/PR, plus a production build and the golden + render-security E2E suites with a real ffmpeg + both services.
+
 ## Production notes
 - Swap SQLite → PostgreSQL (Prisma datasource change; schema is portable) for multi-user deployments — full migration map in `docs/SAAS-MIGRATION.md`.
 - Replace in-memory rate limiting with Redis (or Postgres-backed) shared store when running >1 instance.
 - The async job store (`SourceJob`) is already DB-backed; a dedicated queue worker (BullMQ etc.) can be added without API changes.
 - ASR for uploaded files: run faster-whisper server-side and feed `words` into the analyze/plan endpoints (schema already supports word-level timestamps end-to-end).
-- Word-timestamp provenance is tracked (`wordTiming: 'measured' | 'estimated'`): json3/srv3 caption offsets and faster-whisper produce MEASURED timing; VTT-only sources and manual pastes are labeled honestly in the UI.
+- Word-timestamp provenance is tracked (`wordTiming: 'measured' | 'mixed' | 'estimated'`): json3/srv3 caption offsets and faster-whisper produce MEASURED timing; VTT-only sources and manual pastes are labeled honestly in the UI.
+- Render-job security model: see `SECURITY.md` (ownership enforced at the proxy; renderer recipe validation with documented resource limits; upload caps).
 
 ## Status: **MVP+ (beta)** — the full pipeline (URL or upload → real duration → transcript with word timestamps → grounded AI analysis → server scoring → plan → frame-accurate render) is real and verified end-to-end, now with zero-input auto-grounding (captions fetched automatically) AND a fully closed URL→render loop (source video downloaded server-side, rendered without any upload — browser-verified). Remaining gaps: YouTube endpoints depend on the host IP not being bot-blocked (manual-duration + ASR-upload flows are first-class, failed prepares are retryable), and B-roll/SFX/music remain preview-only recommendations.

@@ -288,3 +288,21 @@ Stage Summary:
 - Real-caption grounding + real media render proven on dQw4w9WgXcQ (213s via yt-dlp, 291 word timestamps, full URL→MP4 loop).
 - Standing limits (honest): PLOpsj6DVQ8-specific YouTube bot-block from this IP (retry may succeed later); B-roll/SFX/music/animations preview-only; in-memory rate-limit store; /api/media endpoint ready but UI-unwired.
 - Final status per mission rubric: MVP (all P0/P1 wired + tested; production-ready requires multi-tenant hardening, persistent rate-limit store, and unblocked YouTube egress).
+
+---
+Task ID: ten-ten-1 (10/10+ engine quality round)
+Agent: Z.ai Code (Principal Engineer)
+Task: CLIPFORGE 10/10+ — baseline, audit, then fix render-job ownership, recipe validation, resource protection, timeline full-cut phantom, caption timing selection, diversity, CI/docs.
+
+Work Log:
+- BASELINE @ 238d489 (clean tree): tsc PASS · eslint PASS · unit 106/106 · golden E2E 17/17 · url-render E2E 17/17 · long-source scale 15/15. All services healthy.
+- AUDIT (execution-path based, not worklog-based):
+  - P0 #1 Render job ownership MISSING: /api/render-proxy GET forwards job poll / SSE stream / artifact download and POST forwards /jobs/:id/cancel to the renderer with NO authorization — any session with a job UUID can read/stream/cancel/download another user's render. Renderer itself trusts job-id secrecy (mission explicitly forbids).
+  - P0 #2 Full-cut phantom: buildKeepRanges() falls back to the FULL clip when cuts cover 100% of the window (subtitles.ts L39) and the renderer repeats the same fallback (index.ts L232). Mission forbids: keepRanges MUST be empty → outputDuration 0 → renderer must reject.
+  - P0 #3 Recipe validation MISSING: renderer trusts arbitrary JSON (interface-only). NaN/absurd duration → zoompan totalFrames explodes (OOM); keep_ranges unbounded; scale keyframe accepts strings → filter-expression injection; negative timestamps → "NaN" in filters.
+  - P0 #4 Resource protection: proxy JSON render mode buffers up to 1.5GB source into RAM (readFileAsync); multipart passthrough has no content-length guard; renderer buffers the whole upload via file.arrayBuffer().
+  - P1 #5 Caption track selection: format rank (json3>srv3>vtt) dominates; a srv3 track WITH word offsets loses to a json3 track WITHOUT them. wordTiming is binary measured/estimated — no 'mixed'.
+  - P1 #6 Diversity: dedupeAndRank drops >50% overlap + title/excerpt dupes, but temporally-adjacent near-duplicates (same moment, non-overlapping windows) survive.
+  - P1 #7 No CI workflow; no SECURITY.md.
+  - Already good (verified, do NOT rewrite): DB-authoritative analyze, Zod+repair, server scoring/recommendation, strict hook tiers, context validation, transactional save, ownership on projects/clips/sourcejobs/usage, path containment (resolveLocalMediaPath + tests), execFile-arg-array ffmpeg/yt-dlp everywhere, renderer frame-accurate trim + codec/resolution/duration gates + cancel + timeout, rate limits on expensive routes.
+- IMPLEMENTATION PLAN (10 steps): (1) Prisma RenderJob table; (2) renderer recipe-validation module + hardening; (3) proxy ownership + streaming + caps; (4) buildKeepRanges full-cut fix + UI guard; (5) caption timing-quality selection + 'mixed'; (6) diversity near-dup rule; (7) tests (unit A–M edge cases, validation matrix, E2E ownership+full-cut); (8) CI + SECURITY.md; (9) full regression + browser QA; (10) final adversarial review + scored report.
