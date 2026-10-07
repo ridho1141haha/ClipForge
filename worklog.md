@@ -229,3 +229,37 @@ Stage Summary:
   3) Usage-based soft limits (configurable daily cap → 429 with friendly message) — table + endpoints already exist.
   4) Exporter: burn-in LUTs/text overlays preview-only labeling cleanup; B-roll/SFX remain preview-only.
 - Risks: none new. Standing limits unchanged (sandbox IP rate-limits on YouTube timedtext endpoint — mitigated by partial-failure tolerance + retry; B-roll/SFX/music preview-only; in-memory rate-limit store).
+
+---
+Task ID: cron-review-4 (webDevReview round 5)
+Agent: Z.ai Code (autonomous review)
+Task: QA + feature round — status assessment, agent-browser QA, then close the last pipeline gap: render from a bare URL (YouTube media download → project-source render).
+
+Work Log:
+- STATUS ASSESSMENT: all services healthy; regression gates ALL GREEN before changes (unit 92/92, E2E 17/17, live 17/17); git clean @ 54db3d6. Browser QA (agent-browser): zero-input golden path re-verified (URL → Auto-Clip → 4 clips, all "verified in transcript" from captions, server scores 82.5–87.3, console clean). No product bugs found in existing flows.
+- 🔑 KEY DISCOVERY: yt-dlp VIDEO download now WORKS from this sandbox IP (34MB 1080p MP4 pulled in ~13s) — same unblocking as captions in round 4. This closes the biggest remaining product gap: the URL flow could analyze but could never RENDER without a manual upload.
+- NEW FEATURE — URL → render loop closed (the headline of this round):
+  • Prepare job gained Stage 3 (media download): yt-dlp downloads the source video into upload/yt/<id>/source.<ext> — hard height cap (≤1080p for ≤20 min sources, ≤720p above; the 9:16 renderer crops+upscales, 1080p keeps output sharp), --max-filesize 1.5G guard, --concurrent-fragments 4, resumable .part files so job retry continues instead of restarting. FAILURE DEGRADES HONESTLY: a failed download never fails the job (its primary purpose is metadata+transcript) — it persists localMediaState='failed' + error and the UI offers the upload path.
+  • Schema: Project.localMedia (RELATIVE path, e.g. upload/yt/<id>/source.mp4), localMediaSize, localMediaState ('ready'|'failed'|'skipped'|'unavailable'), localMediaError. Verified with a fresh Prisma query after db:push (per the documented dev-env rule).
+  • Render-proxy JSON mode: POST /api/render-proxy/render now accepts { recipe, projectId } — the proxy resolves the path FROM THE DB (client never sends a path), enforces ownership (foreign session → 404), validates path containment via resolveLocalMediaPath (upload/-prefix + traversal rejection, unit-tested), size-caps at 1.5GB, then re-builds the multipart for the renderer — RENDERER CONTRACT 100% UNCHANGED (recipe JSON + video bytes → MP4).
+  • transcribe job Stage 4b: the UPLOADED original is persisted to upload/projects/<id>/source.<ext> → upload projects also become render-ready without re-upload.
+  • 🐛 BUGS FIXED along the way: (1) resolveLocalMediaPath initially double-joined the upload/ prefix ('upload/upload/...') → caught immediately by the new E2E, fixed + path-containment hardened; (2) render usage metering matched '/jobs' — an endpoint that doesn't exist in the current renderer contract — so RENDERS WERE SILENTLY UNMETERED; fixed to '/render' (also meters renderSeconds from the recipe output_duration in JSON mode); (3) stale Prisma client in the long-running dev server after schema push (the exact dev-env incident documented last round — db:push requires a dev server restart; lost ~15 min to it, recovered by clean restart).
+- UI/STYLING additions:
+  • upload-render.tsx: "Server source / Your file" segmented source selector (selected state with ring+check, server card shows size MB + "rendered directly — no upload needed" + render-ready badge; failed state shows amber explanation), adaptive header text, stage stepper first step 'Queue' in server mode, JSON render path.
+  • saved-projects.tsx: "render-ready" chip on library cards + "N render-ready" summary stat (title tooltips explain).
+  • url-input.tsx: ASR done state shows "source saved — render without re-upload (N MB)" chip.
+  • page.tsx: projectMedia state wired through prepare result / loadProject / delete / clear; prepare poll window 3→22.5 min for long downloads.
+- TESTS: NEW tests/url-render-e2e.ts (17 assertions, permanent gate): bare URL → prepare job (metadata+captions+media download) → real duration drives plan window → buildRecipeJSON → JSON project-source render → download → ffprobe/volumedetect: duration EXACTLY 20.000s, 1080x1920 h264+aac, non-silent audio, file 13.4MB; PLUS security (JSON render w/o projectId → 400, foreign session → 404) and honest skip semantics when YouTube blocks. Unit suite +10 (path safety: traversal/absolute/non-upload/empty, mime map, safe-id). Frame inspection of the URL-rendered MP4: real Rick Astley footage, correct 9:16 crop, punch-in zoom, yellow hook top-center, karaoke fill subtitle at bottom, post-cut frame clean (no subtitle residue).
+- Regression after changes: unit 102/102 · golden E2E 17/17 · live 17/17 · url-render E2E 17/17 · tsc clean · eslint clean.
+- BROWSER-VERIFIED END-TO-END (agent-browser): URL → Auto-Clip (prepare shows "Downloading source video…" stage) → 5 clips verified-in-transcript → AI Edit Plan (4 segments / 11 subtitles / camera 2) → Render tab shows "Server source · 32.3 MB [selected]" + "Your file" tab → Render MP4 → "Render complete! 1080×1920 · 46s · 30.54 MB" with inline player + Download. Console clean.
+- Committed 93d85a1. GitHub push FAILED with remote "Internal Server Error" (transient GitHub-side; API also 403 at the time) — COMMIT IS SAFE LOCALLY, retry `git push origin main` next round before starting work.
+- package.json: added test:unit / test:e2e / test:live / test:url-render shortcuts. README updated (URL→render loop, JSON render mode, test matrix, honest failure modes).
+
+Stage Summary:
+- The product's last hard gap is closed: a bare YouTube URL now yields a finished, downloadable 9:16 MP4 with zero manual input when YouTube allows it — and every failure mode (no captions, no duration, download blocked) degrades honestly with a first-class manual path.
+- Next round suggestions (priority order):
+  1) `git push origin main` (93d85a1 is local-only due to the transient GitHub error).
+  2) Real auto-edit preview player for server-side media (HTML5 <video> playing the DOWNLOADED source with keep-range skipping) — the URL flow can now preview cuts on real footage instead of the YouTube iframe approximation.
+  3) Usage-based soft limits (daily cap → friendly 429) — UsageEvent + endpoints already exist.
+  4) Storage hygiene: cap/LRU-clean upload/yt (33MB/video adds up), project delete should remove its media dir.
+- Risks: none new. Standing limits: YouTube endpoints are IP-dependent (all flows degrade honestly); in-memory rate-limit store; B-roll/SFX/music preview-only.
