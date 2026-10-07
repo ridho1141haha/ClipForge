@@ -1,0 +1,118 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+// YouTube Clip Studio models
+// SECURITY: every Project is owned by an anonymous session (ownerId = signed session id).
+// All API paths MUST scope queries by ownerId.
+
+model Project {
+  id              String   @id @default(cuid())
+  ownerId         String // anonymous session id — REQUIRED for ownership enforcement
+  youtubeId       String
+  url             String
+  title           String
+  author          String?
+  thumbnail       String?
+  description     String?
+
+  // REAL duration in seconds (never a heuristic guess)
+  duration        Float?
+  // 'yt-dlp' | 'innertube' | 'user-provided' | 'unavailable'
+  durationSource  String   @default("unavailable")
+
+  // Transcript (real source content used for grounded analysis)
+  transcript      String? // plain text
+  transcriptWords String? // JSON: [{ word, start, end }] word-level timestamps where available
+  // 'youtube-captions' | 'manual' | 'asr' | 'none'
+  transcriptSource String  @default("none")
+  language        String?
+
+  // Reproducibility metadata for the last analysis run
+  analysisMeta    String? // JSON: { model, provider, promptVersion, analysisVersion, analyzedAt }
+
+  status          String   @default("new") // new | analyzed | exported
+  clipCount       Int      @default(0)
+  clips           Clip[]
+
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  @@index([ownerId])
+  @@index([youtubeId])
+}
+
+model Clip {
+  id          String  @id @default(cuid())
+  projectId   String
+  project     Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  title       String
+  summary     String?
+  startTime   Float // seconds (source time)
+  endTime     Float // seconds (source time)
+  score       Float   @default(0) // server-calculated weighted total 0-100
+  tags        String? // JSON-encoded string array
+  hookText    String? // DEPRECATED alias of spokenHook (kept for compat)
+  spokenHook  String? // word-for-word quote from transcript
+  hookVerified Boolean @default(false) // spokenHook verified against transcript
+  platform    String  @default("shorts") // shorts | reels | tiktok | custom
+  status      String  @default("suggested") // suggested | approved | edited | rejected
+  order       Int     @default(0)
+
+  // Scoring
+  style          String? // podcast | business | educational | storytelling | gaming | esports | funny | motivational | news
+  targetDuration Int?
+  scores         String? // JSON: { hook, curiosity, emotion, payoff, standalone, shareability, context_safety, total }
+  contextRisk    Boolean @default(false)
+  // PASS | EXTEND | REJECT | UNKNOWN (UNKNOWN = no transcript evidence)
+  contextStatus  String?
+  recommendation String? // POST | SKIP (server-calculated)
+  generatedHook  String? // on-screen hook (clearly generated, not spoken)
+  reason         String? // why this clip was selected/rejected
+
+  // Clip-local transcript snapshot (the words spoken inside [startTime, endTime])
+  clipTranscript String?
+  clipWords      String? // JSON: [{ word, start, end }] within clip range
+
+  // Detailed edit plan (JSON-encoded) - generated on demand
+  segments     String? // JSON array
+  cuts         String? // JSON array
+  camera       String? // JSON array
+  visuals      String? // JSON array
+  animations   String? // JSON array
+  soundEffects String? // JSON array
+  music        String? // JSON
+  subtitles    String? // JSON array
+
+  hasPlan Boolean @default(false)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([projectId])
+  @@index([status])
+}
+
+// Async job pipeline (Phase 19): source prepare (metadata + transcript acquisition)
+model SourceJob {
+  id           String   @id @default(cuid())
+  ownerId      String // session ownership
+  projectId    String? // linked project (created/updated by the job)
+  type         String   @default("prepare") // prepare | transcribe
+  // QUEUED | DOWNLOADING | TRANSCRIBING | COMPLETED | FAILED
+  status       String   @default("QUEUED")
+  stage        String   @default("Queued") // human readable
+  progress     Int      @default(0) // 0-100
+  errorCode    String? // e.g. YTDLP_BLOCKED, ASR_UNAVAILABLE
+  errorMessage String?
+  result       String? // JSON summary { duration, durationSource, transcriptSource, words }
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  @@index([ownerId])
+}
