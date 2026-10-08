@@ -1,0 +1,288 @@
+'use client'
+
+import * as React from 'react'
+import { motion } from 'framer-motion'
+import { Play, User, Clock, ExternalLink, Youtube, AlertCircle, FileVideo, HardDrive, RefreshCw, FolderX } from 'lucide-react'
+import { fmtDuration, type YouTubeMeta } from '@/lib/youtube'
+
+interface Props {
+  meta: YouTubeMeta
+  playStart?: number | null
+  /** Owner-scoped stream URL — when present, real downloaded source playback */
+  mediaUrl?: string | null
+  mediaSize?: number | null
+  /** Bump to force the <video> to reload (e.g. after a re-prepare re-downloads the file) */
+  mediaKey?: number
+  /** Called when the source file is confirmed missing on disk (HTTP 410 from /api/media) */
+  onMediaMissing?: () => void
+  /** True while the parent runs the re-prepare job — disables the heal button */
+  repreparing?: boolean
+}
+
+export function VideoPreview({ meta, playStart, mediaUrl, mediaSize, mediaKey, onMediaMissing, repreparing }: Props) {
+  const [iframeKey, setIframeKey] = React.useState(0)
+  const [embedUrl, setEmbedUrl] = React.useState(meta.embedUrl)
+  const videoRef = React.useRef<HTMLVideoElement | null>(null)
+  // 'ok' = playing/neutral; 'missing' = probed endpoint, file confirmed gone;
+  // 'error' = playback failed for a non-missing reason (generic message only)
+  const [probeState, setProbeState] = React.useState<'ok' | 'checking' | 'missing' | 'error'>('ok')
+  // WHY the source is unavailable — the heal card must tell the truth about
+  // the difference between "file was on disk and is gone" (410) and "the
+  // download never produced a file" (409 state: failed|skipped|unavailable).
+  const [missingReason, setMissingReason] = React.useState<'file-gone' | 'download-failed' | 'never-downloaded'>('file-gone')
+
+  // reset the probe whenever the source (or reload key) changes
+  React.useEffect(() => {
+    setProbeState('ok')
+    setMissingReason('file-gone')
+  }, [mediaUrl, mediaKey])
+
+  /**
+   * The <video> error event is ambiguous (code 4 covers missing, blocked,
+   * unsupported). Probe our own owner-scoped endpoint ONCE to learn the real
+   * reason: 410 = file was on disk and is gone (evicted/removed) → offer
+   * auto-heal; 409 = DB state says no streamable source — the body names the
+   * exact state ('failed' = download attempted and failed, 'skipped'/'unavailable'
+   * = never downloaded) so the heal card can say WHICH truth; anything else is
+   * a generic error. No speculative requests while playback is healthy.
+   */
+  const onVideoError = React.useCallback(async () => {
+    if (!mediaUrl || probeState === 'checking') return
+    setProbeState('checking')
+    try {
+      const r = await fetch(mediaUrl, { headers: { Range: 'bytes=0-1' } })
+      if (r.status === 410) {
+        setMissingReason('file-gone')
+        setProbeState('missing')
+      } else if (r.status === 409) {
+        // body: { error: '... (state: failed)' } — extract the state for honest copy
+        const body = (await r.json().catch(() => null)) as { error?: string } | null
+        const state = /state:\s*(\w+)/.exec(body?.error ?? '')?.[1]
+        setMissingReason(state === 'failed' ? 'download-failed' : 'never-downloaded')
+        setProbeState('missing')
+      } else {
+        setProbeState('error')
+      }
+    } catch {
+      setProbeState('error')
+    }
+  }, [mediaUrl, probeState])
+
+  React.useEffect(() => {
+    // Seek to clip start when a clip is selected
+    if (playStart != null && playStart >= 0) {
+      if (mediaUrl && videoRef.current) {
+        // real source: precise seek, no iframe reload
+        try {
+          videoRef.current.currentTime = playStart
+          videoRef.current.play().catch(() => {})
+        } catch {}
+      }
+      setEmbedUrl(`${meta.embedUrl}?start=${Math.floor(playStart)}&rel=0&modestbranding=1`)
+      setIframeKey((k) => k + 1)
+    } else {
+      setEmbedUrl(`${meta.embedUrl}?rel=0&modestbranding=1`)
+      setIframeKey((k) => k + 1)
+    }
+  }, [playStart, meta.embedUrl, mediaUrl])
+
+  return (
+    <motion.div
+      initial={{ opacity: 0, y: 12 }}
+      animate={{ opacity: 1, y: 0 }}
+      transition={{ duration: 0.4 }}
+      className="overflow-hidden rounded-2xl border border-border/80 bg-card shadow-xl"
+    >
+      {/* Player — real downloaded source > YouTube embed > upload placeholder */}
+      {mediaUrl && probeState === 'missing' ? (
+        <div className="relative flex aspect-video w-full flex-col items-center justify-center gap-3 bg-gradient-to-br from-amber-950/40 via-card to-rose-950/30 p-6">
+          <div className="grid h-14 w-14 place-items-center rounded-2xl bg-amber-500/15 text-amber-400 ring-1 ring-amber-500/30">
+            <FolderX className="h-7 w-7" />
+          </div>
+          <p className="text-sm font-semibold text-foreground">
+            {missingReason === 'file-gone'
+              ? 'Source file is missing on disk'
+              : missingReason === 'download-failed'
+                ? 'Source download never completed'
+                : 'Source was never downloaded'}
+          </p>
+          <p className="max-w-sm text-center text-xs leading-relaxed text-muted-foreground">
+            {missingReason === 'file-gone'
+              ? 'The cached source was removed (media cache policy or manual cleanup). Your clips, scores, and edit plans are all intact — re-prepare re-downloads the source and re-enables preview + direct rendering.'
+              : missingReason === 'download-failed'
+                ? 'The server tried to download this source before and the download failed. Your clips, scores, and edit plans are all intact — re-prepare retries the download (or upload the file manually below).'
+                : 'No source video is stored for this project. Your clips, scores, and edit plans are all intact — re-prepare downloads the source so preview and one-click rendering work without a manual upload.'}
+          </p>
+          {onMediaMissing && (
+            <button
+              type="button"
+              onClick={onMediaMissing}
+              disabled={repreparing}
+              className="inline-flex items-center gap-2 rounded-lg bg-primary px-4 py-2 text-xs font-semibold text-primary-foreground shadow transition hover:bg-primary/90 disabled:cursor-not-allowed disabled:opacity-60"
+            >
+              {repreparing ? <RefreshCw className="h-3.5 w-3.5 animate-spin" /> : <RefreshCw className="h-3.5 w-3.5" />}
+              {repreparing ? 'Re-preparing… (downloading source)' : 'Re-prepare source'}
+            </button>
+          )}
+        </div>
+      ) : mediaUrl ? (
+        <div className="relative aspect-video w-full bg-black">
+          <video
+            key={mediaKey ?? 0}
+            ref={videoRef}
+            src={mediaUrl}
+            controls
+            preload="metadata"
+            playsInline
+            className="h-full w-full"
+            aria-label={`Source video: ${meta.title}`}
+            onError={onVideoError}
+          />
+          <div className="pointer-events-none absolute left-3 top-3 flex items-center gap-1 rounded-md bg-emerald-500/90 px-2 py-1 text-[10px] font-bold text-white shadow">
+            <HardDrive className="h-3 w-3" />
+            LOCAL SOURCE
+            {mediaSize != null && mediaSize > 0 && (
+              <span className="font-medium opacity-90">· {(mediaSize / 1024 / 1024).toFixed(1)} MB</span>
+            )}
+          </div>
+        </div>
+      ) : meta.embedUrl ? (
+        <div className="relative aspect-video w-full bg-black">
+          <iframe
+            key={iframeKey}
+            src={embedUrl}
+            title={meta.title}
+            className="h-full w-full"
+            allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share"
+            allowFullScreen
+          />
+        </div>
+      ) : (
+        <div className="relative flex aspect-video w-full flex-col items-center justify-center gap-2 bg-gradient-to-br from-violet-950/60 via-card to-rose-950/40">
+          <div className="grid h-14 w-14 place-items-center rounded-2xl bg-violet-500/15 text-violet-400 ring-1 ring-violet-500/30">
+            <FileVideo className="h-7 w-7" />
+          </div>
+          <p className="text-sm font-semibold text-foreground">Local media — analyzed via ASR</p>
+          <p className="text-xs text-muted-foreground">
+            {meta.duration != null ? `${Math.floor(meta.duration / 60)}m ${Math.round(meta.duration % 60)}s` : ''} · duration measured by ffprobe · transcript by Whisper
+          </p>
+        </div>
+      )}
+
+      {/* Meta */}
+      <div className="space-y-3 p-4 sm:p-5">
+        <div className="flex items-start gap-3">
+          <div className="grid h-9 w-9 shrink-0 place-items-center rounded-lg bg-primary/10 text-primary">
+            <Youtube className="h-5 w-5" />
+          </div>
+          <div className="min-w-0 flex-1">
+            <h3 className="line-clamp-2 text-sm font-semibold leading-snug text-foreground">
+              {meta.title}
+            </h3>
+            {meta.author && (
+              <div className="mt-1 flex items-center gap-1.5 text-xs text-muted-foreground">
+                <User className="h-3 w-3" />
+                {meta.author}
+              </div>
+            )}
+          </div>
+          <a
+            href={meta.url}
+            target="_blank"
+            rel="noreferrer"
+            className="shrink-0 rounded-md p-1.5 text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+            aria-label="Open on YouTube"
+            onClick={(e) => {
+              if (!meta.url.startsWith('http')) e.preventDefault()
+            }}
+          >
+            <ExternalLink className="h-4 w-4" />
+          </a>
+        </div>
+
+        <div className="flex flex-wrap items-center gap-2">
+          <Badge
+            className={
+              meta.durationSource === 'unavailable'
+                ? 'border-amber-500/40 bg-amber-500/10 text-amber-600 dark:text-amber-400'
+                : 'border-emerald-500/40 bg-emerald-500/10 text-emerald-600 dark:text-emerald-400'
+            }
+          >
+            <Clock className="h-3 w-3" />
+            {meta.duration != null ? fmtDuration(meta.duration) : 'duration unavailable'}
+          </Badge>
+          {meta.durationSource && (
+            <Badge
+              variant="outline"
+              className="text-[10px] text-muted-foreground"
+              title={
+                meta.durationSource === 'yt-dlp'
+                  ? 'Exact duration resolved via yt-dlp'
+                  : meta.durationSource === 'innertube'
+                    ? 'Duration resolved via YouTube player API'
+                    : meta.durationSource === 'user-provided'
+                      ? 'Duration entered manually (server could not fetch it)'
+                      : 'Server could not fetch duration — enter it manually in Advanced options'
+              }
+            >
+              source: {meta.durationSource}
+            </Badge>
+          )}
+          <Badge>
+            <Play className="h-3 w-3" />
+            {meta.youtubeId}
+          </Badge>
+          <Badge>{meta.provider}</Badge>
+        </div>
+
+        {meta.requiresManualDuration && (
+          <div className="flex items-start gap-2 rounded-lg border border-amber-500/30 bg-amber-500/5 px-3 py-2 text-xs text-amber-700 dark:text-amber-400">
+            <AlertCircle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+            <span>
+              YouTube blocked the server from reading this video&apos;s real duration (bot protection). Enter the actual duration under <strong>Advanced → Duration</strong> — ClipForge will not analyze on a guessed value.
+            </span>
+          </div>
+        )}
+
+        {playStart != null && (
+          <motion.div
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            className="flex items-center gap-2 rounded-lg border border-primary/30 bg-primary/5 px-3 py-2 text-xs text-primary"
+          >
+            <span className="relative flex h-2 w-2">
+              <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-primary opacity-60" />
+              <span className="relative inline-flex h-2 w-2 rounded-full bg-primary" />
+            </span>
+            Previewing clip starting at {Math.floor(playStart)}s — seeked via YouTube embed
+          </motion.div>
+        )}
+      </div>
+    </motion.div>
+  )
+}
+
+function Badge({
+  children,
+  className,
+  variant,
+  title,
+}: {
+  children: React.ReactNode
+  className?: string
+  variant?: string
+  title?: string
+}) {
+  const base =
+    variant === 'outline'
+      ? 'border-border/60 bg-transparent'
+      : 'border-border/60 bg-muted/40'
+  return (
+    <span
+      title={title}
+      className={`inline-flex items-center gap-1 rounded-md px-2 py-1 text-[11px] font-medium text-muted-foreground ${base} ${className ?? ''}`}
+    >
+      {children}
+    </span>
+  )
+}
