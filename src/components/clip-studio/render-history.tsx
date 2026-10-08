@@ -19,6 +19,7 @@ import {
   Trash2,
   Pin,
   PinOff,
+  FolderDown,
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { useToast } from '@/hooks/use-toast'
@@ -253,6 +254,14 @@ export function RenderHistory({ refreshKey }: { refreshKey?: number }) {
   const anyActive = jobs?.some((j) => ACTIVE.includes(j.status)) ?? false
   const doneCount = jobs?.filter((j) => j.status === 'DONE').length ?? 0
   const queueBusy = queue != null && (queue.busy || queue.waiting > 0)
+  // downloadable DONE rows with live facts — the archive ZIP includes exactly
+  // these (manifest-validated server-side)
+  const downloadableRows = jobs?.filter((j) => j.status === 'DONE' && j.downloadable) ?? []
+  // pinned-storage soft warning threshold: pinned files NEVER auto-clean, so
+  // a large pinned total deserves a gentle heads-up (disk is finite)
+  const PINNED_WARN_BYTES = 500 * 1024 * 1024
+  const pinnedBytes = jobs?.filter((j) => j.pinned && j.size != null).reduce((s, j) => s + (j.size ?? 0), 0) ?? 0
+  const pinnedCount = jobs?.filter((j) => j.pinned).length ?? 0
 
   return (
     <div className="relative overflow-hidden rounded-xl border border-border/60 bg-card/50 p-4 sm:p-5">
@@ -299,6 +308,21 @@ export function RenderHistory({ refreshKey }: { refreshKey?: number }) {
             </>
           ) : null}
         </span>
+        {/* download all — bulk ZIP of every still-stored render (hidden until
+            2+ downloadable artifacts exist; the endpoint 404s honestly when
+            everything has been cleaned) */}
+        {downloadableRows.length >= 2 ? (
+          <a
+            href="/api/render-proxy/archive"
+            download
+            className="relative inline-flex h-7 shrink-0 items-center gap-1.5 rounded-md border border-emerald-500/30 bg-emerald-500/10 px-2 text-[11px] font-semibold text-emerald-600 transition-all after:absolute after:-inset-y-2 after:inset-x-0 after:content-[''] hover:bg-emerald-500/20 hover:shadow-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500/40 dark:text-emerald-400"
+            title={`Download all ${downloadableRows.length} stored renders as one ZIP file`}
+            aria-label={`Download all ${downloadableRows.length} stored renders as ZIP`}
+          >
+            <FolderDown className="h-3 w-3" />
+            <span className="hidden sm:inline">All ({downloadableRows.length})</span>
+          </a>
+        ) : null}
         <Button
           variant="ghost"
           size="sm"
@@ -566,6 +590,20 @@ export function RenderHistory({ refreshKey }: { refreshKey?: number }) {
           </AnimatePresence>
         </ul>
       )}
+
+      {/* pinned-storage soft warning — pinned files are exempt from the GC,
+          so a growing pinned total is the one retention number users should
+          consciously watch (round-5 worklog risk #2) */}
+      {pinnedBytes > PINNED_WARN_BYTES ? (
+        <p className="mt-2.5 flex items-start gap-1.5 rounded-lg border border-amber-500/25 bg-amber-500/[0.07] px-2.5 py-1.5 text-[10px] leading-relaxed text-amber-700 dark:text-amber-400">
+          <AlertTriangle className="mt-0.5 h-3 w-3 shrink-0" />
+          <span>
+            {pinnedCount} pinned {pinnedCount === 1 ? 'render holds' : 'renders hold'}{' '}
+            <strong className="tabular-nums font-semibold">{fmtBytes(pinnedBytes)}</strong> that never auto-cleans — delete
+            some pins if you want to free server storage.
+          </span>
+        </p>
+      ) : null}
 
       {jobs && jobs.length > 0 ? (
         <p className="mt-2.5 flex items-center gap-1.5 text-[10px] leading-relaxed text-muted-foreground/70">

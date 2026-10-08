@@ -13,8 +13,11 @@ import {
   FileText,
   Film,
   AlertTriangle,
+  Pin,
+  PinOff,
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
+import { useToast } from '@/hooks/use-toast'
 import { type EditPlan } from '@/lib/editplan'
 import { buildRenderRecipe, buildRecipeJSON } from '@/lib/render-recipe'
 import { outputDuration as planOutputDuration } from '@/lib/subtitles'
@@ -98,10 +101,19 @@ function planFromClip(c: ClipPlanSource, platform: string, style: string, target
 }
 
 export function BatchRender({ clips, platform, style, targetDuration, projectId, localReady, onJobStarted, onOpenStudio }: Props) {
+  const { toast } = useToast()
   // per-clip batch status keyed by clip id
   const [statusMap, setStatusMap] = React.useState<Map<string, BatchStatus>>(new Map())
   const [progressMap, setProgressMap] = React.useState<Map<string, number>>(new Map())
   const [errorMap, setErrorMap] = React.useState<Map<string, string>>(new Map())
+  // clip id → renderer job id (set when each render starts; powers the
+  // post-batch pin toggles — pinning a fresh render protects it from the
+  // storage-cap GC before the user has downloaded anything)
+  const [jobIdMap, setJobIdMap] = React.useState<Map<string, string>>(new Map())
+  // clip id → pinned state (mirrored from the job's final poll response —
+  // the renderer reports `pinned` for done jobs)
+  const [pinnedMap, setPinnedMap] = React.useState<Map<string, boolean>>(new Map())
+  const [pinningId, setPinningId] = React.useState<string | null>(null)
   const [running, setRunning] = React.useState(false)
   const stopRef = React.useRef(false)
   // batch renders use the per-project quality preference (synced with the
@@ -124,6 +136,8 @@ export function BatchRender({ clips, platform, style, targetDuration, projectId,
     setStatusMap(new Map(renderable.map((c) => [c.id, 'queued' as BatchStatus])))
     setProgressMap(new Map())
     setErrorMap(new Map())
+    setJobIdMap(new Map())
+    setPinnedMap(new Map())
     try {
       for (const c of renderable) {
         if (stopRef.current) {
@@ -148,6 +162,7 @@ export function BatchRender({ clips, platform, style, targetDuration, projectId,
           const data = await res.json()
           if (!res.ok) throw new Error(data.error ?? 'Render request failed')
           onJobStarted?.(data.id)
+          setJobIdMap((m) => new Map(m).set(c.id, data.id))
           // poll until terminal
           let terminal = false
           while (!terminal && !stopRef.current) {
@@ -161,6 +176,8 @@ export function BatchRender({ clips, platform, style, targetDuration, projectId,
             setProgressMap((m) => new Map(m).set(c.id, job.progress ?? 0))
             if (job.status === 'done') {
               setStatusMap((m) => new Map(m).set(c.id, 'done'))
+              // mirror the artifact's real pinned state into the summary
+              setPinnedMap((m) => new Map(m).set(c.id, job.pinned === true))
               terminal = true
             } else if (job.status === 'error') {
               throw new Error(job.error ?? job.stage ?? 'Render failed')
@@ -190,6 +207,37 @@ export function BatchRender({ clips, platform, style, targetDuration, projectId,
 
   const stopBatch = () => {
     stopRef.current = true
+  }
+
+  // ---- pin/unpin a finished batch render (GC exemption) ----
+  // The summary row knows its job id, so the user can pin right here without
+  // scrolling to the render history — protect the just-finished MP4s before
+  // downloading them. Same optimistic-toggle contract as the history panel.
+  const toggleBatchPin = async (clipId: string, next: boolean) => {
+    const jobId = jobIdMap.get(clipId)
+    if (!jobId || pinningId) return
+    setPinningId(clipId)
+    setPinnedMap((m) => new Map(m).set(clipId, next))
+    try {
+      const res = await fetch(`/api/render-proxy/jobs/${jobId}/pin`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ pinned: next }),
+      })
+      const data = (await res.json().catch(() => ({}))) as { pinned?: boolean; error?: string }
+      if (!res.ok || data.pinned !== next) {
+        throw new Error(data.error ?? `Pin failed (HTTP ${res.status})`)
+      }
+    } catch (e: unknown) {
+      setPinnedMap((m) => new Map(m).set(clipId, !next))
+      toast({
+        title: next ? 'Could not pin render' : 'Could not unpin render',
+        description: e instanceof Error ? e.message : 'Unknown error',
+        variant: 'destructive',
+      })
+    } finally {
+      setPinningId(null)
+    }
   }
 
   // nothing approved at all → hide the whole card
@@ -351,6 +399,37 @@ export function BatchRender({ clips, platform, style, targetDuration, projectId,
                   ) : (
                     <span className="inline-flex min-w-[70px] items-center justify-center text-[10px] text-muted-foreground/50">ready</span>
                   )}
+                  {/* pin toggle — finished rows only (protect the fresh MP4 from
+                      the storage-cap GC right here, without scrolling to the
+                      render history). Pinned state is mirrored from the job's
+                      final poll; optimistic toggle with revert+toast on failure. */}
+                  {st === 'done' && jobIdMap.get(c.id) ? (
+                    <button
+                      type="button"
+                      onClick={() => void toggleBatchPin(c.id, !pinnedMap.get(c.id))}
+                      disabled={pinningId === c.id}
+                      aria-pressed={pinnedMap.get(c.id) === true}
+                      aria-label={pinnedMap.get(c.id) ? `Unpin ${c.title}` : `Pin ${c.title}`}
+                      title={
+                        pinnedMap.get(c.id)
+                          ? 'Pinned — kept until you delete it (click to unpin)'
+                          : 'Pin — keep this render safe from automatic storage cleanup'
+                      }
+                      className={`relative inline-flex h-6 w-6 shrink-0 items-center justify-center rounded-md border transition-all after:absolute after:-inset-2 after:content-[''] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-500/40 disabled:cursor-wait ${
+                        pinnedMap.get(c.id)
+                          ? 'border-amber-500/40 bg-amber-500/15 text-amber-600 hover:bg-amber-500/25 dark:text-amber-400'
+                          : 'border-transparent text-muted-foreground/50 hover:border-amber-500/30 hover:bg-amber-500/10 hover:text-amber-500'
+                      }`}
+                    >
+                      {pinningId === c.id ? (
+                        <Loader2 className="h-3 w-3 animate-spin" />
+                      ) : pinnedMap.get(c.id) ? (
+                        <Pin className="h-3 w-3" />
+                      ) : (
+                        <PinOff className="h-3 w-3" />
+                      )}
+                    </button>
+                  ) : null}
                 </span>
               </motion.li>
             )
@@ -377,7 +456,7 @@ export function BatchRender({ clips, platform, style, targetDuration, projectId,
 
       <p className="mt-2.5 flex items-center gap-1.5 text-[10px] leading-relaxed text-muted-foreground/70">
         <Clock3 className="h-3 w-3 shrink-0" />
-        Renders run one at a time from the server source. Finished MP4s land in the render history below (stored on the server; oldest auto-cleaned under the storage cap).
+        Renders run one at a time from the server source. Finished MP4s land in the render history below — pin the ones you want to keep before they hit the storage cap.
       </p>
     </div>
   )

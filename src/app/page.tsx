@@ -1479,7 +1479,7 @@ export default function Home() {
                         size="sm"
                         variant="ghost"
                         onClick={() => setReanalyzeOpen((v) => !v)}
-                        className="h-8 shrink-0 gap-1.5 text-xs"
+                        className="h-8 shrink-0 gap-1.5 border border-primary/25 bg-primary/10 text-xs text-primary hover:bg-primary/20 hover:text-primary"
                       >
                         <RotateCw className="h-3.5 w-3.5" />
                         Re-analyze

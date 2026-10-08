@@ -43,12 +43,14 @@ export type RecipeValidationCode =
 
 // ---- Render quality presets --------------------------------------------------
 // The recipe may carry a quality hint; the renderer maps it to concrete ffmpeg
-// parameters. 'standard' is the historical default (1080x1920 · crf 20 · 128k)
-// so every existing recipe/test renders EXACTLY as before.
-//   draft    — 720x1280, crf 26, 96k audio: ~2-3x faster, ~4x smaller files
-//              (preview/iteration quality)
-//   standard — 1080x1920, crf 20, 128k audio (balanced default)
-//   high     — 1080x1920, crf 16, 192k audio: max fidelity, larger files
+// parameters. 'standard' is the historical default (1080x1920 · crf 20 · 128k
+// · 30fps) so every existing recipe/test renders EXACTLY as before.
+//   draft    — 720x1280, crf 26, 96k audio, 24fps: ~2-3x faster, ~4x smaller
+//              files (preview/iteration quality; 24fps is a fully standard
+//              playback rate for every short-form platform and cuts another
+//              ~20% of encode frames on top of the resolution savings)
+//   standard — 1080x1920, crf 20, 128k audio, 30fps (balanced default)
+//   high     — 1080x1920, crf 16, 192k audio, 30fps: max fidelity, larger files
 // NOTE: keep src/lib/render-recipe.ts (client mirror: labels/copy) in sync when
 // changing these presets.
 export type RenderQuality = 'draft' | 'standard' | 'high'
@@ -59,10 +61,12 @@ export const QUALITY_PRESETS: Record<RenderQuality, {
   crf: number
   videoPreset: 'veryfast'
   audioBitrate: string
+  /** output frame rate — drives the zoompan frame math AND -r (must match) */
+  fps: number
 }> = {
-  draft: { width: 720, height: 1280, crf: 26, videoPreset: 'veryfast', audioBitrate: '96k' },
-  standard: { width: 1080, height: 1920, crf: 20, videoPreset: 'veryfast', audioBitrate: '128k' },
-  high: { width: 1080, height: 1920, crf: 16, videoPreset: 'veryfast', audioBitrate: '192k' },
+  draft: { width: 720, height: 1280, crf: 26, videoPreset: 'veryfast', audioBitrate: '96k', fps: 24 },
+  standard: { width: 1080, height: 1920, crf: 20, videoPreset: 'veryfast', audioBitrate: '128k', fps: 30 },
+  high: { width: 1080, height: 1920, crf: 16, videoPreset: 'veryfast', audioBitrate: '192k', fps: 30 },
 }
 
 export function isRenderQuality(v: unknown): v is RenderQuality {

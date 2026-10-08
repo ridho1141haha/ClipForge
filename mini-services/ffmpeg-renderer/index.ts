@@ -321,7 +321,7 @@ function sanitize(s: string): string {
   return s.replace(/[^a-z0-9-_]+/gi, '_').slice(0, 60)
 }
 
-function buildZoompanFilter(recipe: ValidatedRecipe, fps = 30): string | null {
+function buildZoompanFilter(recipe: ValidatedRecipe, fps = QUALITY_PRESETS[recipe.quality ?? 'standard'].fps): string | null {
   const kfs = recipe.camera_keyframes ?? []
   if (!kfs || kfs.length < 2) return null
   // output resolution follows the recipe's quality preset — zoompan punches
@@ -623,7 +623,17 @@ async function processJob(jobId: string, spoolPath: string, originalName: string
     // sources dynamically via iw/ih expressions
     postParts.push("crop=w='trunc(min(iw\\,ih*9/16)/2)*2':h='trunc(min(ih\\,iw*16/9)/2)*2'")
     postParts.push(`scale=${q.width}:${q.height}`)
-    const zoom = buildZoompanFilter(recipe)
+    // resample to the preset's frame rate BEFORE zoompan — zoompan emits d=1
+    // output frame per INPUT frame at its own fps, so an input rate ≠ zoompan
+    // fps STRETCHES output time (30fps source at zoompan fps=24 → 1.25×
+    // slower/longer video, desynced from the untouched audio; 60fps source at
+    // fps=30 → 2× — a pre-existing distortion this also fixes). The fps filter
+    // drops/duplicates frames with correct timestamps, so motion stays
+    // real-time, duration is exact, and A/V stays in sync at every quality.
+    postParts.push(`fps=${q.fps}`)
+    // zoompan runs at the preset's fps — the frame-count math inside uses the
+    // SAME rate, so keyframe timings stay frame-accurate at 24 (draft) or 30
+    const zoom = buildZoompanFilter(recipe, q.fps)
     if (zoom) postParts.push(zoom)
     if (recipe.subtitles_ass) postParts.push(`ass='${join(jobDir, 'subs.ass')}'`)
     fcParts.push(`[vc]${postParts.join(',')}[vf]`)
@@ -641,7 +651,7 @@ async function processJob(jobId: string, spoolPath: string, originalName: string
     let finalRes: { code: number; stdout: string; stderr: string }
     if (job.status === 'cancelled') return // cancelled before render started
     if (inputHasAudio) {
-      const args = ['ffmpeg', '-nostdin', '-y', '-i', inputPath, '-filter_complex', fcParts.join(';'), '-map', '[vf]', '-map', '[ac]', '-c:v', 'libx264', '-preset', q.videoPreset, '-crf', String(q.crf), '-c:a', 'aac', '-b:a', q.audioBitrate, '-r', '30', outPath]
+      const args = ['ffmpeg', '-nostdin', '-y', '-i', inputPath, '-filter_complex', fcParts.join(';'), '-map', '[vf]', '-map', '[ac]', '-c:v', 'libx264', '-preset', q.videoPreset, '-crf', String(q.crf), '-c:a', 'aac', '-b:a', q.audioBitrate, '-r', String(q.fps), outPath]
       finalRes = await run(args, jobDir, job, 'Encoding H.264 + burning subtitles + zoom', 25, 92, 15 * 60_000, { progressPipe: true })
       if (job.status === 'cancelled') return
       if (finalRes.code !== 0) {
@@ -656,7 +666,7 @@ async function processJob(jobId: string, spoolPath: string, originalName: string
         '-f', 'lavfi', '-i', 'anullsrc=channel_layout=stereo:sample_rate=44100',
         '-filter_complex', fcParts.join(';'),
         '-map', '[vf]', '-map', '[ac]',
-        '-c:v', 'libx264', '-preset', q.videoPreset, '-crf', String(q.crf), '-c:a', 'aac', '-b:a', q.audioBitrate, '-r', '30',
+        '-c:v', 'libx264', '-preset', q.videoPreset, '-crf', String(q.crf), '-c:a', 'aac', '-b:a', q.audioBitrate, '-r', String(q.fps),
         '-shortest', outPath,
       ]
       finalRes = await run(silentArgs, jobDir, job, 'Encoding (silent audio — source has no audio)', 25, 92, 15 * 60_000, { progressPipe: true })

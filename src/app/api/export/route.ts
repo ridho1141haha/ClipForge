@@ -3,9 +3,21 @@ import { db } from '@/lib/db'
 import { getOrCreateSessionId } from '@/lib/session'
 import { checkRateLimit, rateLimitHeaders } from '@/lib/validation'
 import { buildKeepRanges, buildSrt, buildVtt, sourceToOutputTime, type Cut, type SubtitleBlock, type Word } from '@/lib/subtitles'
+import { RENDER_QUALITY_PRESETS } from '@/lib/render-recipe'
 
 export const dynamic = 'force-dynamic'
 export const runtime = 'nodejs'
+
+/** export-JSON preset facts — DERIVED from the shared RENDER_QUALITY_PRESETS
+ *  (drops the internal videoPreset field; downstream tools get the
+ *  user-facing encoder contract). Single source of truth: changing the preset
+ *  table updates every export automatically. */
+const EXPORT_PRESETS = Object.fromEntries(
+  Object.entries(RENDER_QUALITY_PRESETS).map(([k, p]) => [
+    k,
+    { width: p.width, height: p.height, crf: p.crf, audioBitrate: p.audioBitrate, fps: p.fps },
+  ]),
+)
 
 function fmtTime(sec: number): string {
   const s = Math.max(0, Math.floor(sec))
@@ -177,17 +189,15 @@ export async function POST(req: NextRequest) {
               }
             : null,
           renderSettings: {
-            fps: 30,
+            fps: RENDER_QUALITY_PRESETS.standard.fps,
             videoCodec: 'libx264 (H.264)',
             audioCodec: 'aac',
             aspect: '9:16 vertical',
-            // real per-quality encoder settings (mirrors the renderer's
-            // QUALITY_PRESETS contract — render recipe "quality" field)
-            presets: {
-              draft: { width: 720, height: 1280, crf: 26, audioBitrate: '96k' },
-              standard: { width: 1080, height: 1920, crf: 20, audioBitrate: '128k' },
-              high: { width: 1080, height: 1920, crf: 16, audioBitrate: '192k' },
-            },
+            // real per-quality encoder settings — derived from the SHARED
+            // RENDER_QUALITY_PRESETS (single source of truth with the renderer
+            // mirror in src/lib/render-recipe.ts; the old inline literal here
+            // once drifted from the renderer contract)
+            presets: EXPORT_PRESETS,
           },
           rendererCapabilities: {
             rendered: ['cuts', 'subtitles_burn_in', 'camera_punch_in', '9:16_crop_scale', 'h264+aac_encode'],

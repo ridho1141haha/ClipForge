@@ -25,6 +25,8 @@ import { ensureRenderer } from '@/lib/renderer-supervisor'
 //   GET  /jobs/:id/stream   → 404 unless owned
 //   GET  /jobs/:id/download → 404 unless owned
 //   GET  /jobs/:id/cover    → 404 unless owned
+//   GET  /archive           → ZIP of owned DONE artifacts (manifest-validated,
+//                             direct-FS — no renderer dependency)
 // Random UUID secrecy is NEVER relied on; ownership lives in the DB.
 // The renderer is a trusted internal service (localhost only); this proxy is
 // the public-facing authorization boundary.
@@ -198,6 +200,289 @@ async function pruneAncientRows(): Promise<void> {
   } catch {
     // best-effort housekeeping — never break the list response
   }
+}
+
+// ─── GET /archive — "download all" ZIP of this session's finished renders ────
+// Streams a STORE-method (uncompressed) ZIP built from the PERSISTED artifact
+// store (upload/renders/<jobId>/manifest.json + clipforge_*.mp4) — read
+// directly from disk, NO renderer dependency (same economy as pin/delete: a
+// bulk download must never revive a dead service). Ownership is enforced via
+// the RenderJob table exactly like every other job operation.
+//
+// ZIP writer notes (why hand-rolled): MP4s are already-compressed media —
+// deflate would burn CPU for ~0% size win, so entries use method 0 (STORE).
+// CRC-32 is computed incrementally per 8 MB chunk and emitted in a per-entry
+// data descriptor (flag bit 3) after the file data — the standard streaming
+// ZIP layout (local header CRC/size fields are zero; the CENTRAL directory
+// carries the real values, which is what every unzip tool actually reads).
+const MAX_ARCHIVE_BYTES = 2 * 1024 * 1024 * 1024 // 2 GB of MP4 payload per archive
+const MAX_ARCHIVE_ENTRIES = 50
+
+/** CRC-32 (IEEE 802.3, reflected, poly 0xEDB88320) — small table impl so the
+ *  route works on every runtime (node:zlib.crc32 is version-gated). */
+const CRC_TABLE = (() => {
+  const t = new Uint32Array(256)
+  for (let n = 0; n < 256; n++) {
+    let c = n
+    for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1
+    t[n] = c >>> 0
+  }
+  return t
+})()
+
+function crc32Update(crc: number, chunk: Uint8Array): number {
+  let c = (crc ^ 0xffffffff) >>> 0
+  for (let i = 0; i < chunk.length; i++) {
+    c = (CRC_TABLE[(c ^ chunk[i]) & 0xff] ^ (c >>> 8)) >>> 0
+  }
+  return (c ^ 0xffffffff) >>> 0
+}
+
+/** DOS date/time words from a JS Date (ZIP's 1980-based 2s-resolution format). */
+function dosDateTime(d: Date): { time: number; date: number } {
+  const time = ((d.getHours() << 11) | (d.getMinutes() << 5) | Math.floor(d.getSeconds() / 2)) & 0xffff
+  const date = (((d.getFullYear() - 1980) << 9) | ((d.getMonth() + 1) << 5) | d.getDate()) & 0xffff
+  return { time, date }
+}
+
+interface ArchiveEntry {
+  name: string
+  path: string
+  size: number
+  mtime: Date
+}
+
+/** Collect this session's archived (downloadable) artifacts, newest-first.
+ *  A row contributes ONLY when its persisted manifest validates AND the MP4
+ *  exists — cleaned/deleted artifacts are skipped silently (the per-row
+ *  download links already degrade honestly). Duplicate filenames (re-renders
+ *  of the same clip) are de-duped with " (n)" suffixes so the zip never has
+ *  two entries with the same name. */
+async function collectArchiveEntries(ownerId: string): Promise<ArchiveEntry[]> {
+  const rows = await db.renderJob.findMany({
+    where: { ownerId, status: 'DONE' },
+    orderBy: { createdAt: 'desc' },
+    take: MAX_ARCHIVE_ENTRIES,
+    select: { id: true, filename: true },
+  })
+  const rendersRoot = join(process.cwd(), 'upload', 'renders')
+  const entries: ArchiveEntry[] = []
+  const usedNames = new Set<string>()
+  for (const row of rows) {
+    if (!/^[\w-]{8,64}$/.test(row.id)) continue
+    try {
+      const manifestPath = join(rendersRoot, row.id, 'manifest.json')
+      if (!existsSync(manifestPath)) continue
+      const m = JSON.parse(await readFile(manifestPath, 'utf8')) as Record<string, unknown>
+      const filename = typeof m.filename === 'string' ? m.filename : row.filename
+      if (m?.id !== row.id || m.status !== 'done' || !filename || !SAFE_MP4_NAME.test(filename)) continue
+      const mp4Path = join(rendersRoot, row.id, filename)
+      const st = statSync(mp4Path)
+      if (!st.isFile() || st.size <= 0) continue
+      // dedupe entry names (same clip re-rendered → same output filename)
+      let name = filename
+      let n = 2
+      while (usedNames.has(name)) {
+        name = filename.replace(/\.mp4$/, ` (${n++}).mp4`)
+      }
+      usedNames.add(name)
+      entries.push({ name, path: mp4Path, size: st.size, mtime: st.mtime })
+    } catch {
+      // unreadable manifest / vanished file — skip this row
+    }
+  }
+  return entries
+}
+
+/** Build the streaming ZIP response. Pull-based ReadableStream (same memory
+ *  posture as buildStreamingMultipart): one 8 MB read buffer at a time, file
+ *  handles closed deterministically. Content-Length is exact (STORE entries
+ *  have known sizes), so browsers can show a real progress bar. */
+function buildArchiveZipStream(entries: ArchiveEntry[]): { stream: ReadableStream<Uint8Array>; totalBytes: number } {
+  const enc = new TextEncoder()
+  const CHUNK = STREAM_CHUNK
+
+  // pre-compute sizes: per entry = local header (30 + nameLen) + data +
+  // descriptor (16); central dir per entry = 46 + nameLen; EOCD = 22
+  let offset = 0
+  const central: { name: Uint8Array; crc: number; size: number; time: number; date: number; offset: number }[] = []
+  const locals = entries.map((e) => {
+    const nameBytes = enc.encode(e.name)
+    const { time, date } = dosDateTime(e.mtime)
+    const localOffset = offset
+    offset += 30 + nameBytes.length + e.size + 16
+    central.push({ name: nameBytes, crc: 0, size: e.size, time, date, offset: localOffset })
+    return { entry: e, nameBytes, time, date }
+  })
+  const centralOffset = offset
+  let cdSize = 0
+  for (const c of central) cdSize += 46 + c.name.length
+  const totalBytes = centralOffset + cdSize + 22
+
+  let idx = 0
+  let stage: 'head' | 'file' | 'desc' | 'central' | 'eocd' | 'done' = 'head'
+  let fh: import('node:fs/promises').FileHandle | null = null
+  let crc = 0
+  const buf = Buffer.allocUnsafe(CHUNK)
+  let position = 0
+  let centralIdx = 0
+
+  const release = async () => {
+    const h = fh
+    fh = null
+    if (h) {
+      try { await h.close() } catch { /* already closed */ }
+    }
+  }
+
+  const stream = new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      try {
+        if (stage === 'head') {
+          const cur = locals[idx]
+          // reset per-entry accumulators BEFORE branching (zero-size entries
+          // jump straight to the descriptor and must see crc=0, not the
+          // previous entry's value)
+          crc = 0
+          position = 0
+          const head = Buffer.alloc(30)
+          head.writeUInt32LE(0x04034b50, 0) // local file header signature
+          head.writeUInt16LE(20, 4) // version needed (2.0)
+          head.writeUInt16LE(0x0808, 6) // flags: UTF-8 names + data descriptor
+          head.writeUInt16LE(0, 8) // method: STORE
+          head.writeUInt16LE(cur.time, 10)
+          head.writeUInt16LE(cur.date, 12)
+          // crc / csize / usize = 0 in the local header (descriptor carries them)
+          head.writeUInt16LE(cur.nameBytes.length, 26)
+          controller.enqueue(new Uint8Array(head))
+          controller.enqueue(cur.nameBytes)
+          stage = cur.entry.size === 0 ? 'desc' : 'file'
+          return
+        }
+        if (stage === 'file') {
+          const cur = locals[idx]
+          if (!fh) fh = await open(cur.entry.path, 'r')
+          const { bytesRead } = await fh.read(buf, 0, Math.min(CHUNK, cur.entry.size - position), position)
+          if (bytesRead <= 0 || position + bytesRead > cur.entry.size) {
+            // file grew/shrank since stat — the central dir records the stated
+            // size, so stop exactly there (best-effort honesty for a store)
+            stage = 'desc'
+            await release()
+            return
+          }
+          const view = buf.subarray(0, bytesRead)
+          crc = crc32Update(crc, view)
+          position += bytesRead
+          controller.enqueue(new Uint8Array(view)) // copy — buf is reused
+          if (position >= cur.entry.size) {
+            stage = 'desc'
+            await release()
+          }
+          return
+        }
+        if (stage === 'desc') {
+          const cur = locals[idx]
+          central[idx].crc = crc
+          const desc = Buffer.alloc(16)
+          desc.writeUInt32LE(0x08074b50, 0) // data descriptor signature
+          desc.writeUInt32LE(crc, 4)
+          desc.writeUInt32LE(cur.entry.size, 8) // compressed (= stored) size
+          desc.writeUInt32LE(cur.entry.size, 12) // uncompressed size
+          controller.enqueue(new Uint8Array(desc))
+          idx++
+          if (idx >= locals.length) {
+            stage = 'central'
+            centralIdx = 0
+          } else {
+            stage = 'head'
+          }
+          return
+        }
+        if (stage === 'central') {
+          if (centralIdx >= central.length) {
+            stage = 'eocd'
+            return
+          }
+          const c = central[centralIdx]
+          const head = Buffer.alloc(46)
+          head.writeUInt32LE(0x02014b50, 0) // central directory signature
+          head.writeUInt16LE(20, 4) // version made by
+          head.writeUInt16LE(20, 6) // version needed
+          head.writeUInt16LE(0x0808, 8) // flags (matches local)
+          head.writeUInt16LE(0, 10) // method: STORE
+          head.writeUInt16LE(c.time, 12)
+          head.writeUInt16LE(c.date, 14)
+          head.writeUInt32LE(c.crc, 16)
+          head.writeUInt32LE(c.size, 20) // csize
+          head.writeUInt32LE(c.size, 24) // usize
+          head.writeUInt16LE(c.name.length, 28)
+          head.writeUInt32LE(c.offset, 42) // local header offset
+          controller.enqueue(new Uint8Array(head))
+          controller.enqueue(c.name)
+          centralIdx++
+          if (centralIdx >= central.length) stage = 'eocd'
+          return
+        }
+        if (stage === 'eocd') {
+          const eocd = Buffer.alloc(22)
+          eocd.writeUInt32LE(0x06054b50, 0)
+          eocd.writeUInt16LE(central.length, 8) // entries on this disk
+          eocd.writeUInt16LE(central.length, 10) // total entries
+          eocd.writeUInt32LE(cdSize, 12)
+          eocd.writeUInt32LE(centralOffset, 16)
+          controller.enqueue(new Uint8Array(eocd))
+          stage = 'done'
+          controller.close()
+          return
+        }
+        // stage === 'done' — nothing more
+      } catch (e) {
+        await release()
+        controller.error(e)
+      }
+    },
+    async cancel() {
+      await release()
+    },
+  })
+  return { stream, totalBytes }
+}
+
+/** GET /api/render-proxy/archive — ZIP of every still-stored render this
+ *  session owns. 404 when nothing is archivable (the UI hides the button in
+ *  that case, but direct links must degrade honestly), 413 when the payload
+ *  would exceed the 2 GB cap (tell the user to download/delete some first). */
+async function buildOwnedArchive(): Promise<Response> {
+  const ownerId = await getOrCreateSessionId()
+  const entries = await collectArchiveEntries(ownerId)
+  if (entries.length === 0) {
+    return NextResponse.json(
+      { error: 'No stored renders to download — finished MP4s appear here until they are cleaned.' },
+      { status: 404 },
+    )
+  }
+  const totalPayload = entries.reduce((s, e) => s + e.size, 0)
+  if (totalPayload > MAX_ARCHIVE_BYTES) {
+    return NextResponse.json(
+      {
+        error: `Your stored renders total ${(totalPayload / 1024 / 1024 / 1024).toFixed(1)} GB — over the 2 GB archive cap. Download or delete some renders individually, then try again.`,
+      },
+      { status: 413 },
+    )
+  }
+  const { stream, totalBytes } = buildArchiveZipStream(entries)
+  const stamp = new Date()
+  const pad = (n: number) => String(n).padStart(2, '0')
+  const fname = `clipforge-renders-${stamp.getFullYear()}${pad(stamp.getMonth() + 1)}${pad(stamp.getDate())}-${pad(stamp.getHours())}${pad(stamp.getMinutes())}.zip`
+  return new NextResponse(stream, {
+    status: 200,
+    headers: {
+      'content-type': 'application/zip',
+      'content-length': String(totalBytes),
+      'content-disposition': `attachment; filename="${fname}"`,
+      'cache-control': 'no-store',
+    },
+  })
 }
 
 async function listOwnedRenderJobs(): Promise<Response> {
@@ -783,6 +1068,22 @@ export async function GET(
 ) {
   const { path } = await ctx.params
   const targetPath = '/' + path.join('/')
+
+  // ---- GET /archive — bulk ZIP download of owned finished renders ----
+  // Handled BEFORE ensureRenderer on purpose: the archive is built straight
+  // from the persisted store on disk; a bulk download must never revive (or
+  // wait on) the renderer service. Ownership = the RenderJob table.
+  if (targetPath === '/archive') {
+    const ip = req.headers.get('x-forwarded-for') ?? req.headers.get('x-real-ip') ?? 'unknown'
+    const rl = checkRateLimit(`archive:${ip}`, 4, 60_000)
+    if (!rl.allowed) {
+      return NextResponse.json(
+        { error: 'Too many archive downloads — please wait a minute.' },
+        { status: 429, headers: { 'Retry-After': String(Math.ceil((rl.resetAt - Date.now()) / 1000)) } },
+      )
+    }
+    return buildOwnedArchive()
+  }
 
   // SELF-HEALING: polls/streams/downloads of a known job also revive a dead
   // renderer (job state is in-memory — a restart loses it, but the ownership

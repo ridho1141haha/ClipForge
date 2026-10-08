@@ -149,15 +149,17 @@ export function SavedProjects({ projects, loading, onSelect, onDelete, onRefresh
         )}
         <UsagePanel />
 
-        {/* search + sort */}
-        <div className="ml-auto flex items-center gap-2">
-          <div className="relative">
+        {/* search + sort — wraps onto its own full-width row on mobile (the
+            fixed 192px search + 210px sort group + refresh could never fit 390px
+            side-by-side; this fixed a real 44px horizontal overflow) */}
+        <div className="ml-auto flex w-full flex-wrap items-center gap-2 sm:w-auto">
+          <div className="relative min-w-0 flex-1 basis-40 sm:basis-auto sm:flex-none">
             <Search className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
             <Input
               value={query}
               onChange={(e) => setQuery(e.target.value)}
               placeholder="Search title or channel…"
-              className="h-8 w-48 rounded-lg pl-8 pr-8 text-xs sm:w-56"
+              className="h-8 w-full rounded-lg pl-8 pr-8 text-xs sm:w-48"
             />
             {query && (
               <button
