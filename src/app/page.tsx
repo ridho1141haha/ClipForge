@@ -51,6 +51,7 @@ import { FeaturesGrid } from '@/components/clip-studio/features-grid'
 import { Tutorial } from '@/components/clip-studio/tutorial'
 import { UploadRender } from '@/components/clip-studio/upload-render'
 import { RenderHistory } from '@/components/clip-studio/render-history'
+import { BatchRender } from '@/components/clip-studio/batch-render'
 import { RemotionPlayer } from '@/components/clip-studio/remotion-player'
 
 import { Button } from '@/components/ui/button'
@@ -1789,6 +1790,18 @@ export default function Home() {
                   projectMedia={projectMedia}
                   onJobStarted={() => setRenderHistoryKey((k) => k + 1)}
                 />
+                {phase === 'done' ? (
+                  <BatchRender
+                    clips={clips}
+                    platform={currentPlatform}
+                    style={currentStyle}
+                    targetDuration={currentTargetDuration}
+                    projectId={projectId}
+                    localReady={Boolean(projectId && projectMedia?.state === 'ready')}
+                    onJobStarted={() => setRenderHistoryKey((k) => k + 1)}
+                    onOpenStudio={() => studioRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' })}
+                  />
+                ) : null}
                 <RenderHistory refreshKey={renderHistoryKey} />
               </div>
             )}

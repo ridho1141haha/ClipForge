@@ -561,3 +561,31 @@ Stage Summary:
 - New artifacts: render-history.tsx (UI), listOwnedRenderJobs + ACTIVE_STATUSES + poll-404 reconciliation (render-proxy route), UploadRender.onJobStarted callback, page.tsx wiring (renderHistoryKey).
 - Prisma schema UNCHANGED (net zero) — response-time fact merging instead. Do not add columns without a dev-server restart plan.
 - Unresolved risks / next-round priorities: (1) render CPU time still ~4-5min for 45s output (zoompan) — speed tuning (preset veryfast, or preset per-stage) is the top UX lever; (2) artifacts expire after ~10 min (renderer LRU) — consider longer retention or server-side persistence of finished MP4s into upload/ with DB paths; (3) batch render queue (render all approved clips sequentially) remains the biggest missing product feature; (4) toast-on-completion only fires while the Render tab is mounted (history panel unmounts when switching tabs) — consider lifting the poller to page level if desired.
+
+---
+Task ID: 4
+Agent: Z.ai Code (webDevReview round 2)
+Task: Scheduled review: assess status, QA, then implement the worklog's top priorities — render SPEED (2.2x), serial render queue, and the batch-render product feature; styling polish; full verification.
+
+Work Log:
+- STATUS ASSESSMENT: services healthy; dev.log's 11 errors were HISTORICAL (last round's Prisma schema experiment — all current /api/render-proxy/jobs responses 200). Fresh browser session QA: landing + render history clean, zero console errors.
+- PERF ANALYSIS (root-caused before optimizing): the render source was 1080p AV1 and the old filter graph did `scale=1080:1920:force_original_aspect_ratio=increase` on the FULL 16:9 frame → upscaled 1920x1080 → 3413x1920 then center-cropped to 1080x1920, discarding 68% of the upscaled pixels (~10x wasted scaling work per frame). Plus `-preset medium`.
+- RENDERER OPTIMIZATION (mini-services/ffmpeg-renderer/index.ts, hot-reloaded):
+  1. Crop-first 9:16 framing: `crop=w='trunc(min(iw\,ih*9/16)/2)*2':h='trunc(min(ih\,iw*16/9)/2)*2',scale=1080:1920` — crops the exact 9:16 center region from the ORIGINAL frame then scales once. Mathematically the same pixels as cover-scale→crop (even-floor keeps yuv420p alignment; ≤0.1% aspect deviation, imperceptible). Handles wide AND tall sources dynamically via iw/ih expressions.
+  2. `-preset medium` → `-preset veryfast` (both audio + silent-audio paths).
+  - Benchmarked on 10s of the real 1080p AV1 source: 26.7s → 12.0s (2.2x); isolated: crop-first ~6%, veryfast ~2.1x. Output specs byte-verified identical (h264 1080x1920 30fps, exact duration, similar bitrate).
+- NEW RENDERER SUBSYSTEM — serial render queue (concurrency 1): processJob was fire-and-forget (concurrent renders CPU-thrashed and made -progress/ETA meaningless). Now enqueueRender/drainRenderQueue run jobs FIFO, one ffmpeg at a time; queued jobs show "Queued (#N in line)"; cancel-while-queued is honored; a crashed job can never stall the queue (belt-and-braces terminal-state guard). POST /render response now includes queuePosition.
+- NEW PRODUCT FEATURE — BatchRender (src/components/clip-studio/batch-render.tsx, wired in page.tsx Render tab, above RenderHistory, shown when phase==='done'): renders EVERY approved clip sequentially from the server source. Per approved clip: reconstructs the EditPlan from persisted clip fields (same mapping as openPlanView), builds the renderer recipe JSON, POSTs {recipe, projectId} (server-source mode — zero uploads), polls to terminal, then proceeds. Honest handling: approved clips WITHOUT a stored AI plan are listed "NEEDS PLAN" and skipped (with a jump-to-studio button) — the renderer requires a recipe; nothing is invented. Stop button cancels the live job (POST /jobs/:id/cancel) + marks the rest skipped. Per-clip live % + done/failed/skipped states, error detail lines, prerequisite notice when no server source.
+  - Design choice: sequential client-side loop (not firing all POSTs) so only ONE full source-file stream is in flight at a time (the renderer queue holds the accepted File until processed — N queued 1.5GB uploads would be a memory hazard).
+- STYLING POLISH: BatchRender card matches the established language (gradient hairline, icon tile header, "working" ping badge); VLM critique round → fixed ragged right-edge alignment with fixed-width status column (min-w-[70px]) + w-9 tabular duration column; "✓ in history" → icon+"rendered" chip.
+- VERIFICATION (all real, in-browser):
+  • URL → Auto-Clip (5 clips) → Approve all (5/5) → AI plans on 2 clips → Render tab: batch card shows "2 approved clips ready · 3 need AI plan" (honest per-clip chips).
+  • Batch run: 2× 45s clips rendered sequentially in 189s total; per-job wall time measured from the renderer: 73.8s and 85.6s for 45s outputs (PREVIOUSLY ~4-5min for ONE 45s clip → ~3.4x speedup confirmed in production path).
+  • Both outputs in Render History with live facts (45.0s/27.6MB, 45.2s/29.1MB); download verified HTTP 200 h264 1080x1920.
+  • History persists across page reloads (server-side session ownership). Unit 334/334 · golden E2E 25/25 · render-security E2E 26/26 — ALL PASS against the optimized filter graph (duration accuracy, codecs, dimensions, cover-frame 9:16 all asserted). bun run lint PASS. No console errors.
+
+Stage Summary:
+- Render performance: ~3.4x faster real renders (74-86s per 45s clip, was ~4-5min) via crop-first 9:16 framing + veryfast preset; serial queue protects CPU from concurrent renders.
+- New feature: Batch render of all approved clips with honest plan-gap labeling, live per-clip progress, stop support, and history integration.
+- Renderer mini-service now has a real job queue (POST /render returns queuePosition; stage shows queue position).
+- Unresolved risks / next-round priorities: (1) renderer queue holds accepted Files in memory until processed — fine at current caps, but a disk-backed queue would harden large-source batch runs; (2) toast-on-completion still only fires while the Render tab is mounted (lift RenderHistory's poller to page level if cross-tab toasts are wanted); (3) artifact retention still ~10 min LRU — server-side persistence of finished MP4s (e.g. copy into upload/renders + DB path) remains the top product gap; (4) consider exposing queue depth in the render UI (nice-to-have).
