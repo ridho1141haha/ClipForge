@@ -83,9 +83,19 @@ export function extractYouTubeId(url: string): string | null {
 const YTDLP_TIMEOUT_MS = 25_000
 
 function findYtDlp(): string | null {
-  if (existsSync('/home/z/.venv/bin/yt-dlp')) return '/home/z/.venv/bin/yt-dlp'
-  if (existsSync('/usr/local/bin/yt-dlp')) return '/usr/local/bin/yt-dlp'
-  if (existsSync('/usr/bin/yt-dlp')) return '/usr/bin/yt-dlp'
+  // resolution order: venv → user-local install (pip --user / PEP 668
+  // break-system-packages land in ~/.local/bin) → system paths. A binary
+  // present on disk but missing from the server process's PATH must still be
+  // found (container restarts silently drop PATH additions).
+  const candidates = [
+    '/home/z/.venv/bin/yt-dlp',
+    process.env.HOME ? `${process.env.HOME}/.local/bin/yt-dlp` : '/home/z/.local/bin/yt-dlp',
+    '/usr/local/bin/yt-dlp',
+    '/usr/bin/yt-dlp',
+  ]
+  for (const c of candidates) {
+    try { if (existsSync(c)) return c } catch { /* ignore */ }
+  }
   return null
 }
 
@@ -235,22 +245,60 @@ export function captionTrackTimingQuality(fileName: string, readText: () => stri
   return 0 // vtt has no word timing
 }
 
-/** Minimal VTT → json3-ish converter so downstream parsing stays uniform. */
+/**
+ * Parse one WebVTT timestamp. Valid WebVTT forms:
+ *   HH:MM:SS.mmm   MM:SS.mmm   (also accepts a comma decimal separator)
+ * Returns milliseconds, or null when the string is not a valid timestamp.
+ */
+function parseVttTimestamp(s: string): number | null {
+  const m = s.trim().match(/^(?:(\d+):)?(\d+):(\d+(?:[.,]\d+)?)$/)
+  if (!m) return null
+  const h = m[1] ? Number(m[1]) : 0
+  const min = Number(m[2])
+  const sec = Number(m[3].replace(',', '.'))
+  if (!isFinite(h) || !isFinite(min) || !isFinite(sec)) return null
+  return h * 3600000 + min * 60000 + Math.round(sec * 1000)
+}
+
+/**
+ * Minimal VTT → json3-ish converter so downstream parsing stays uniform.
+ *
+ * ROBUSTNESS: accepts both HH:MM:SS.mmm and MM:SS.mmm cue timings, ignores
+ * cue settings (align/position/line), joins multiline cue text, strips
+ * HTML-like cue markup (including inline `<00:00:01.000>` timestamps), and
+ * skips NOTE/STYLE/REGION blocks, malformed cues, and empty cues safely.
+ *
+ * TIMING HONESTY: a VTT cue carries ONE segment timestamp — never per-word
+ * timing. The output keeps a single multi-word seg per cue WITHOUT word
+ * offsets; parseJson3 distributes it as ESTIMATED word timing (never fake
+ * "measured" word data).
+ */
 function vttToJson3(vtt: string): unknown {
   const events: { tStartMs: number; dDurationMs: number; segs: { utf8: string }[] }[] = []
   const blocks = vtt.split(/\r?\n\r?\n/)
   for (const block of blocks) {
-    const lines = block.split(/\r?\n/).filter((l) => l.trim() && !l.startsWith('WEBVTT') && !l.includes('-->') === false ? l.trim() : l.trim())
-    const cue = lines.find((l) => l.includes('-->'))
-    if (!cue) continue
-    const m = cue.match(/(\d+):(\d+):(\d+)\.(\d+)\s*-->\s*(\d+):(\d+):(\d+)\.(\d+)/)
-    if (!m) continue
-    const start = (+m[1]) * 3600000 + (+m[2]) * 60000 + (+m[3]) * 1000 + (+m[4])
-    const end = (+m[5]) * 3600000 + (+m[6]) * 60000 + (+m[7]) * 1000 + (+m[8])
-    const idx = lines.indexOf(cue)
-    const text = lines.slice(idx + 1).join(' ').replace(/<[^>]+>/g, '').trim()
-    if (!text) continue
-    events.push({ tStartMs: start, dDurationMs: Math.max(1, end - start), segs: [{ utf8: text }] })
+    const lines = block.split(/\r?\n/).map((l) => l.trim()).filter(Boolean)
+    if (lines.length === 0) continue // empty block
+    if (/^(WEBVTT|NOTE|STYLE|REGION)/.test(lines[0]) && !lines[0].includes('-->')) {
+      lines.shift() // header/comment block marker (cue id may still follow)
+    }
+    const cueIdx = lines.findIndex((l) => l.includes('-->'))
+    if (cueIdx === -1) continue // malformed / comment-only block → skip
+    const cue = lines[cueIdx]
+    const tm = cue.match(/([0-9:.,]+)\s*-->\s*([0-9:.,]+)/)
+    if (!tm) continue
+    const start = parseVttTimestamp(tm[1])
+    const end = parseVttTimestamp(tm[2])
+    if (start === null || end === null || end <= start) continue // malformed cue
+    // cue text: everything after the cue line (multiline cues joined)
+    const text = lines
+      .slice(cueIdx + 1)
+      .join(' ')
+      .replace(/<[^>]+>/g, '') // strip markup + inline timestamps
+      .replace(/&nbsp;/g, ' ')
+      .trim()
+    if (!text) continue // empty cue → skip
+    events.push({ tStartMs: start, dDurationMs: end - start, segs: [{ utf8: text }] })
   }
   return { events }
 }
@@ -258,8 +306,12 @@ function vttToJson3(vtt: string): unknown {
 /**
  * Minimal srv3 (XML timedtext) → json3-ish converter.
  * <p t="start" d="dur"><s ac-as="offset"|t="offset">word</s>...</p>
- * When <s> word offsets exist they are preserved (measured word timing);
- * when absent, parseJson3 falls back to even distribution (estimated).
+ *
+ * TIMING HONESTY: a word offset is carried through ONLY when the source
+ * actually supplies one. A missing offset stays ABSENT (undefined) — it must
+ * NEVER become 0, because downstream code interprets a numeric offset as REAL
+ * measured timing (0 would pin a word to the segment start and poison the
+ * 'measured' provenance label).
  */
 function srv3ToJson3(xml: string): unknown {
   const events: { tStartMs: number; dDurationMs: number; segs: { utf8: string; tOffsetMs?: number }[] }[] = []
@@ -277,10 +329,10 @@ function srv3ToJson3(xml: string): unknown {
       foundS = true
       const attrs = sm[1] ?? ''
       const offM = attrs.match(/\bac-as="(\d+)"/) ?? attrs.match(/\bt="(\d+)"/)
-      const off = offM ? Number(offM[1]) : 0
+      const off = offM ? Number(offM[1]) : NaN
       const text = sm[2].replace(/<[^>]+>/g, '')
       if (!text.trim()) continue
-      segs.push({ utf8: text, tOffsetMs: isFinite(off) ? off : undefined })
+      segs.push({ utf8: text, tOffsetMs: typeof off === 'number' && isFinite(off) ? off : undefined })
     }
     if (!foundS) {
       const text = inner.replace(/<[^>]+>/g, '').trim()
@@ -437,12 +489,31 @@ interface Json3Event { tStartMs: number; dDurationMs?: number; segs?: { utf8: st
  * and that is explicitly labeled 'estimated', never treated as true word
  * timestamps downstream.
  */
+/**
+ * DEFINITION OF "MEASURED" (binding for all downstream provenance labels):
+ *
+ *   A word is MEASURED only when the source actually supplied timing that
+ *   identifies the timing of that specific spoken token — i.e. the word was
+ *   ALONE in its caption segment and that segment carried a real offset.
+ *
+ * Consequences (never violated below):
+ *   - A missing word offset stays ABSENT — it is never coerced to 0.
+ *   - A segment holding MULTIPLE words with one timestamp ("I love this
+ *     technology" @ 10.0–12.0) does NOT give all four words independent
+ *     measured timing. Only the group's start is real; the intra-group word
+ *     boundaries are distributed → ESTIMATED.
+ *   - A segment WITHOUT an offset inside a partially-measured event is
+ *     interpolated in the gap between its measured neighbours → ESTIMATED
+ *     (its measured neighbours keep their real times — real data is never
+ *     thrown away just because a sibling segment lacks offsets).
+ *   - The track label is computed PER WORD: ≥80% measured → 'measured',
+ *     20–80% → 'mixed', otherwise 'estimated'.
+ */
 function parseJson3(json3: unknown): { words: WordTimestamp[]; text: string; wordTiming: 'measured' | 'estimated' | 'mixed' } {
   const words: WordTimestamp[] = []
-  const lines: string[] = []
   const events = (json3 as { events?: Json3Event[] })?.events ?? []
-  let measuredSegs = 0
-  let totalSegs = 0
+  let measuredWords = 0
+  let totalWords = 0
 
   const round2 = (n: number) => Math.round(n * 100) / 100
 
@@ -451,7 +522,7 @@ function parseJson3(json3: unknown): { words: WordTimestamp[]; text: string; wor
     const eventStartMs = ev.tStartMs ?? 0
     const eventEndMs = eventStartMs + (ev.dDurationMs ?? 0)
 
-    // collect usable segments first
+    // collect usable segments in speech order
     const usable: { text: string; offsetMs: number | null }[] = []
     for (const seg of ev.segs) {
       const raw = (seg.utf8 ?? '').replace(/\n/g, ' ').trim()
@@ -460,51 +531,65 @@ function parseJson3(json3: unknown): { words: WordTimestamp[]; text: string; wor
     }
     if (usable.length === 0) continue
 
-    for (const u of usable) {
-      totalSegs++
-      if (u.offsetMs !== null) measuredSegs++
+    // flat word list with per-word anchor eligibility
+    type FlatWord = { word: string; segIdx: number; first: boolean; sole: boolean }
+    const flat: FlatWord[] = []
+    for (let i = 0; i < usable.length; i++) {
+      const parts = usable[i].text.split(/\s+/).filter(Boolean)
+      for (let j = 0; j < parts.length; j++) {
+        flat.push({ word: parts[j], segIdx: i, first: j === 0, sole: parts.length === 1 })
+      }
+    }
+    if (flat.length === 0) continue
+
+    // estimated slice width (window evenly divided; 80ms readability floor)
+    const n = flat.length
+    const winDurS = ev.dDurationMs && ev.dDurationMs > 0 ? ev.dDurationMs / 1000 : n * 0.24
+    const per = Math.max(0.08, winDurS / n)
+
+    // STARTS: an anchored seg's FIRST word takes the REAL anchor time (the
+    // source identifies the group's start); every other word steps by the
+    // estimated slice. Anchors are clamped only for monotonicity (a word can
+    // never start before its predecessor + 80ms) — real anchors are never
+    // moved by estimated slices unless the source data itself is malformed.
+    const starts: number[] = []
+    let prevStart = -Infinity
+    let cursor = eventStartMs / 1000
+    for (let i = 0; i < n; i++) {
+      const f = flat[i]
+      let s: number
+      if (f.first && usable[f.segIdx].offsetMs !== null) {
+        const anchor = (eventStartMs + (usable[f.segIdx].offsetMs as number)) / 1000
+        s = Math.max(anchor, Number.isFinite(prevStart) ? prevStart + 0.08 : anchor)
+      } else {
+        s = Math.max(cursor, Number.isFinite(prevStart) ? prevStart + 0.08 : cursor)
+      }
+      starts.push(s)
+      prevStart = s
+      cursor = s + per
     }
 
-    const allMeasured = usable.every((u) => u.offsetMs !== null)
-
-    if (allMeasured) {
-      // REAL word-level timing: start = eventStart + offset; end = next word's
-      // start (or event end for the last word). No estimation involved.
-      const starts = usable.map((u) => (eventStartMs + (u.offsetMs as number)) / 1000)
-      for (let i = 0; i < usable.length; i++) {
-        const start = starts[i]
-        const nextInEvent = i + 1 < usable.length ? starts[i + 1] : eventEndMs / 1000
-        // end must never precede start; keep a floor of 80ms for readability
-        const end = Math.max(start + 0.08, nextInEvent > start ? nextInEvent : start + 0.08)
-        for (const w of usable[i].text.split(/\s+/)) {
-          if (w) words.push({ word: w, start: round2(start), end: round2(end) })
-        }
-      }
-    } else {
-      // ESTIMATED: distribute the segment/event window evenly across words.
-      // A segment without its own offset shares the whole event duration
-      // proportionally with its siblings by word count.
-      const totalWords = usable.reduce((acc, u) => acc + u.text.split(/\s+/).filter(Boolean).length, 0)
-      const winStart = eventStartMs / 1000
-      const winDur = Math.max(usable.length * 0.08, (ev.dDurationMs ?? totalWords * 240) / 1000)
-      const per = Math.max(0.08, winDur / Math.max(1, totalWords))
-      let cursor = winStart
-      for (const u of usable) {
-        const parts = u.text.split(/\s+/).filter(Boolean)
-        for (const p of parts) {
-          words.push({ word: p, start: round2(cursor), end: round2(cursor + per) })
-          cursor += per
-        }
-      }
+    // ENDS: chain to the next word's start; the last word of the event ends at
+    // the event boundary (both boundaries are source-supplied for measured
+    // chains; estimated words inherit the same chaining for consistency)
+    for (let i = 0; i < n; i++) {
+      const next = i + 1 < n ? starts[i + 1] : Math.max(eventEndMs / 1000, starts[i] + 0.08)
+      const end = Math.max(starts[i] + 0.08, next > starts[i] ? next : starts[i] + 0.08)
+      words.push({ word: flat[i].word, start: round2(starts[i]), end: round2(end) })
+      totalWords++
+      const f = flat[i]
+      // MEASURED: the source identified THIS token's timing (sole word of a
+      // segment with a real offset). Multi-word segments contribute only an
+      // estimated grid even when their group start is real.
+      if (f.sole && f.first && usable[f.segIdx].offsetMs !== null) measuredWords++
     }
   }
 
-  // provenance: ≥80% measured segments → 'measured'; 20–80% → 'mixed';
-  // below → 'estimated' (honest labeling all the way down)
-  const measuredRatio = totalSegs > 0 ? measuredSegs / totalSegs : 0
+  // provenance is computed PER WORD (see the definition above this function)
+  const measuredRatio = totalWords > 0 ? measuredWords / totalWords : 0
   const wordTiming: 'measured' | 'estimated' | 'mixed' =
     measuredRatio >= 0.8 ? 'measured' : measuredRatio >= 0.2 ? 'mixed' : 'estimated'
-  return { words, text: lines.length > 0 ? lines.join('\n') : words.map((w) => w.word).join(' '), wordTiming }
+  return { words, text: words.map((w) => w.word).join(' '), wordTiming }
 }
 
 /**

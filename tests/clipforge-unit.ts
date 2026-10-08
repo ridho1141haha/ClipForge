@@ -204,6 +204,21 @@ console.log('\n== Phase 7: context validation (PASS/EXTEND/REJECT) ==')
   // no words
   const cc3 = checkContext({ clipStart: 0, clipEnd: 10, minLen: 5, maxLen: 60, words: [], duration: 30 })
   assert(cc3.status === 'UNKNOWN' && cc3.contextRisk, 'no transcript → UNKNOWN + risk (never fake PASS)')
+
+  // CONTEXT COMPLETENESS: back-references to unseen content ("earlier", "as I
+  // said earlier", "remember when") can never stand alone → must be flagged
+  const s3 = 'earlier in the show we talked about how the whole industry changed its mind .'
+  const wordsBackRef: { word: string; start: number; end: number }[] = []
+  s3.split(' ').forEach((w, i) => wordsBackRef.push({ word: w, start: 60 + i * 0.5, end: 60 + i * 0.5 + 0.45 }))
+  const br = checkContext({ clipStart: 60, clipEnd: 68, minLen: 5, maxLen: 60, words: wordsBackRef, duration: 120 })
+  assert(br.status === 'EXTEND' || br.contextRisk, 'back-reference opener ("earlier…") → EXTEND or risk-flagged', `status=${br.status} risk=${br.contextRisk}`)
+  const br2 = checkContext({ clipStart: 30, clipEnd: 38, minLen: 5, maxLen: 60, words: [
+    { word: 'as', start: 30, end: 30.4 }, { word: 'you', start: 30.5, end: 30.8 },
+    { word: 'know', start: 30.9, end: 31.3 }, { word: 'nobody', start: 31.4, end: 31.9 },
+    { word: 'expected', start: 32.0, end: 32.6 }, { word: 'that', start: 32.7, end: 33.0 },
+    { word: 'outcome', start: 33.1, end: 33.6 }, { word: '.', start: 33.7, end: 33.8 },
+  ], duration: 120 })
+  assert(br2.status === 'EXTEND' || br2.contextRisk, 'back-reference opener ("as you know") detected', `status=${br2.status} risk=${br2.contextRisk}`)
 }
 
 // ---------------------------------------------------------------------------
@@ -799,6 +814,172 @@ console.log('\n== Usage soft limits: daily caps ==')
   assert(Number(h['Retry-After']) > 0, 'Retry-After positive when blocked')
   const hOpen = limitHeaders(e3)
   assert(hOpen['X-RateLimit-Limit'] === undefined, 'unlimited → no limit header')
+}
+
+
+// ---------------------------------------------------------------------------
+// ROUND: transcript timing honesty — missing offsets never become 0/false-
+// measured; multi-word segments never claim independent word timing
+// ---------------------------------------------------------------------------
+console.log('\n== TIMING HONESTY: missing offset ≠ 0, multi-word seg ≠ measured words ==')
+{
+  const { parseJson3, srv3ToJson3 } = (await import('../src/lib/media')).__testHelpers
+
+  // srv3: a seg WITHOUT an offset attribute must stay ABSENT — never become 0
+  // (a numeric 0 would be read downstream as "measured at segment start")
+  const srv3Mixed = `<timedtext><body>
+    <p t="10000" d="2000"><s ac-as="0">alpha</s><s>beta gamma</s><s ac-as="1500">delta</s></p>
+  </body></timedtext>`
+  const conv = srv3ToJson3(srv3Mixed) as { events: { segs: { utf8: string; tOffsetMs?: number }[] }[] }
+  const segs = conv.events[0].segs
+  assert(segs[0].tOffsetMs === 0, 'real offset 0 preserved (measured)')
+  assert(!('tOffsetMs' in segs[1]) || segs[1].tOffsetMs === undefined, 'missing offset stays ABSENT (never coerced to 0)', JSON.stringify(segs[1]))
+  assert(segs[2].tOffsetMs === 1500, 'later real offset preserved')
+
+  // multi-word seg with ONE timestamp: "beta gamma" is NOT independently
+  // measured — words interpolate inside the seg window and count estimated
+  const p = parseJson3(conv)
+  assert(p.words.length === 4, 'all words emitted', `got ${p.words.length}`)
+  const beta = p.words.find((w) => w.word === 'beta')!
+  const gamma = p.words.find((w) => w.word === 'gamma')!
+  assert(eq(beta.start, 10.9) || (beta.start >= 10.0 && beta.start <= 11.5), 'multi-word seg words interpolate within window', JSON.stringify(beta))
+  assert(gamma.start > beta.start, 'multi-word seg words are sequential (not pinned to the same instant)')
+  // provenance: alpha+delta measured (2/4 = 50%) → mixed, never 'measured'
+  assert(p.wordTiming === 'mixed', '2/4 measured words → mixed (per-word honesty)', p.wordTiming)
+
+  // a single multi-word seg with one offset → NO measured words at all
+  const soloMulti = parseJson3(srv3ToJson3('<timedtext><body><p t="10000" d="2000"><s>I love this technology</s></p></body></timedtext>'))
+  assert(soloMulti.wordTiming === 'estimated', 'one multi-word seg with one timestamp → estimated (never measured)', soloMulti.wordTiming)
+  assert(eq(soloMulti.words[0].start, 10.0), 'group start anchor preserved for first word', JSON.stringify(soloMulti.words[0]))
+  assert(soloMulti.words[3].start > soloMulti.words[0].start, 'words distributed inside the seg window')
+
+  // unmeasured seg between measured anchors: neighbours keep REAL times,
+  // gap seg is interpolated, everything stays monotonic
+  const gap = parseJson3({
+    events: [{ tStartMs: 20000, dDurationMs: 2000, segs: [
+      { utf8: 'one', tOffsetMs: 0 },      // 20.0 measured
+      { utf8: 'two three' },              // unmeasured → gap interpolation
+      { utf8: 'four', tOffsetMs: 1800 },  // 21.8 measured
+    ] }],
+  })
+  const w1 = gap.words.find((w) => w.word === 'one')!
+  const w4 = gap.words.find((w) => w.word === 'four')!
+  assert(eq(w1.start, 20.0), 'measured neighbour keeps real start', JSON.stringify(w1))
+  assert(eq(w4.start, 21.8), 'later measured neighbour keeps real start (gap does not discard real data)', JSON.stringify(w4))
+  const two = gap.words.find((w) => w.word === 'two')!
+  const three = gap.words.find((w) => w.word === 'three')!
+  assert(two.start > 20.0 && three.start > two.start && three.start < 21.8, 'gap words interpolated between anchors, monotonic', JSON.stringify([two, three]))
+}
+
+// ---------------------------------------------------------------------------
+// ROUND: VTT robustness — timestamps, settings, markup, malformed cues
+// ---------------------------------------------------------------------------
+console.log('\n== VTT robustness: MM:SS.mmm, settings, multiline, markup, malformed ==')
+{
+  const { vttToJson3, parseJson3 } = (await import('../src/lib/media')).__testHelpers
+
+  // MM:SS.mmm (valid WebVTT, previously UNPARSED → cues silently dropped)
+  const mmss = vttToJson3('WEBVTT\n\n1\n00:05.000 --> 00:07.500\nshort form cue') as { events: { tStartMs: number; dDurationMs: number }[] }
+  assert(mmss.events.length === 1, 'MM:SS.mmm cue parsed', JSON.stringify(mmss.events))
+  assert(eq(mmss.events[0].tStartMs, 5000) && eq(mmss.events[0].dDurationMs, 2500), 'MM:SS.mmm times correct', JSON.stringify(mmss.events[0]))
+
+  // HH:MM:SS.mmm + cue settings after the arrow are ignored
+  const settings = vttToJson3('WEBVTT\n\n00:00:10.000 --> 00:00:12.000 align:start position:10%\nwith settings') as { events: { tStartMs: number }[] }
+  assert(settings.events.length === 1 && eq(settings.events[0].tStartMs, 10000), 'cue settings ignored', JSON.stringify(settings.events))
+
+  // multiline cue text joined; HTML-like markup AND inline timestamps stripped
+  const rich = vttToJson3('WEBVTT\n\n00:01.000 --> 00:04.000\n<v Speaker>hello<00:02.000>\nworld line two') as { events: { segs: { utf8: string }[] }[] }
+  assert(rich.events.length === 1, 'multiline cue kept')
+  const txt = rich.events[0].segs[0].utf8
+  assert(txt === 'hello world line two', 'markup + inline timestamps stripped, lines joined', txt)
+
+  // NOTE block, malformed cue, empty cue, end<=start → all safely skipped
+  const messy = vttToJson3('WEBVTT\n\nNOTE this is a comment block\nspanning lines\n\nnot a valid cue line\njust text\n\n\n00:20.000 --> 00:10.000\nreversed times\n\n00:30.000 --> 00:31.000\n') as { events: unknown[] }
+  assert(messy.events.length === 0, 'NOTE/malformed/reversed/empty cues all skipped', JSON.stringify(messy.events))
+
+  // VTT-derived words remain ESTIMATED (segment timing, never fake word data)
+  const est = parseJson3(vttToJson3('WEBVTT\n\n00:00:30.000 --> 00:00:32.000\na b c d'))
+  assert(est.wordTiming === 'estimated', 'VTT fallback stays estimated', est.wordTiming)
+  assert(eq(est.words[0].start, 30.0) && eq(est.words[3].end, 32.0), 'estimated words span the cue window')
+}
+
+// ---------------------------------------------------------------------------
+// ROUND: long-video retrieval — full-timeline markers, no head bias, stride
+// ---------------------------------------------------------------------------
+console.log('\n== LONG-VIDEO retrieval: markers at 5%/50%/95%, strided budget, determinism ==')
+{
+  const { buildTimestampedTranscript } = await import('../src/lib/transcript-window')
+
+  // synthetic 60-minute video: 1 word per 400ms → 9000 words
+  const words60: { word: string; start: number; end: number }[] = []
+  for (let i = 0; i < 9000; i++) {
+    const s = i * 0.4
+    words60.push({ word: `w${i}`, start: s, end: s + 0.4 })
+  }
+  const marked = buildTimestampedTranscript(words60.map((w) => w.word).join(' '), words60)
+  assert(marked.coverage === 'full' && !marked.truncated, '60-min transcript fits budget → full coverage', `${marked.text.length} chars`)
+  assert(marked.markers >= 200, 'marker every 40 words across the whole video', String(marked.markers))
+  // markers must exist near the BEGINNING, MIDDLE, and END (no early bias)
+  const midMarker = marked.text.includes('[29:') || marked.text.includes('[30:')
+  const endMarker = marked.text.includes('[56:') || marked.text.includes('[57:') || marked.text.includes('[58:') || marked.text.includes('[59:')
+  assert(marked.text.indexOf('[') !== -1 && marked.text.indexOf('[') < 300, 'marker near the beginning present')
+  assert(midMarker, 'marker near the MIDDLE present (~30min)')
+  assert(endMarker, 'marker near the END present (~59min)')
+  // no head bias: markers are roughly evenly spaced by construction
+  const markerPositions = [...marked.text.matchAll(/\[(\d+):(\d{2})\]/g)].map((m) => Number(m[1]) * 60 + Number(m[2]))
+  assert(markerPositions.length === marked.markers, 'all markers accounted for')
+  const first = markerPositions[0]
+  const last = markerPositions[markerPositions.length - 1]
+  assert(last > 3500, 'last marker lands in the final minutes', String(last))
+  assert(first < 30, 'first marker lands in the first half-minute', String(first))
+
+  // over-budget (3-hour ≈ 270k chars) → deterministic stride across timeline
+  const words180: { word: string; start: number; end: number }[] = []
+  for (let i = 0; i < 27000; i++) {
+    const s = i * 0.4
+    words180.push({ word: `t${i}`, start: s, end: s + 0.4 })
+  }
+  const long = buildTimestampedTranscript(words180.map((w) => w.word).join(' '), words180)
+  assert(long.truncated && long.coverage === 'strided', '3-hour transcript → strided', long.coverage)
+  assert(long.text.length <= 80_000 + 5000, 'strided text respects the budget', String(long.text.length))
+  assert(long.text.includes('elided for length'), 'elision gaps are explicit')
+  assert(long.text.startsWith('t0 '), 'strided output still begins at the actual start')
+  assert(long.text.endsWith('t26999'), 'strided output still includes the actual end (no head bias)', long.text.slice(-40))
+  const again = buildTimestampedTranscript(words180.map((w) => w.word).join(' '), words180)
+  assert(again.text === long.text, 'stride is deterministic (same input → same output)')
+
+  // no word timing: text-only passthrough under budget, strided over budget
+  const plain = buildTimestampedTranscript('hello world', [])
+  assert(plain.markers === 0 && plain.coverage === 'full', 'no words → no fabricated markers')
+  const bigPlain = buildTimestampedTranscript(Array.from({ length: 30000 }, (_, i) => `x${i}`).join(' '), [])
+  assert(bigPlain.truncated && bigPlain.text.includes('elided'), 'text-only over budget → honest stride')
+}
+
+// ---------------------------------------------------------------------------
+// ROUND: memory-safety + renderer boundary (structural scans of the REAL
+// sources — cheap, deterministic; the E2E suites verify behavior live)
+// ---------------------------------------------------------------------------
+console.log('\n== MEMORY SAFETY: no body/blob buffering; renderer loopback + streaming ==')
+{
+  const { readFileSync: rf } = await import('node:fs')
+  const proxy = rf('src/app/api/render-proxy/[...path]/route.ts', 'utf-8')
+  assert(!proxy.includes('= await req.blob('), 'proxy never materializes uploads via req.blob()')
+  assert(!proxy.includes('= await req.arrayBuffer('), 'proxy never materializes uploads via req.arrayBuffer()')
+  assert(proxy.includes('byteCappedStream'), 'upload stream is byte-capped (chunked uploads enforced)')
+  assert(proxy.includes("payloadTooLarge = true") && proxy.includes("status: 413"), 'cap trip → honest 413')
+  // download/cover MUST stream (upstream.body passthrough), polls stay buffered
+  assert(proxy.includes('binaryArtifact') && proxy.includes('new NextResponse(upstream.body'), 'MP4/cover download streams through (no arrayBuffer)')
+  const getSection = proxy.slice(proxy.indexOf('export async function GET'))
+  assert(getSection.includes('binaryArtifact') && getSection.includes('new NextResponse(upstream.body'), 'GET download streams upstream.body')
+  const dlSection = getSection.slice(getSection.indexOf('const binaryArtifact'), getSection.indexOf('const respBody = await upstream.arrayBuffer()'))
+  assert(dlSection.includes('content-disposition'), 'download passthrough preserves Content-Disposition')
+
+  const renderer = rf('mini-services/ffmpeg-renderer/index.ts', 'utf-8')
+  assert(renderer.includes("hostname: '127.0.0.1'"), 'renderer explicitly bound to loopback (never 0.0.0.0 by default)')
+  assert(!renderer.includes('readFileSync'), 'renderer never readFileSync()es artifacts (streamed via Bun.file)')
+  assert(renderer.includes('Bun.file(outPath)'), 'MP4 download streams from disk')
+  assert(renderer.includes("if (!transition(job, 'done')) return"), 'finalization guard: cancelled job can never be finalized as done')
+  assert(renderer.includes('} finally {'), 'cleanup scheduled for EVERY terminal outcome (no cancelled-job disk leak)')
 }
 
 console.log(`\n════════════════════════════════`)

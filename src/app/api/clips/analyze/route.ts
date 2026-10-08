@@ -4,6 +4,7 @@ import { db } from '@/lib/db'
 import { getOrCreateSessionId } from '@/lib/session'
 import { STYLE_PRESETS } from '@/lib/editplan'
 import { extractYouTubeId, resolveYoutubeTranscript } from '@/lib/media'
+import { buildTimestampedTranscript, TRANSCRIPT_MARKER_EVERY_WORDS } from '@/lib/transcript-window'
 import { recordUsage } from '@/lib/usage'
 import { checkDailyUsageLimit, limitHeaders, limitReachedMessage } from '@/lib/usage-limits'
 import {
@@ -29,8 +30,8 @@ export const dynamic = 'force-dynamic'
 export const runtime = 'nodejs'
 export const maxDuration = 300
 
-const PROMPT_VERSION = 'analyze-v3-grounded'
-const ANALYSIS_VERSION = '2026.02-transcript-grounded'
+const PROMPT_VERSION = 'analyze-v4-fullspan'
+const ANALYSIS_VERSION = '2026.02-fullspan-retrieval'
 
 interface WordInput { word: string; start: number; end: number }
 
@@ -281,14 +282,23 @@ export async function POST(req: NextRequest) {
     // ---------- LLM call ----------
     const zai = await ZAI.create()
 
-    // transcript section with timestamps for grounding
+    // LONG-VIDEO RETRIEVAL: full-timeline [mm:ss] markers (constant token cost)
+    // replace the old first-400-words sample that made every 30min+ video
+    // groundable only in its opening minutes. Over-budget transcripts are
+    // deterministically strided across the whole timeline with honest elision
+    // markers. Server-side grounding (processCandidate) still validates every
+    // candidate against the FULL word array — the prompt is discovery input;
+    // the server remains the authority.
     let transcriptSection: string
     if (hasTranscript) {
-      const wordsSample = words.length > 0
-        ? `\nWORD-LEVEL TIMESTAMPS (first ${Math.min(400, words.length)} words — use these to place candidate windows):\n` +
-          words.slice(0, 400).map((w) => `[${w.start.toFixed(1)}-${w.end.toFixed(1)}] ${w.word}`).join(' ')
+      const marked = buildTimestampedTranscript(transcript, words)
+      const markerNote = words.length > 0
+        ? `\nTimestamps like [12:34] appear every ~${TRANSCRIPT_MARKER_EVERY_WORDS} words across the WHOLE video — use them to place candidate windows anywhere in the timeline (beginning, middle, AND end).`
         : ''
-      transcriptSection = `\n\nVIDEO TRANSCRIPT (REAL SOURCE CONTENT — every decision MUST come from this):\n"""\n${transcript.slice(0, 24_000)}\n"""${wordsSample}\n\nCRITICAL: spoken_hook MUST be a word-for-word quote from this transcript inside the candidate window. Timestamps must match transcript positions. If evidence is insufficient for ${clipCount} strong clips, return fewer.`
+      const elisionNote = marked.truncated
+        ? `\nSome transcript blocks are elided for length and marked with […] gaps. NEVER quote across a gap; candidates must come from the shown content only.`
+        : ''
+      transcriptSection = `\n\nVIDEO TRANSCRIPT (REAL SOURCE CONTENT — every decision MUST come from this):\n"""\n${marked.text}\n"""${markerNote}${elisionNote}\n\nCRITICAL: spoken_hook MUST be a word-for-word quote from this transcript inside the candidate window. Timestamps must match transcript positions. If evidence is insufficient for ${clipCount} strong clips, return fewer.`
     } else {
       transcriptSection = `\n\nNOTE: NO transcript is available. You have NO access to the actual content. Set "spoken_hook" to "" for every candidate and set "context_risk": true on every candidate. Do NOT fabricate quotes. Do NOT pretend to know the content.`
     }

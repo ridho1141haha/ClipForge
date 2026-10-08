@@ -2,9 +2,23 @@
 // Accepts multipart upload: video file + JSON recipe
 // Renders MP4 with cuts, subtitle burn-in, camera zoom via ffmpeg
 // Exposes: POST /render (start job), GET /jobs/:id (poll status), GET /jobs/:id/stream (SSE), GET /jobs/:id/download
+//
+// ─── NETWORK BOUNDARY (security invariant) ──────────────────────────────────
+// This service is INTERNAL and TRUSTED. It performs NO authorization of its
+// own — ownership is enforced by the Next.js proxy (render-proxy route),
+// which is the ONLY supported client:
+//
+//   Browser → Next.js authorization (session + RenderJob ownership) →
+//   localhost renderer (127.0.0.1:3003) → FFmpeg
+//
+// The server is explicitly bound to 127.0.0.1 (Bun's documented default is
+// 0.0.0.0, which would expose /render + job endpoints to the network).
+// Never bind it to a public interface without adding internal auth first.
+// If a deployment ever needs a remote renderer, add explicit shared-secret
+// auth on BOTH sides and document the architecture in SECURITY.md.
 
 import { serve } from 'bun'
-import { existsSync, mkdirSync, rmSync, writeFileSync, readFileSync, statSync } from 'node:fs'
+import { existsSync, mkdirSync, rmSync, writeFileSync, statSync } from 'node:fs'
 import { join } from 'node:path'
 import { spawn } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
@@ -247,8 +261,10 @@ function publicJob(job: RenderJob) {
 async function processJob(jobId: string, file: File, recipe: ValidatedRecipe) {
   const job = jobs.get(jobId)!
   const jobStart = Date.now()
+  // job dir lives in the OUTER scope so the finally-cleanup covers every
+  // terminal outcome (success / error / cancel / early return)
+  const jobDir = join(WORKDIR, jobId)
   try {
-    const jobDir = join(WORKDIR, jobId)
     mkdirSync(jobDir, { recursive: true })
     const inputPath = join(jobDir, 'input' + (file.name.match(/\.[a-z0-9]+$/)?.[0] ?? '.mp4'))
     // Bun.write streams the Blob to disk without materializing it a second time
@@ -402,19 +418,16 @@ async function processJob(jobId: string, file: File, recipe: ValidatedRecipe) {
     }
 
     stageTiming(job, 'finalize', finalizeStart)
-    transition(job, 'done')
+    // CANCELLATION INVARIANT: a job cancelled during finalization (probe / cover
+    // extraction) must NEVER be finalized as done. transition() refuses the
+    // cancelled → done edge — and when it refuses we return WITHOUT touching
+    // stage/progress (no "Render complete", no progress=100, no broadcast).
+    if (!transition(job, 'done')) return // cancelled mid-finalize → terminal state stands
     job.stage = 'Render complete'
     job.progress = 100
     job.finishedAt = Date.now()
     broadcast(job)
     console.log(`[${jobId}] done: ${outName} (${job.size} bytes, ${job.duration}s, ${job.width}x${job.height}) total=${((Date.now() - jobStart) / 1000).toFixed(1)}s`)
-
-    // schedule cleanup of the output after 10 minutes
-    setTimeout(() => {
-      try { rmSync(outPath) } catch {}
-      try { rmSync(jobDir, { recursive: true }) } catch {}
-      jobs.delete(jobId)
-    }, 600000)
   } catch (e: any) {
     if (job.status === 'cancelled') return // cancellation already broadcast — do not overwrite
     job.status = 'error'
@@ -423,6 +436,16 @@ async function processJob(jobId: string, file: File, recipe: ValidatedRecipe) {
     job.finishedAt = Date.now()
     broadcast(job)
     console.error(`[${jobId}] error:`, job.error)
+  } finally {
+    // CLEANUP FOR EVERY TERMINAL OUTCOME (done / error / cancelled):
+    // the old code only scheduled cleanup on the success path, so a cancelled
+    // or failed job leaked its input (up to 1.5 GB) and its registry entry
+    // forever. The output stays downloadable for the same 10-minute window as
+    // before; after that the job dir and registry entry are gone.
+    setTimeout(() => {
+      try { rmSync(jobDir, { recursive: true, force: true }) } catch {}
+      jobs.delete(jobId)
+    }, 600000)
   }
 }
 
@@ -439,6 +462,9 @@ function cors(res: Response): Response {
 
 serve({
   port: PORT,
+  // SECURITY: explicit loopback bind. Do NOT rely on the implicit default
+  // (0.0.0.0 = all interfaces). Only the local Next.js proxy may reach this.
+  hostname: '127.0.0.1',
   async fetch(req) {
     const url = new URL(req.url)
     // CORS preflight
@@ -546,13 +572,15 @@ serve({
       const jobDir = join(WORKDIR, job.id)
       const outPath = join(jobDir, job.filename!)
       if (!existsSync(outPath)) return cors(json({ error: 'file expired' }, 410))
-      const buf = readFileSync(outPath)
-      const res = new Response(buf, {
+      // MEMORY SAFETY: stream the file from disk (Bun.file is a streaming blob
+      // source) — a 500 MB MP4 must never be materialized in the JS heap.
+      const size = statSync(outPath).size
+      const res = new Response(Bun.file(outPath), {
         status: 200,
         headers: {
           'Content-Type': 'video/mp4',
           'Content-Disposition': `attachment; filename="${job.filename}"`,
-          'Content-Length': String(buf.length),
+          'Content-Length': String(size),
         },
       })
       return cors(res)
@@ -566,14 +594,14 @@ serve({
       if (!job.hasCover) return cors(json({ error: 'no cover was requested for this render' }, 404))
       const coverPath = join(WORKDIR, job.id, 'cover.jpg')
       if (!existsSync(coverPath)) return cors(json({ error: 'file expired' }, 410))
-      const buf = readFileSync(coverPath)
+      const coverSize = statSync(coverPath).size
       const base = sanitize(job.filename?.replace(/\.mp4$/i, '') ?? 'clip')
-      const res = new Response(buf, {
+      const res = new Response(Bun.file(coverPath), {
         status: 200,
         headers: {
           'Content-Type': 'image/jpeg',
           'Content-Disposition': `attachment; filename="cover_${base}.jpg"`,
-          'Content-Length': String(buf.length),
+          'Content-Length': String(coverSize),
           'Cache-Control': 'private, max-age=300',
         },
       })

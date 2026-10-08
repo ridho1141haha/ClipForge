@@ -402,6 +402,11 @@ const DEPENDENT_OPENERS = [
   'which', 'then', 'also', 'even', 'just', 'like i said', 'as i said',
   'anyway', 'however', 'therefore', 'meanwhile', 'jadi', 'tapi', 'karena',
   'makanya', 'terus', 'itu', 'nah', 'dan', 'jadi begini',
+  // back-references to UNSEEN content: a viewer who never watched the original
+  // cannot resolve these (CONTEXT COMPLETENESS — penalized via extension/risk)
+  'earlier', 'as you know', 'as we know', 'like we said', 'like i mentioned',
+  'as i mentioned', 'as we discussed', 'like we discussed', 'remember when',
+  'back then', 'seperti yang kubilang', 'seperti kataku tadi',
 ]
 
 export interface ContextCheckInput {
@@ -447,7 +452,13 @@ export function checkContext(input: ContextCheckInput): ContextCheckResult {
   const prevWord = idxFirst > 0 ? sorted[idxFirst - 1] : null
   const startsClean = clipStart - (prevWord ? prevWord.end : -Infinity) >= 0.5 || idxFirst === 0
   const opener = normalizeText(firstWord.word)
-  const dependentOpen = DEPENDENT_OPENERS.includes(opener)
+  // multi-word openers ("as I said", "like we discussed") must be matched
+  // against the opening PHRASE, not just the first token — the previous
+  // single-token test made every multi-word entry unreachable (dead list).
+  const openerPhrase = normalizeText(inside.slice(0, 3).map((w) => w.word).join(' '))
+  const dependentOpen =
+    DEPENDENT_OPENERS.includes(opener) ||
+    DEPENDENT_OPENERS.some((d) => d.includes(' ') && (openerPhrase === d || openerPhrase.startsWith(d + ' ')))
 
   if (dependentOpen || (!startsClean && clipStart - firstWord.start > 0.4)) {
     // try to extend backwards to previous pause >= 0.6s (or video start)

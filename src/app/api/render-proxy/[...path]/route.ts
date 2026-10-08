@@ -35,6 +35,15 @@ import { checkDailyUsageLimit, limitHeaders, limitReachedMessage } from '@/lib/u
 //      client NEVER sends a path), validates ownership + path containment, and
 //      STREAMS the file into a manually-built multipart body (no 1.5 GB RAM
 //      buffer) — the renderer contract is unchanged.
+//
+// ─── MEMORY SAFETY (both directions) ─────────────────────────────────────────
+//   Upload:  browser → ReadableStream (byte-capped) → this proxy → renderer
+//            The multipart body is NEVER materialized via req.blob()/
+//            req.arrayBuffer(); an 8 MB-capped byte counter enforces the size
+//            limit DURING streaming (also covers chunked uploads that omit
+//            Content-Length, where a declared-length precheck is impossible).
+//   Download: renderer → stream → this proxy → browser. MP4/cover responses
+//            are piped through, never buffered (no 500 MB arrayBuffer()).
 
 const RENDERER_BASE = 'http://localhost:3003'
 
@@ -48,6 +57,30 @@ export const runtime = 'nodejs'
 export const maxDuration = 300
 
 const JOB_PATH_RE = /^\/jobs\/([\w-]+)(\/(stream|download|cover|cancel))?$/
+
+/**
+ * Wrap an incoming request stream with a hard byte cap so chunked uploads
+ * (no Content-Length) cannot exceed the source limit mid-flight. Errors the
+ * stream when the cap is exceeded — the upstream fetch aborts, the renderer's
+ * formData() parse fails, and the caller sees 413 (never an OOM).
+ * onCap fires synchronously at the moment the cap trips (for honest errors).
+ */
+function byteCappedStream(src: ReadableStream<Uint8Array>, maxBytes: number, onCap?: () => void): ReadableStream<Uint8Array> {
+  let total = 0
+  return src.pipeThrough(
+    new TransformStream<Uint8Array, Uint8Array>({
+      transform(chunk, ctrl) {
+        total += chunk.byteLength
+        if (total > maxBytes) {
+          onCap?.()
+          ctrl.error(new Error('PAYLOAD_TOO_LARGE'))
+          return
+        }
+        ctrl.enqueue(chunk)
+      },
+    }),
+  )
+}
 
 /** Map a renderer status string to the canonical DB status (upper-snake). */
 function canonicalStatus(s: unknown): string | null {
@@ -191,6 +224,7 @@ export async function POST(
   let rawBody: string | null = null
   let recipeJson: string | null = null
   let projectIdForRecord: string | null = null
+  let payloadTooLarge = false // set when the byte cap trips mid-stream
 
   if (contentType.includes('application/json') && targetPath === '/render') {
     // ---- JSON mode: project-source render (server-side media) ----
@@ -272,14 +306,19 @@ export async function POST(
       void recordUsage(ownerId, 'render', 1, { renderSeconds, projectId: projectIdForRecord })
     } catch { /* never block rendering */ }
   } else if (contentType.includes('multipart/form-data')) {
-    // resource guard: reject oversized uploads BEFORE buffering the body
+    // resource guard: reject declared oversize uploads BEFORE streaming starts
     const declaredLen = Number(req.headers.get('content-length') ?? '')
     if (isFinite(declaredLen) && declaredLen > MAX_SOURCE_BYTES) {
       return NextResponse.json({ error: 'Upload exceeds the 1.5 GB render cap' }, { status: 413 })
     }
-    // forward multipart as-is
-    body = await req.blob()
-    headers['content-type'] = contentType
+    // MEMORY SAFETY: forward the multipart body AS A STREAM (byte-capped).
+    // The old `await req.blob()` materialized the entire upload (up to 1.5 GB)
+    // in server RAM before a single byte reached the renderer.
+    if (!req.body) {
+      return NextResponse.json({ error: 'Empty multipart body' }, { status: 400 })
+    }
+    body = byteCappedStream(req.body, MAX_SOURCE_BYTES, () => { payloadTooLarge = true })
+    headers['content-type'] = contentType // preserves the multipart boundary
   } else {
     rawBody = await req.text()
     body = rawBody
@@ -322,6 +361,10 @@ export async function POST(
       },
     })
   } catch (e: any) {
+    // the byte cap aborts the stream mid-flight → surface an honest 413
+    if (payloadTooLarge || e?.message === 'PAYLOAD_TOO_LARGE') {
+      return NextResponse.json({ error: 'Upload exceeds the 1.5 GB render cap' }, { status: 413 })
+    }
     return NextResponse.json({ error: e?.message ?? 'proxy failed' }, { status: 502 })
   }
 }
@@ -342,6 +385,12 @@ export async function GET(
 
   const url = new URL(req.url)
   const targetUrl = RENDERER_BASE + targetPath + (url.search || '')
+
+  // MEMORY SAFETY: download/cover are LARGE binary artifacts (full MP4s) —
+  // pipe the upstream body straight through, never await arrayBuffer().
+  // Poll (GET /jobs/:id) stays buffered: it is a tiny JSON document the proxy
+  // also inspects for DB status sync.
+  const binaryArtifact = jobMatch?.[3] === 'download' || jobMatch?.[3] === 'cover'
 
   try {
     const upstream = await fetch(targetUrl, { method: 'GET' })
@@ -373,6 +422,23 @@ export async function GET(
           'connection': 'keep-alive',
         },
       })
+    }
+    if (binaryArtifact) {
+      // STREAM THROUGH with the renderer's own headers preserved (content-type,
+      // content-length, content-disposition, cache-control). The 404/410 error
+      // bodies from the renderer are JSON — those stay buffered via the same
+      // branch (status !== ok and tiny), but the header passthrough is harmless.
+      const passthrough: Record<string, string> = { 'content-type': ct }
+      for (const h of ['content-length', 'content-disposition', 'cache-control']) {
+        const v = upstream.headers.get(h)
+        if (v) passthrough[h] = v
+      }
+      if (!upstream.ok || !upstream.body) {
+        // renderer error (404 not ready / 410 expired): relay the small JSON body
+        const errBody = await upstream.text()
+        return new NextResponse(errBody, { status: upstream.status, headers: { 'content-type': ct } })
+      }
+      return new NextResponse(upstream.body, { status: upstream.status, headers: passthrough })
     }
     const respBody = await upstream.arrayBuffer()
     // opportunistic DB status sync (observability) on plain job polls
