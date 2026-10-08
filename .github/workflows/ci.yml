@@ -84,7 +84,7 @@ jobs:
           nohup bun run index.ts > /tmp/renderer.log 2>&1 &
           for i in $(seq 1 30); do curl -sf -H "X-ClipForge-Internal-Token: $CLIPFORGE_RENDERER_TOKEN" http://127.0.0.1:3003/ && break || sleep 1; done
           curl -sf -H "X-ClipForge-Internal-Token: $CLIPFORGE_RENDERER_TOKEN" http://127.0.0.1:3003/ > /dev/null # fail fast if renderer never came up
-      - name: Renderer-auth E2E (isolated instance: 401 matrix, fail-closed startup)
+      - name: "Renderer-auth E2E (isolated instance — 401 matrix, fail-closed startup)"
         run: bun run test:renderer-auth
       - name: Start Next.js dev server
         run: |
