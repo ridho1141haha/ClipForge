@@ -6,6 +6,13 @@ on:
   pull_request:
     branches: [main]
 
+# Single source of truth for the DB used by db:push, the dev server, and E2E.
+# Absolute path → identical resolution for Prisma CLI and Prisma Client at runtime
+# (a relative `file:./db/custom.db` is schema-relative for the CLI but ambiguous
+# for the generated client, which silently strands the runtime on a missing file).
+env:
+  DATABASE_URL: file:${{ github.workspace }}/db/custom.db
+
 jobs:
   check:
     name: typecheck · lint · unit
@@ -39,9 +46,12 @@ jobs:
         run: bun install --frozen-lockfile
       - name: Generate Prisma client + push schema
         run: |
+          mkdir -p db
           bun run db:generate
-          DATABASE_URL="file:./db/custom.db" bun run db:push
-      - name: Build (strict gates: type errors fail the build)
+          bun run db:push
+      # NOTE: the step name is quoted — an unquoted `: ` inside a YAML plain
+      # scalar is a parse error (this broke the whole workflow at one point).
+      - name: "Build (strict gates: type errors fail the build)"
         run: bun run build
 
   e2e:
@@ -59,17 +69,20 @@ jobs:
         run: bun install --frozen-lockfile
       - name: Generate Prisma client + push schema
         run: |
+          mkdir -p db
           bun run db:generate
-          DATABASE_URL="file:./db/custom.db" bun run db:push
+          bun run db:push
       - name: Start ffmpeg-renderer mini-service
         run: |
           cd mini-services/ffmpeg-renderer
           nohup bun run index.ts > /tmp/renderer.log 2>&1 &
-          for i in $(seq 1 30); do curl -sf http://localhost:3003/ && break || sleep 1; done
+          for i in $(seq 1 30); do curl -sf http://127.0.0.1:3003/ && break || sleep 1; done
+          curl -sf http://127.0.0.1:3003/ > /dev/null # fail fast if renderer never came up
       - name: Start Next.js dev server
         run: |
           nohup bun run dev > /tmp/next.log 2>&1 &
-          for i in $(seq 1 60); do curl -sf http://localhost:3000/ && break || sleep 2; done
+          for i in $(seq 1 60); do curl -sf http://127.0.0.1:3000/ && break || sleep 2; done
+          curl -sf http://127.0.0.1:3000/ > /dev/null # fail fast if server never came up
       - name: Golden render E2E (frame-accurate cuts, 9:16, A/V sync)
         run: bun run test:e2e
       - name: Render-security E2E (job ownership · recipe validation · full-cut rejection)
