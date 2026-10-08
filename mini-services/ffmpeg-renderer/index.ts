@@ -4,18 +4,25 @@
 // Exposes: POST /render (start job), GET /jobs/:id (poll status), GET /jobs/:id/stream (SSE), GET /jobs/:id/download
 //
 // ─── NETWORK BOUNDARY (security invariant) ──────────────────────────────────
-// This service is INTERNAL and TRUSTED. It performs NO authorization of its
-// own — ownership is enforced by the Next.js proxy (render-proxy route),
-// which is the ONLY supported client:
+// This service is INTERNAL. Ownership/authorization lives in the Next.js
+// proxy (render-proxy route), which is the ONLY supported client:
 //
 //   Browser → Next.js authorization (session + RenderJob ownership) →
 //   localhost renderer (127.0.0.1:3003) → FFmpeg
 //
-// The server is explicitly bound to 127.0.0.1 (Bun's documented default is
-// 0.0.0.0, which would expose /render + job endpoints to the network).
-// Never bind it to a public interface without adding internal auth first.
-// If a deployment ever needs a remote renderer, add explicit shared-secret
-// auth on BOTH sides and document the architecture in SECURITY.md.
+// Two independent protections protect it from the local machine itself:
+//   1. The server is explicitly bound to 127.0.0.1 (Bun's documented default
+//      is 0.0.0.0, which would expose /render + job endpoints to the network).
+//   2. INTERNAL AUTHENTICATION (shared secret): every request must carry
+//      X-ClipForge-Internal-Token: $CLIPFORGE_RENDERER_TOKEN. The check runs
+//      BEFORE routing, body parsing, job mutation, and FFmpeg work. Loopback
+//      binding alone does NOT stop a malicious local PAGE from POSTing to
+//      127.0.0.1:3003 — a simple cross-origin multipart POST needs no CORS
+//      preflight, so the browser sends it even though it cannot read the
+//      response. CORS is not authentication; the token is. The token lives
+//      ONLY in server-side environments (repo .env / process env) — never in
+//      browser JS, logs, or public API responses. If the variable is unset at
+//      startup the service exits (fail closed) with an actionable message.
 //
 // CORS: deliberately NONE. CORS is a browser-enforced mechanism; this service
 // has exactly one supported client — the Next.js proxy — which communicates
@@ -27,10 +34,12 @@ import { serve } from 'bun'
 import { existsSync, mkdirSync, rmSync, writeFileSync, statSync, readdirSync, renameSync } from 'node:fs'
 import { join } from 'node:path'
 import { spawn } from 'node:child_process'
-import { randomUUID } from 'node:crypto'
+import { randomUUID, createHash, timingSafeEqual } from 'node:crypto'
 import { validateRecipe, RECIPE_LIMITS, QUALITY_PRESETS, type ValidatedRecipe, type RenderQuality } from './recipe-validation'
 
-const PORT = 3003
+// Port override (tests spawn an isolated renderer instance; default unchanged).
+const requestedPort = Math.floor(Number(process.env.RENDERER_PORT))
+const PORT = Number.isFinite(requestedPort) && requestedPort > 0 ? requestedPort : 3003
 // Job artifact workspace. RENDERER_WORKDIR overrides; default is repo-relative
 // (<repo>/upload/ffmpeg-render). A hardcoded machine path (/home/z/...) made the
 // renderer EACCES-crash on any other host — incl. the CI runner (E2E job red).
@@ -247,6 +256,52 @@ function sweepSpoolDir(): void {
       } catch { /* raced with a claim — leave it */ }
     }
   } catch { /* spool gone — recreate on demand */ }
+}
+
+// ---- INTERNAL AUTHENTICATION (shared secret, fail closed) ----
+// Bun auto-loads .env from the PROCESS CWD; the renderer is often started from
+// its own mini-services dir, so the repo-root .env — the same file Next.js
+// loads — is parsed as a fallback. Process env always wins. No dependency,
+// only this one variable is read, a missing file is not an error, and the
+// value is never logged.
+async function readTokenFromRepoEnvFile(): Promise<string | undefined> {
+  // CLIPFORGE_RENDERER_ENV_FILE overrides the fallback file location (tests
+  // point it at /dev/null to verify the fail-closed startup deterministically).
+  const envFile = process.env.CLIPFORGE_RENDERER_ENV_FILE ?? join(import.meta.dir, '..', '..', '.env')
+  try {
+    const text = await Bun.file(envFile).text()
+    const m = text.match(/^CLIPFORGE_RENDERER_TOKEN=(.*)$/m)
+    if (!m) return undefined
+    const v = m[1].trim().replace(/^"|"$/g, '').replace(/^'|'$/g, '')
+    return v.length > 0 ? v : undefined
+  } catch {
+    return undefined
+  }
+}
+
+const RENDERER_TOKEN: string | undefined =
+  process.env.CLIPFORGE_RENDERER_TOKEN || (await readTokenFromRepoEnvFile())
+
+if (!RENDERER_TOKEN) {
+  console.error(
+    '[clipforge-renderer] FATAL: CLIPFORGE_RENDERER_TOKEN is not set.\n' +
+      '  The renderer performs expensive FFmpeg work and rejects every request that\n' +
+      '  does not carry the shared internal token (X-ClipForge-Internal-Token).\n' +
+      '  Set CLIPFORGE_RENDERER_TOKEN (process env or repo-root .env) to the SAME\n' +
+      '  value the Next.js server uses. See .env.example.',
+  )
+  process.exit(1)
+}
+
+const TOKEN_HEADER = 'x-clipforge-internal-token'
+
+/** Constant-time shared-secret comparison (both sides hashed to equal lengths
+ * so timingSafeEqual never throws on length mismatch). */
+function tokenOk(received: string | null): boolean {
+  if (!received) return false
+  const a = createHash('sha256').update(received, 'utf8').digest()
+  const b = createHash('sha256').update(RENDERER_TOKEN!, 'utf8').digest()
+  return timingSafeEqual(a, b)
 }
 
 // ---- Job state machine (deterministic transitions; mission Phase 6) ----
@@ -594,6 +649,7 @@ async function processJob(jobId: string, spoolPath: string, originalName: string
 
     // build filter_complex
     // FILTER ORDER (fixed): 9:16 framing FIRST (no aspect distortion), then
+    // fps normalization (zoompan correctness — see the postParts below), then
     // zoompan punches into the already-vertical frame, then subtitles are
     // burned LAST so they stay fixed-size and are never cropped by the zoom.
     //
@@ -627,7 +683,8 @@ async function processJob(jobId: string, spoolPath: string, originalName: string
     // output frame per INPUT frame at its own fps, so an input rate ≠ zoompan
     // fps STRETCHES output time (30fps source at zoompan fps=24 → 1.25×
     // slower/longer video, desynced from the untouched audio; 60fps source at
-    // fps=30 → 2× — a pre-existing distortion this also fixes). The fps filter
+    // fps=30 → 2× — a pre-existing distortion this also fixes; independently
+    // discovered upstream as the "output 45.2s vs UI 23s" bug). The fps filter
     // drops/duplicates frames with correct timestamps, so motion stays
     // real-time, duration is exact, and A/V stays in sync at every quality.
     postParts.push(`fps=${q.fps}`)
@@ -783,6 +840,14 @@ serve({
   // (0.0.0.0 = all interfaces). Only the local Next.js proxy may reach this.
   hostname: '127.0.0.1',
   async fetch(req) {
+    // INTERNAL AUTH GATE — runs before ANY routing, body parsing, job
+    // mutation, or FFmpeg work. Missing or wrong token → 401 before any
+    // expensive work happens. This also means unauthenticated probes learn
+    // nothing about job existence (401, not 404).
+    if (!tokenOk(req.headers.get(TOKEN_HEADER))) {
+      return json({ error: 'Unauthorized' }, 401)
+    }
+
     const url = new URL(req.url)
 
     // POST /render — start a render job
@@ -1051,4 +1116,4 @@ serve({
     } })
   },
 })
-console.log(`ClipForge ffmpeg-renderer running on http://127.0.0.1:${PORT}`)
+console.log(`ClipForge ffmpeg-renderer running on http://127.0.0.1:${PORT} (internal token auth: ON)`)

@@ -29,6 +29,14 @@ const RENDERER_DIR = join(process.cwd(), 'mini-services', 'ffmpeg-renderer')
 const HEALTH_TIMEOUT_MS = 20_000 // max wait for the renderer to come up
 const START_POLL_MS = 400 // poll interval while waiting
 
+// Internal shared secret (same variable the proxy and the renderer use).
+// The renderer AUTHENTICATES every request — including this health probe —
+// with X-ClipForge-Internal-Token; an unauthenticated probe would read the
+// gate's 401 as "renderer down" and spawn duplicates forever. The spawned
+// child inherits process.env, so it sees the same token.
+const RENDERER_TOKEN = process.env.CLIPFORGE_RENDERER_TOKEN ?? ''
+const TOKEN_HEADER = 'x-clipforge-internal-token'
+
 let healthCache: { ok: boolean; at: number } | null = null
 const HEALTH_TTL_MS = 5_000 // cache "ok" for 5s to avoid a TCP round-trip per poll
 let starting: Promise<boolean> | null = null
@@ -39,13 +47,18 @@ async function isRendererUp(): Promise<boolean> {
     return true
   }
   try {
-    const res = await fetch(`${RENDERER_BASE}/`, {
+    await fetch(`${RENDERER_BASE}/`, {
+      headers: { [TOKEN_HEADER]: RENDERER_TOKEN },
       signal: AbortSignal.timeout(2500),
       cache: 'no-store',
     })
-    const ok = res.ok
-    healthCache = { ok, at: Date.now() }
-    return ok
+    // ANY HTTP answer means a process is listening on the renderer port —
+    // the only true "down" signal is a connection REFUSED (which throws).
+    // Status-code probing here would misfire on test doubles (stubbed fetches
+    // answer non-200) and on token drift (401 — a revive would not help);
+    // the actual proxy relay surfaces those honestly.
+    healthCache = { ok: true, at: Date.now() }
+    return true
   } catch {
     healthCache = { ok: false, at: Date.now() }
     return false

@@ -568,10 +568,16 @@ export function generateFFmpegScript(
   lines.push('ffmpeg -nostdin -y -f concat -safe 0 -i concat.txt -c copy merged.mp4')
   lines.push('')
 
-  lines.push('# 4. Camera punch-in (9:16 crop FIRST, then zoompan — no aspect distortion), then burn subtitles last (fixed size)')
+  lines.push('# 4. Camera punch-in (9:16 crop FIRST, then fps=30 normalization so zoompan',
+  'never stretches non-30fps sources, then zoompan), then burn subtitles last (fixed size)')
   const zoomFilter = buildZoompanFilter(recipe)
   const vfParts: string[] = ['scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920']
-  if (zoomFilter) vfParts.push(zoomFilter)
+  if (zoomFilter) {
+    // same duration contract as the mini-service renderer: zoompan re-stamps
+    // every frame at its fps=30, so a 60fps input would double the output
+    // duration without this normalization (see renderer postParts comment)
+    vfParts.push('fps=30', zoomFilter)
+  }
   vfParts.push(`ass='$ASS'`)
   lines.push(`ffmpeg -nostdin -y -i merged.mp4 -vf "${vfParts.join(',')}" -c:v libx264 -preset medium -crf 20 -c:a aac -b:a 128k "$OUTPUT"`)
   lines.push('')

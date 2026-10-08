@@ -31,6 +31,15 @@ import { ensureRenderer } from '@/lib/renderer-supervisor'
 // The renderer is a trusted internal service (localhost only); this proxy is
 // the public-facing authorization boundary.
 //
+// ─── INTERNAL RENDERER AUTHENTICATION (shared secret) ─────────────────────
+// The renderer authenticates EVERY proxy request with the shared secret
+// CLIPFORGE_RENDERER_TOKEN (header: x-clipforge-internal-token). The token is
+// attached to EVERY Next.js → renderer fetch (render start, poll, SSE,
+// cancel, download, cover, AND the ownership-failure cancel) — never to any
+// browser-facing response, log, or error message. If the variable is not
+// configured on the Next.js side, requests fail closed with an honest 500
+// (the renderer would reject them with 401 anyway).
+//
 // Two input modes for renders (POST /render):
 //   1. multipart passthrough — the client uploads the source video (Upload tab)
 //   2. JSON { recipe, projectId } — the renderer input is the server-side media
@@ -50,6 +59,16 @@ import { ensureRenderer } from '@/lib/renderer-supervisor'
 //            are piped through, never buffered (no 500 MB arrayBuffer()).
 
 const RENDERER_BASE = 'http://127.0.0.1:3003'
+
+// Shared secret with the ffmpeg-renderer mini-service (server-side only).
+const RENDERER_TOKEN = process.env.CLIPFORGE_RENDERER_TOKEN ?? ''
+const TOKEN_HEADER = 'x-clipforge-internal-token'
+
+/** Headers for EVERY Next.js → renderer fetch: the internal shared secret.
+ * Centralized so no renderer call site can forget it. */
+function rendererHeaders(extra: Record<string, string> = {}): Record<string, string> {
+  return { [TOKEN_HEADER]: RENDERER_TOKEN, ...extra }
+}
 
 // resource limits (mission Phase 1.3) — mirror the renderer's own guards
 const MAX_SOURCE_BYTES = 1500 * 1024 * 1024 // 1.5 GB
@@ -92,6 +111,7 @@ const SAFE_MP4_NAME = /^clipforge_[A-Za-z0-9_-]{0,60}\.mp4$/
 async function reconcileActiveRow(row: { id: string; status: string }): Promise<void> {
   try {
     const res = await fetch(`${RENDERER_BASE}/jobs/${row.id}`, {
+      headers: rendererHeaders(),
       signal: AbortSignal.timeout(4000),
       cache: 'no-store',
     })
@@ -174,6 +194,7 @@ async function pruneAncientRows(): Promise<void> {
       oldDone.map(async (row) => {
         try {
           const res = await fetch(`${RENDERER_BASE}/jobs/${row.id}`, {
+            headers: rendererHeaders(),
             signal: AbortSignal.timeout(4000),
             cache: 'no-store',
           })
@@ -518,6 +539,7 @@ async function listOwnedRenderJobs(): Promise<Response> {
     doneRows.map(async (row) => {
       try {
         const res = await fetch(`${RENDERER_BASE}/jobs/${row.id}`, {
+          headers: rendererHeaders(),
           signal: AbortSignal.timeout(4000),
           cache: 'no-store',
         })
@@ -567,6 +589,7 @@ async function listOwnedRenderJobs(): Promise<Response> {
   let queue: { waiting: number; busy: boolean } | null = null
   try {
     const res = await fetch(`${RENDERER_BASE}/stats`, {
+      headers: rendererHeaders(),
       signal: AbortSignal.timeout(2000),
       cache: 'no-store',
     })
@@ -782,6 +805,15 @@ export async function POST(
   const { path } = await ctx.params
   const targetPath = '/' + path.join('/')
 
+  // fail closed when the internal auth is not configured — the renderer would
+  // 401 every request anyway; a clear 500 beats a confusing relayed 401
+  if (!RENDERER_TOKEN) {
+    return NextResponse.json(
+      { error: 'Renderer authentication is not configured (CLIPFORGE_RENDERER_TOKEN missing on the server)' },
+      { status: 500 },
+    )
+  }
+
   // ---- POST /jobs/:id/pin — pin/unpin a DONE artifact (GC exemption) ----
   // Handled BEFORE ensureRenderer: flipping a manifest flag must not revive a
   // dead renderer (same economy as DELETE). Ownership gate → renderer relay
@@ -813,7 +845,7 @@ export async function POST(
     try {
       const res = await fetch(`${RENDERER_BASE}/jobs/${jobId}/pin`, {
         method: 'POST',
-        headers: { 'content-type': 'application/json' },
+        headers: rendererHeaders({ 'content-type': 'application/json' }),
         body: JSON.stringify({ pinned }),
         signal: AbortSignal.timeout(4000),
       })
@@ -1018,7 +1050,7 @@ export async function POST(
   try {
     const upstream = await fetch(targetUrl, {
       method: 'POST',
-      headers,
+      headers: rendererHeaders(headers),
       body,
       // propagate client disconnects as a CONTROLLED abort — without this,
       // a mid-upload disconnect surfaces later as an undici socket error
@@ -1038,7 +1070,12 @@ export async function POST(
       if (!recorded.ok) {
         if (recorded.rendererJobId) {
           try {
-            await fetch(`${RENDERER_BASE}/jobs/${recorded.rendererJobId}/cancel`, { method: 'POST' })
+            // authenticated with the SAME internal token — an unauthenticated
+            // cancel would be rejected 401 and strand the orphan job
+            await fetch(`${RENDERER_BASE}/jobs/${recorded.rendererJobId}/cancel`, {
+              method: 'POST',
+              headers: rendererHeaders(),
+            })
           } catch { /* renderer unavailable — job self-expires with its artifacts */ }
         }
         return NextResponse.json(
@@ -1068,6 +1105,14 @@ export async function GET(
 ) {
   const { path } = await ctx.params
   const targetPath = '/' + path.join('/')
+
+  // fail closed when the internal auth is not configured (see POST)
+  if (!RENDERER_TOKEN) {
+    return NextResponse.json(
+      { error: 'Renderer authentication is not configured (CLIPFORGE_RENDERER_TOKEN missing on the server)' },
+      { status: 500 },
+    )
+  }
 
   // ---- GET /archive — bulk ZIP download of owned finished renders ----
   // Handled BEFORE ensureRenderer on purpose: the archive is built straight
@@ -1122,7 +1167,11 @@ export async function GET(
     // abort the upstream fetch deterministically — otherwise the runtime's
     // cancellation of the passthrough body races undici's socket handling and
     // surfaces as an unhandled socket-error rejection.
-    const upstream = await fetch(targetUrl, { method: 'GET', signal: req.signal })
+    const upstream = await fetch(targetUrl, {
+      method: 'GET',
+      headers: rendererHeaders(),
+      signal: req.signal,
+    })
     const ct = upstream.headers.get('content-type') ?? 'application/octet-stream'
     if (ct.includes('text/event-stream')) {
       // SSE: forward the upstream body DIRECTLY (byte-identical event format).
@@ -1242,6 +1291,7 @@ export async function DELETE(
   try {
     const res = await fetch(`${RENDERER_BASE}/jobs/${jobId}`, {
       method: 'DELETE',
+      headers: rendererHeaders(),
       signal: AbortSignal.timeout(4000),
     })
     if (res.status === 409) {

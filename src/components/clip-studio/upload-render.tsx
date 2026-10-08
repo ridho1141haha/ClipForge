@@ -609,7 +609,12 @@ export function UploadRender({ plan, projectId, projectMedia, onJobStarted, onOp
           </div>
           <p className="text-sm font-semibold">{plan.selected_clip.title}</p>
           <p className="mt-0.5 font-mono text-xs text-muted-foreground">
-            {fmtTime(plan.selected_clip.start)} → {fmtTime(plan.selected_clip.end)} · {fmtDuration(plan.selected_clip.duration)}
+            {fmtTime(plan.selected_clip.start)} → {fmtTime(plan.selected_clip.end)} ·{' '}
+            <span title="Selected source window duration (before cuts)">{fmtDuration(plan.selected_clip.duration)} clip</span>
+            {' · '}
+            <span title="Actual output duration after cuts are removed — this is what the rendered MP4 will be">
+              {fmtDuration(outputDurationSec)} output
+            </span>
           </p>
           <div className="mt-2.5 grid grid-cols-2 gap-1.5 text-[11px] sm:grid-cols-4">
             <PlanStat icon={<Scissors className="h-3 w-3" />} label="Cuts" value={plan.selected_clip.cuts.length} />
