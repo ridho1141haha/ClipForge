@@ -16,6 +16,12 @@
 // Never bind it to a public interface without adding internal auth first.
 // If a deployment ever needs a remote renderer, add explicit shared-secret
 // auth on BOTH sides and document the architecture in SECURITY.md.
+//
+// CORS: deliberately NONE. CORS is a browser-enforced mechanism; this service
+// has exactly one supported client — the Next.js proxy — which communicates
+// server-to-server (fetch does not enforce CORS). Emitting wildcard
+// Access-Control-* headers here would only ever AUTHORIZE browser pages to
+// read a trusted internal service. Browsers must go through Next.js.
 
 import { serve } from 'bun'
 import { existsSync, mkdirSync, rmSync, writeFileSync, statSync } from 'node:fs'
@@ -453,13 +459,6 @@ function json(obj: any, status = 200, headers: Record<string, string> = {}): Res
   return new Response(JSON.stringify(obj), { status, headers: { 'Content-Type': 'application/json', ...headers } })
 }
 
-function cors(res: Response): Response {
-  res.headers.set('Access-Control-Allow-Origin', '*')
-  res.headers.set('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
-  res.headers.set('Access-Control-Allow-Headers', '*')
-  return res
-}
-
 serve({
   port: PORT,
   // SECURITY: explicit loopback bind. Do NOT rely on the implicit default
@@ -467,38 +466,36 @@ serve({
   hostname: '127.0.0.1',
   async fetch(req) {
     const url = new URL(req.url)
-    // CORS preflight
-    if (req.method === 'OPTIONS') return cors(new Response(null, { status: 204 }))
 
     // POST /render — start a render job
     if (req.method === 'POST' && url.pathname === '/render') {
       const contentType = req.headers.get('content-type') ?? ''
-      if (!contentType.includes('multipart/form-data')) return cors(json({ error: 'Expected multipart/form-data' }, 400))
+      if (!contentType.includes('multipart/form-data')) return json({ error: 'Expected multipart/form-data' }, 400)
       // resource guard: reject oversized uploads BEFORE parsing the body
       const lenHeader = req.headers.get('content-length')
       const declaredLen = lenHeader ? Number(lenHeader) : NaN
       if (isFinite(declaredLen) && declaredLen > RECIPE_LIMITS.MAX_UPLOAD_BYTES) {
-        return cors(json({ error: `Upload exceeds the ${Math.round(RECIPE_LIMITS.MAX_UPLOAD_BYTES / (1024 * 1024))} MB cap` }, 413))
+        return json({ error: `Upload exceeds the ${Math.round(RECIPE_LIMITS.MAX_UPLOAD_BYTES / (1024 * 1024))} MB cap` }, 413)
       }
       const form = await req.formData()
       const file = form.get('video') as File | null
       const recipeRaw = form.get('recipe') as string | File | null
-      if (!file) return cors(json({ error: 'video file required' }, 400))
-      if (!recipeRaw) return cors(json({ error: 'recipe JSON required' }, 400))
+      if (!file) return json({ error: 'video file required' }, 400)
+      if (!recipeRaw) return json({ error: 'recipe JSON required' }, 400)
       let parsedRecipe: unknown
       try {
         const rawText = typeof recipeRaw === 'string' ? recipeRaw : await recipeRaw.text()
         if (Buffer.byteLength(rawText, 'utf8') > RECIPE_LIMITS.MAX_RECIPE_BYTES) {
-          return cors(json({ error: `Recipe JSON exceeds the ${Math.round(RECIPE_LIMITS.MAX_RECIPE_BYTES / 1024)} KB limit`, code: 'RECIPE_TOO_LARGE' }, 413))
+          return json({ error: `Recipe JSON exceeds the ${Math.round(RECIPE_LIMITS.MAX_RECIPE_BYTES / 1024)} KB limit`, code: 'RECIPE_TOO_LARGE' }, 413)
         }
         parsedRecipe = JSON.parse(rawText)
       } catch {
-        return cors(json({ error: 'invalid recipe JSON' }, 400))
+        return json({ error: 'invalid recipe JSON' }, 400)
       }
       // STRICT contract enforcement — the renderer never executes unvalidated JSON
       const v = validateRecipe(parsedRecipe)
       if (!v.ok) {
-        return cors(json({ error: v.error, code: v.code }, 400))
+        return json({ error: v.error, code: v.code }, 400)
       }
       const id = randomUUID()
       const job: RenderJob = {
@@ -507,22 +504,22 @@ serve({
       jobs.set(id, job)
       // start async processing
       processJob(id, file, v.recipe)
-      return cors(json({ id, status: 'queued', progress: 0 }))
+      return json({ id, status: 'queued', progress: 0 })
     }
 
     // GET /jobs/:id — poll status
     const jobMatch = url.pathname.match(/^\/jobs\/([^/]+)$/)
     if (req.method === 'GET' && jobMatch) {
       const job = jobs.get(jobMatch[1])
-      if (!job) return cors(json({ error: 'job not found' }, 404))
-      return cors(json(publicJob(job)))
+      if (!job) return json({ error: 'job not found' }, 404)
+      return json(publicJob(job))
     }
 
     // GET /jobs/:id/stream — SSE progress
     const streamMatch = url.pathname.match(/^\/jobs\/([^/]+)\/stream$/)
     if (req.method === 'GET' && streamMatch) {
       const job = jobs.get(streamMatch[1])
-      if (!job) return cors(json({ error: 'job not found' }, 404))
+      if (!job) return json({ error: 'job not found' }, 404)
       const stream = new ReadableStream({
         start(controller) {
           const send = (data: string) => {
@@ -543,35 +540,34 @@ serve({
         },
         cancel() {},
       })
-      const res = new Response(stream, { headers: { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive' } })
-      return cors(res)
+      return new Response(stream, { headers: { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive' } })
     }
 
     // POST /jobs/:id/cancel — cancel a queued/running job (kills ffmpeg)
     const cancelMatch = url.pathname.match(/^\/jobs\/([^/]+)\/cancel$/)
     if (req.method === 'POST' && cancelMatch) {
       const job = jobs.get(cancelMatch[1])
-      if (!job) return cors(json({ error: 'job not found' }, 404))
+      if (!job) return json({ error: 'job not found' }, 404)
       if (!isActive(job.status)) {
         // terminal states are final — a cancelled/completed job cannot be re-cancelled
-        return cors(json({ id: job.id, status: job.status, progress: job.progress }))
+        return json({ id: job.id, status: job.status, progress: job.progress })
       }
       transition(job, 'cancelled')
       job.stage = 'Cancelled by user'
       job.finishedAt = Date.now()
       try { job.currentChild?.kill('SIGKILL') } catch {}
       broadcast(job)
-      return cors(json({ id: job.id, status: 'cancelled', progress: job.progress }))
+      return json({ id: job.id, status: 'cancelled', progress: job.progress })
     }
 
     // GET /jobs/:id/download — download rendered MP4
     const dlMatch = url.pathname.match(/^\/jobs\/([^/]+)\/download$/)
     if (req.method === 'GET' && dlMatch) {
       const job = jobs.get(dlMatch[1])
-      if (!job || job.status !== 'done') return cors(json({ error: 'render not ready' }, 404))
+      if (!job || job.status !== 'done') return json({ error: 'render not ready' }, 404)
       const jobDir = join(WORKDIR, job.id)
       const outPath = join(jobDir, job.filename!)
-      if (!existsSync(outPath)) return cors(json({ error: 'file expired' }, 410))
+      if (!existsSync(outPath)) return json({ error: 'file expired' }, 410)
       // MEMORY SAFETY: stream the file from disk (Bun.file is a streaming blob
       // source) — a 500 MB MP4 must never be materialized in the JS heap.
       const size = statSync(outPath).size
@@ -583,17 +579,17 @@ serve({
           'Content-Length': String(size),
         },
       })
-      return cors(res)
+      return res
     }
 
     // GET /jobs/:id/cover — download the extracted cover-frame JPG (when requested)
     const coverMatch = url.pathname.match(/^\/jobs\/([^/]+)\/cover$/)
     if (req.method === 'GET' && coverMatch) {
       const job = jobs.get(coverMatch[1])
-      if (!job || job.status !== 'done') return cors(json({ error: 'render not ready' }, 404))
-      if (!job.hasCover) return cors(json({ error: 'no cover was requested for this render' }, 404))
+      if (!job || job.status !== 'done') return json({ error: 'render not ready' }, 404)
+      if (!job.hasCover) return json({ error: 'no cover was requested for this render' }, 404)
       const coverPath = join(WORKDIR, job.id, 'cover.jpg')
-      if (!existsSync(coverPath)) return cors(json({ error: 'file expired' }, 410))
+      if (!existsSync(coverPath)) return json({ error: 'file expired' }, 410)
       const coverSize = statSync(coverPath).size
       const base = sanitize(job.filename?.replace(/\.mp4$/i, '') ?? 'clip')
       const res = new Response(Bun.file(coverPath), {
@@ -605,17 +601,17 @@ serve({
           'Cache-Control': 'private, max-age=300',
         },
       })
-      return cors(res)
+      return res
     }
 
     // GET / — health
-    return cors(json({ service: 'ClipForge ffmpeg renderer', port: PORT, endpoints: {
+    return json({ service: 'ClipForge ffmpeg renderer', port: PORT, endpoints: {
       'POST /render': 'multipart (video, recipe) → {id}',
       'GET /jobs/:id': 'poll status',
       'GET /jobs/:id/stream': 'SSE progress',
       'GET /jobs/:id/download': 'download MP4',
       'GET /jobs/:id/cover': 'download cover-frame JPG (when recipe.cover was set)',
-    } }))
+    } })
   },
 })
-console.log(`ClipForge ffmpeg-renderer running on http://localhost:${PORT}`)
+console.log(`ClipForge ffmpeg-renderer running on http://127.0.0.1:${PORT}`)

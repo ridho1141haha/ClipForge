@@ -17,11 +17,15 @@ claims here are backed by tests (see `tests/clipforge-unit.ts`,
   `(jobId, ownerId)` pair in the `RenderJob` table first. Random job-UUID
   secrecy is never relied on.
 - The ffmpeg-renderer mini-service is **explicitly bound to `127.0.0.1`**
-  (Bun's default would be `0.0.0.0`; the bind is set in code and covered by a
-  structural test). It performs NO authorization of its own — it is a trusted
-  internal service reachable only from the local machine. The Next.js proxy is
-  the single public authorization boundary:
-  `Browser → Next.js authorization → localhost renderer → FFmpeg`.
+  (Bun's default would be `0.0.0.0`; the bind is set in code and asserted
+  behaviorally by the render-security E2E). It performs NO authorization of its
+  own — it is a trusted internal service reachable only from the local machine.
+  It emits **no CORS headers at all**: CORS is browser-enforced, its only
+  supported client is the Next.js proxy (server-to-server fetch), and wildcard
+  CORS would only ever authorize browser pages to read an internal service.
+  The Next.js proxy is the single public authorization boundary:
+  `Browser → Next.js authorization → 127.0.0.1 renderer → FFmpeg`
+  (the proxy targets the literal loopback address — no `localhost` DNS drift).
   A remote-renderer deployment would require explicit internal authentication
   on both sides first (documented in the renderer source header).
 
@@ -35,11 +39,12 @@ claims here are backed by tests (see `tests/clipforge-unit.ts`,
 | Filter-expression injection via recipe values | Numeric-only enforcement (e.g. camera `scale` must be a finite number in [0.5, 10]) — no strings reach ffmpeg filter strings | unit: string-scale rejection |
 | Command injection | ffmpeg / ffprobe / yt-dlp invoked via `execFile`/`spawn` with argument arrays — no shell string concatenation anywhere | code audit |
 | Path traversal (stored media paths) | `resolveLocalMediaPath()`: `upload/` prefix + containment check; YouTube ids validated by `isSafeYouTubeId` before path use | unit: traversal/absolute/non-upload/empty rejected |
-| Oversized uploads / memory exhaustion | 1.5 GB source cap enforced BEFORE buffering (declared Content-Length precheck) AND during streaming (byte-capped TransformStream — covers chunked uploads that omit Content-Length, trips → honest 413); 1 MiB recipe cap; client multipart uploads are forwarded as STREAMS (never `req.blob()`/`req.arrayBuffer()`); renderer artifacts (MP4/cover) are streamed from disk via `Bun.file` and piped through the proxy — a 500 MB render never materializes in server RAM | unit structural scans; render-security + golden E2E (real uploads/downloads through the proxy) |
+| Oversized uploads / memory exhaustion | 1.5 GB source cap enforced BEFORE buffering (declared Content-Length precheck) AND during streaming (byte-capped TransformStream — covers chunked uploads that omit Content-Length, trips → honest 413); 1 MiB recipe cap; client multipart uploads are forwarded as STREAMS (never `req.blob()`/`req.arrayBuffer()`); server-side media is streamed into the renderer multipart with **consumer-driven backpressure** (`pull()`-based reads, memory bounded at ~2 chunks regardless of file size, `cancel()` releases the file handle); renderer artifacts (MP4/cover) are streamed from disk via `Bun.file` and piped through the proxy — a 500 MB render never materializes in server RAM | unit structural scans; render-security + golden + url-render E2E (real uploads/downloads through the proxy) |
 | Render artifacts leaking across sessions | 10-minute artifact lifetime in the renderer; download requires ownership | render-security E2E |
 | SSRF | All outbound calls target fixed hosts (YouTube APIs, localhost renderer); URLs built from validated YouTube ids only | code audit |
 | Transcript timing fabrication | Word timing provenance is computed server-side: a missing caption offset stays ABSENT (never coerced to `0` = "measured"); multi-word caption segments never claim independent word timing; provenance labels (`measured`/`estimated`/`mixed`) are per-word and unit-tested | unit: timing-honesty + VTT fixture matrices |
 | Rate abuse of expensive routes | In-memory rate limits on analyze / prepare / transcribe / render-start (documented: single-instance only) | validation.ts |
+| Orphan renderer work after an ownership-recording failure | `recordRenderJob()` failure no longer swallows silently: the proxy cancels the renderer job and returns an honest 500 — the client never receives an id that every later operation would 404, and no render keeps burning CPU/disk without a DB owner | structural unit assertions; render-security E2E (ownership recording verified on the happy path; simulated-DB-failure live test intentionally NOT run against the shared dev database) |
 
 ## Known limitations (honest)
 

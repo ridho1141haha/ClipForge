@@ -11,8 +11,8 @@ import { mediaMimeForExt, resolveLocalMediaPath } from '@/lib/media'
 import { touchMediaCache } from '@/lib/media-cache'
 import { checkDailyUsageLimit, limitHeaders, limitReachedMessage } from '@/lib/usage-limits'
 
-// Proxy from /api/render-proxy/[...path] to the ffmpeg-renderer mini-service at localhost:3003
-// Avoids CORS issues and keeps the mini-service internal (never publicly exposed).
+// Proxy from /api/render-proxy/[...path] to the ffmpeg-renderer mini-service at 127.0.0.1:3003
+// Keeps the mini-service internal (never publicly exposed).
 //
 // ─── SECURITY: JOB OWNERSHIP (10/10 mission, Phase 1.1) ─────────────────────
 // Every job operation (poll, SSE stream, cancel, download, cover frame) is
@@ -45,7 +45,7 @@ import { checkDailyUsageLimit, limitHeaders, limitReachedMessage } from '@/lib/u
 //   Download: renderer → stream → this proxy → browser. MP4/cover responses
 //            are piped through, never buffered (no 500 MB arrayBuffer()).
 
-const RENDERER_BASE = 'http://localhost:3003'
+const RENDERER_BASE = 'http://127.0.0.1:3003'
 
 // resource limits (mission Phase 1.3) — mirror the renderer's own guards
 const MAX_SOURCE_BYTES = 1500 * 1024 * 1024 // 1.5 GB
@@ -121,11 +121,23 @@ async function syncJobStatus(jobId: string, upstreamStatus: unknown, upstreamSta
   }
 }
 
-/** Persist render-job ownership after a successful render start (security invariant). */
-async function recordRenderJob(upstreamBody: string, projectId: string | null, fallbackStatus = 'QUEUED') {
+/** Persist render-job ownership after a successful render start (security invariant).
+ * Returns { ok, rendererJobId }: ok=false means the DB row is NOT guaranteed —
+ * the caller MUST cancel the renderer job and fail honestly. A silently-swallowed
+ * failure here used to strand a renderer job the client could never poll,
+ * cancel, or download (every proxy operation 404s fail-closed). */
+async function recordRenderJob(
+  upstreamBody: string,
+  projectId: string | null,
+  fallbackStatus = 'QUEUED',
+): Promise<{ ok: boolean; rendererJobId: string | null }> {
+  let rendererJobId: string | null = null
   try {
     const parsed = JSON.parse(upstreamBody) as { id?: unknown; status?: unknown }
-    if (typeof parsed?.id !== 'string' || !/^[\w-]{8,64}$/.test(parsed.id)) return
+    if (typeof parsed?.id !== 'string' || !/^[\w-]{8,64}$/.test(parsed.id)) {
+      return { ok: false, rendererJobId: null } // upstream contract broken — nothing to cancel by id
+    }
+    rendererJobId = parsed.id
     const ownerId = await getOrCreateSessionId()
     await db.renderJob.upsert({
       where: { id: parsed.id },
@@ -138,15 +150,20 @@ async function recordRenderJob(upstreamBody: string, projectId: string | null, f
       },
       update: { ownerId, projectId },
     })
+    return { ok: true, rendererJobId }
   } catch {
-    // recording must never fail the render — but a failure here means the job
-    // is NOT pollable/cancellable/downloadable through the proxy (fail closed)
+    // DB/session failure — report to the caller so the renderer job is cancelled
+    // and the client gets an honest 5xx (never a doomed job id).
+    return { ok: false, rendererJobId }
   }
 }
 
 /**
- * Build a multipart/form-data body as a STREAM (video file read in chunks —
- * never fully buffered in memory) so a 1.5 GB source doesn't exhaust RAM.
+ * Build a multipart/form-data body as a CONSUMER-DRIVEN stream (pull-based):
+ * file reads happen only when the downstream fetch pulls — memory stays bounded
+ * at ~2 chunks regardless of source size (the old start()-pump enqueued the
+ * ENTIRE file into the stream's internal queue as fast as disk allowed, which
+ * re-materialized a 1.5 GB source chunk-by-chunk in RAM).
  * Returns the stream AND the boundary (needed for the Content-Type header).
  */
 function buildStreamingMultipart(
@@ -162,29 +179,57 @@ function buildStreamingMultipart(
   const post = new TextEncoder().encode(
     `\r\n--${boundary}\r\nContent-Disposition: form-data; name="recipe"\r\n\r\n${recipeJson}\r\n--${boundary}--\r\n`,
   )
-  return {
-    stream: new ReadableStream<Uint8Array>({
-    async start(controller) {
-      const fh = await open(absolutePath, 'r')
+  const CHUNK = STREAM_CHUNK
+  let stage: 'pre' | 'file' | 'post' | 'done' = 'pre'
+  let fh: import('node:fs/promises').FileHandle | null = null
+  const buf = Buffer.allocUnsafe(CHUNK)
+  let position = 0
+  const release = async () => {
+    const h = fh
+    fh = null
+    if (h) {
+      try { await h.close() } catch { /* already closed */ }
+    }
+  }
+  const stream = new ReadableStream<Uint8Array>({
+    async pull(controller) {
       try {
-        controller.enqueue(pre)
-        const buf = Buffer.allocUnsafe(STREAM_CHUNK)
-        let position = 0
-        for (;;) {
-          const { bytesRead } = await fh.read(buf, 0, STREAM_CHUNK, position)
-          if (bytesRead <= 0) break
+        if (stage === 'pre') {
+          controller.enqueue(pre)
+          stage = 'file'
+          return
+        }
+        if (stage === 'file') {
+          if (!fh) fh = await open(absolutePath, 'r')
+          const { bytesRead } = await fh.read(buf, 0, CHUNK, position)
+          if (bytesRead <= 0) {
+            stage = 'post'
+            return // pull is called again immediately → 'post' branch below
+          }
           controller.enqueue(new Uint8Array(buf.subarray(0, bytesRead))) // copy — buf is reused
           position += bytesRead
+          return
         }
-        controller.enqueue(post)
-        controller.close()
-      } finally {
-        await fh.close()
+        if (stage === 'post') {
+          controller.enqueue(post)
+          stage = 'done'
+          controller.close()
+          await release()
+          return
+        }
+        // stage === 'done' — stream closed; nothing further to produce
+      } catch (e) {
+        await release()
+        controller.error(e)
       }
     },
-    }),
-    boundary,
-  }
+    async cancel() {
+      // downstream aborted mid-upload (renderer 4xx, cap trip, client cancel):
+      // release the file handle — the read loop never runs again.
+      await release()
+    },
+  })
+  return { stream, boundary }
 }
 
 export async function POST(
@@ -350,9 +395,23 @@ export async function POST(
     })
     const respBody = await upstream.arrayBuffer()
     // record ownership for the NEW job (both render modes) — required for all
-    // subsequent poll/stream/cancel/download authorization
+    // subsequent poll/stream/cancel/download authorization. A recording failure
+    // must NOT be silent: cancel the renderer job (no orphan work) and fail
+    // honestly — the client must never receive an id that every later operation
+    // would 404.
     if (upstream.ok) {
-      await recordRenderJob(Buffer.from(respBody).toString('utf8'), projectIdForRecord)
+      const recorded = await recordRenderJob(Buffer.from(respBody).toString('utf8'), projectIdForRecord)
+      if (!recorded.ok) {
+        if (recorded.rendererJobId) {
+          try {
+            await fetch(`${RENDERER_BASE}/jobs/${recorded.rendererJobId}/cancel`, { method: 'POST' })
+          } catch { /* renderer unavailable — job self-expires with its artifacts */ }
+        }
+        return NextResponse.json(
+          { error: 'Render started but job ownership could not be recorded; the render was cancelled. Please retry.' },
+          { status: 500 },
+        )
+      }
     }
     return new NextResponse(respBody, {
       status: upstream.status,
@@ -396,26 +455,15 @@ export async function GET(
     const upstream = await fetch(targetUrl, { method: 'GET' })
     const ct = upstream.headers.get('content-type') ?? 'application/octet-stream'
     if (ct.includes('text/event-stream')) {
-      // SSE: stream through
-      const reader = upstream.body?.getReader()
-      if (!reader) return new NextResponse(null, { status: 502 })
-      const stream = new ReadableStream({
-        start(controller) {
-          const pump = async () => {
-            while (true) {
-              const { done, value } = await reader.read()
-              if (done) {
-                controller.close()
-                return
-              }
-              controller.enqueue(value)
-            }
-          }
-          pump()
-        },
-      })
-      return new NextResponse(stream, {
-        status: 200,
+      // SSE: forward the upstream body DIRECTLY (byte-identical event format).
+      // The old manual reader/pump wrapper never cancelled the upstream when the
+      // browser disconnected (leaking the renderer connection + its subscriber),
+      // and a read error inside the detached pump was an unhandled rejection that
+      // left the downstream hanging. Native body passthrough propagates
+      // backpressure, upstream errors, and downstream cancellation for free.
+      if (!upstream.body) return new NextResponse(null, { status: 502 })
+      return new NextResponse(upstream.body, {
+        status: upstream.status,
         headers: {
           'content-type': 'text/event-stream',
           'cache-control': 'no-cache',

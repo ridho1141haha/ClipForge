@@ -48,6 +48,24 @@ function assert(cond: boolean, name: string, detail = '') {
 }
 
 async function main() {
+  console.log('\n== Render-security E2E: renderer network boundary (loopback-only, no CORS) ==')
+  {
+    // The renderer is an internal trusted service whose ONLY supported client
+    // is the Next.js proxy (server-to-server). It must therefore:
+    //   1. be bound to 127.0.0.1 (not reachable off-host)
+    //   2. emit NO wildcard CORS headers (CORS is browser-enforced; wildcard
+    //      ACAO would only ever authorize browser pages to read it)
+    const bind = await execFileAsync('sh', ['-c', "ss -tlnp 2>/dev/null | grep ':3003' || true"]).catch(() => ({ stdout: '' }))
+    assert(/127\.0\.0\.1:3003/.test(bind.stdout), 'renderer LISTENs on 127.0.0.1:3003 (not 0.0.0.0/[::])', bind.stdout.trim())
+    const health = await fetch('http://127.0.0.1:3003/')
+    assert(health.ok, 'renderer health responds (proxy → renderer path alive)')
+    assert(!health.headers.has('access-control-allow-origin'), 'renderer emits NO Access-Control-Allow-Origin header')
+    assert(!health.headers.has('access-control-allow-methods'), 'renderer emits NO Access-Control-Allow-Methods header')
+    assert(!health.headers.has('access-control-allow-headers'), 'renderer emits NO Access-Control-Allow-Headers header')
+    const preflight = await fetch('http://127.0.0.1:3003/render', { method: 'OPTIONS' })
+    assert(!preflight.headers.has('access-control-allow-origin'), 'OPTIONS is NOT treated as a CORS preflight by the renderer')
+  }
+
   console.log('\n== Render-security E2E: fixture ==')
   const srcPath = '/tmp/clipforge-sec-e2e-src.mp4'
   await execFileAsync('ffmpeg', [

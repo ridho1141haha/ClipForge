@@ -956,6 +956,81 @@ console.log('\n== LONG-VIDEO retrieval: markers at 5%/50%/95%, strided budget, d
 }
 
 // ---------------------------------------------------------------------------
+// ROUND: transcript prompt budget is a HARD bound (surgical hardening P1)
+// INVARIANT under test: result.text.length <= maxChars for EVERY input,
+// including strided outputs whose elision labels used to push it over.
+// ---------------------------------------------------------------------------
+console.log('\n== TRANSCRIPT BUDGET: hard maxChars bound (measure-and-shrink + guard) ==')
+{
+  const { buildTimestampedTranscript } = await import('../src/lib/transcript-window')
+
+  // word-timed source whose marked text is ~5x the small budgets below
+  const words: { word: string; start: number; end: number }[] = []
+  for (let i = 0; i < 6000; i++) {
+    const s = i * 0.4
+    words.push({ word: `v${i}`, start: s, end: s + 0.4 })
+  }
+  const joined = words.map((w) => w.word).join(' ')
+
+  // budget sweep — the invariant must hold at every point, full AND strided
+  for (const budget of [4_000, 8_000, 15_999, 16_000, 40_000, 80_000]) {
+    const r = buildTimestampedTranscript(joined, words, { maxChars: budget })
+    assert(r.text.length <= budget, `budget ${budget}: output <= budget`, `${r.text.length}`)
+  }
+
+  // tiny budget (below a single block): still honest, still bounded
+  const tiny = buildTimestampedTranscript(joined, words, { maxChars: 4_000 })
+  assert(tiny.text.length <= 4_000, 'tiny budget respected', String(tiny.text.length))
+  assert(tiny.truncated && tiny.text.includes('elided'), 'tiny budget keeps honest elision markers')
+
+  // exact budget: text that measures exactly maxChars → full, untouched
+  const exactWords = ['a', 'bb', 'ccc', 'dddd']
+  const exactText = exactWords.join(' ')
+  const exact = buildTimestampedTranscript(exactText, exactWords.map((w, i) => ({ word: w, start: i * 0.4, end: i * 0.4 + 0.4 })), { maxChars: exactText.length })
+  assert(exact.coverage === 'full' && exact.text === exactText, 'exact budget → full untouched text')
+
+  // budget - 1 → still full (under, not over)
+  const under = buildTimestampedTranscript(exactText, exactWords.map((w, i) => ({ word: w, start: i * 0.4, end: i * 0.4 + 0.4 })), { maxChars: exactText.length - 1 })
+  assert(under.text.length <= exactText.length - 1, 'budget-1 respected')
+
+  // budget + 1 → stride kicks in, output back under budget
+  const over = buildTimestampedTranscript(joined, words, { maxChars: 16_001 })
+  assert(over.text.length <= 16_001, 'budget+1: stride output re-fitted under budget', String(over.text.length))
+
+  // strided output keeps beginning AND end coverage even at the fitted size
+  const fitted = buildTimestampedTranscript(joined, words, { maxChars: 8_000 })
+  assert(fitted.text.startsWith('v0 '), 'fitted stride starts at the actual beginning')
+  assert(fitted.text.endsWith('v5999'), 'fitted stride ends at the actual end', fitted.text.slice(-30))
+  assert(fitted.text.includes('elided for length'), 'fitted stride labels its gaps')
+  const midIdx = fitted.text.indexOf('[9:') + fitted.text.indexOf('[10:') + fitted.text.indexOf('[11:')
+  assert(midIdx > -3 || fitted.text.includes('[1:'), 'temporal markers survive fitting')
+
+  // long transcript WITHOUT word timings (word-timing-less ASR): bounded too
+  const textOnly = Array.from({ length: 12_000 }, (_, i) => `tok${i}`).join(' ')
+  for (const budget of [5_000, 20_000]) {
+    const r = buildTimestampedTranscript(textOnly, [], { maxChars: budget })
+    assert(r.text.length <= budget, `text-only budget ${budget} respected`, String(r.text.length))
+    assert(r.markers === 0, `text-only budget ${budget}: no fabricated markers`)
+  }
+  const textOnlyFitted = buildTimestampedTranscript(textOnly, [], { maxChars: 5_000 })
+  assert(textOnlyFitted.text.startsWith('tok0 '), 'text-only fitted stride starts at beginning')
+  assert(textOnlyFitted.text.endsWith('tok11999'), 'text-only fitted stride ends at end', textOnlyFitted.text.slice(-30))
+
+  // PATHOLOGICAL: whitespace-free (CJK-style) transcript = one giant block —
+  // the old stride bypass (keepCount >= total → join ALL) blew the budget.
+  const giant = '长'.repeat(50_000)
+  const cjk = buildTimestampedTranscript(giant, [], { maxChars: 4_000 })
+  assert(cjk.text.length <= 4_000, 'single giant block hard-cut under budget', String(cjk.text.length))
+  assert(cjk.truncated && cjk.text.includes('remainder elided'), 'giant block cut is honestly labeled')
+  const cjk2 = buildTimestampedTranscript(giant, [], { maxChars: 4_000 })
+  assert(cjk2.text === cjk.text, 'hard cut is deterministic')
+
+  // determinism of the fitted stride
+  const fitAgain = buildTimestampedTranscript(joined, words, { maxChars: 8_000 })
+  assert(fitAgain.text === fitted.text, 'fitted stride deterministic (same input → same bytes)')
+}
+
+// ---------------------------------------------------------------------------
 // ROUND: memory-safety + renderer boundary (structural scans of the REAL
 // sources — cheap, deterministic; the E2E suites verify behavior live)
 // ---------------------------------------------------------------------------
@@ -980,6 +1055,42 @@ console.log('\n== MEMORY SAFETY: no body/blob buffering; renderer loopback + str
   assert(renderer.includes('Bun.file(outPath)'), 'MP4 download streams from disk')
   assert(renderer.includes("if (!transition(job, 'done')) return"), 'finalization guard: cancelled job can never be finalized as done')
   assert(renderer.includes('} finally {'), 'cleanup scheduled for EVERY terminal outcome (no cancelled-job disk leak)')
+}
+
+// ---------------------------------------------------------------------------
+// ROUND: surgical hardening (renderer CORS removal, consumer-driven multipart,
+// SSE passthrough, honest ownership recording, loopback proxy target)
+// ---------------------------------------------------------------------------
+console.log('\n== SURGICAL HARDENING: no wildcard CORS; pull-based multipart; SSE passthrough; honest ownership ==')
+{
+  const { readFileSync: rf2 } = await import('node:fs')
+  const renderer = rf2('mini-services/ffmpeg-renderer/index.ts', 'utf-8')
+  assert(!renderer.includes('Access-Control-Allow-Origin'), 'renderer emits NO Access-Control-Allow-Origin (loopback-only, browser-facing API is Next.js)')
+  assert(!renderer.includes('Access-Control-Allow-Methods'), 'renderer emits NO Access-Control-Allow-Methods')
+  assert(!renderer.includes('Access-Control-Allow-Headers'), 'renderer emits NO Access-Control-Allow-Headers')
+  assert(!renderer.includes("req.method === 'OPTIONS'"), 'renderer has no CORS preflight handler')
+
+  const proxy = rf2('src/app/api/render-proxy/[...path]/route.ts', 'utf-8')
+  assert(proxy.includes("RENDERER_BASE = 'http://127.0.0.1:3003'"), 'proxy targets the literal loopback address (no localhost DNS drift)')
+
+  // multipart: producer must be CONSUMER-DRIVEN — reads happen inside pull(),
+  // never an eager start() pump, and cancel() releases the file handle.
+  const mpStart = proxy.indexOf('function buildStreamingMultipart')
+  const mpEnd = proxy.indexOf('export async function POST')
+  const mp = proxy.slice(mpStart, mpEnd)
+  assert(mp.includes('async pull(controller)'), 'multipart file streaming is pull-based (consumer-driven backpressure)')
+  assert(!mp.includes('async start(controller)'), 'multipart has NO eager start() pump (old code queued the whole file)')
+  assert(mp.includes('async cancel()'), 'multipart stream cancel() releases the file handle')
+
+  // SSE: upstream body forwarded natively (no manual reader/pump wrapper)
+  const getSect = proxy.slice(proxy.indexOf('export async function GET'))
+  assert(getSect.includes('new NextResponse(upstream.body'), 'SSE/binary responses forward upstream.body directly')
+  assert(!getSect.includes('getReader()'), 'SSE has NO manual reader pump (leaked upstream connections + unhandled rejections)')
+
+  // ownership: recording failure is HONEST — cancel renderer job + 5xx, never a doomed job id
+  assert(proxy.includes('recorded.ok'), 'ownership recording result is checked (no silent swallow)')
+  assert(proxy.includes('/cancel`'), 'ownership recording failure cancels the renderer job (no orphan work)')
+  assert(proxy.includes('the render was cancelled'), 'client receives an honest error when ownership recording fails')
 }
 
 console.log(`\n════════════════════════════════`)

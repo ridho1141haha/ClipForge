@@ -45,6 +45,10 @@ export const TRANSCRIPT_MARKER_EVERY_WORDS = MARKER_EVERY_WORDS
 export const TRANSCRIPT_PROMPT_BUDGET = 80_000
 /** words per strided block (blocks are kept/dropped as units) */
 const BLOCK_WORDS = 200
+/** minimum blocks the stride ever keeps (block 0 + last → beginning & end survive) */
+const MIN_KEEP_BLOCKS = 2
+/** honest label appended when even the minimal stride cannot fit the budget */
+const TAIL_MARKER = ' [… transcript truncated to fit the prompt budget — remainder elided …]'
 
 function fmtMarker(sec: number): string {
   const s = Math.max(0, Math.floor(sec))
@@ -75,11 +79,51 @@ export function markWords(words: TranscriptWord[]): { text: string; markers: num
 }
 
 /**
- * Deterministic block stride: keep whole blocks so the kept content spans the
- * full timeline. Returns the kept text with explicit elision markers between
- * non-contiguous blocks (the model is told these are gaps, never to quote
- * across them).
+ * Deterministic stride that FITS the budget by construction: build a candidate,
+ * MEASURE its final length (elision labels add characters the naive
+ * maxChars/avgBlock estimate ignores), drop blocks until it fits, rebuild.
+ * Each candidate is built by strideBlocks (deterministic), so the fixed point
+ * is deterministic too. keepCount never goes below MIN_KEEP_BLOCKS — block 0
+ * and the last block always survive (beginning & end coverage).
  */
+function strideToFit(
+  blocks: string[],
+  totalChars: number,
+  maxChars: number,
+  elisionLabel: (from: number, to: number) => string,
+): string {
+  if (blocks.length === 0) return ''
+  const avgBlock = Math.max(1, totalChars / blocks.length)
+  const labelLen = elisionLabel(0, 1).length
+  let keepCount = Math.max(
+    Math.min(MIN_KEEP_BLOCKS, blocks.length),
+    Math.min(blocks.length, Math.floor(maxChars / avgBlock)),
+  )
+  let out = strideBlocks(blocks, keepCount, elisionLabel)
+  // measure-and-shrink loop (deterministic: fixed step from measured overshoot)
+  while (out.length > maxChars && keepCount > Math.min(MIN_KEEP_BLOCKS, blocks.length)) {
+    const overshoot = out.length - maxChars
+    const savedPerBlock = avgBlock + labelLen
+    keepCount = Math.max(
+      Math.min(MIN_KEEP_BLOCKS, blocks.length),
+      keepCount - Math.max(1, Math.ceil(overshoot / savedPerBlock)),
+    )
+    out = strideBlocks(blocks, keepCount, elisionLabel)
+  }
+  return out
+}
+
+/**
+ * Last-resort guard for inputs the stride cannot compress (e.g. a transcript
+ * with no whitespace — one giant block — or a budget smaller than a single
+ * block): cut honestly to maxChars and label the cut. Content is REMOVED,
+ * never fabricated; determinism preserved.
+ */
+function hardCutToBudget(text: string, maxChars: number): string {
+  if (text.length <= maxChars) return text
+  if (maxChars > TAIL_MARKER.length) return text.slice(0, maxChars - TAIL_MARKER.length) + TAIL_MARKER
+  return text.slice(0, Math.max(0, maxChars))
+}
 function strideBlocks(blocks: string[], keepCount: number, elisionLabel: (from: number, to: number) => string): string {
   const total = blocks.length
   if (keepCount >= total) return blocks.join(' ')
@@ -130,13 +174,17 @@ function strideBlocks(blocks: string[], keepCount: number, elisionLabel: (from: 
  * deterministic striding. Without word timings: the raw transcript, strided
  * the same way when over budget (temporal markers are impossible without
  * word data — honest absence, never fabricated timestamps).
+ *
+ * INVARIANT: the returned text is ALWAYS <= maxChars for every input — the
+ * stride loop measures real output length (including elision labels) and a
+ * final hard-cut guard covers inputs the stride cannot compress.
  */
 export function buildTimestampedTranscript(
   transcript: string,
   words: TranscriptWord[],
   opts?: { maxChars?: number },
 ): MarkedTranscript {
-  const maxChars = Math.max(4000, opts?.maxChars ?? TRANSCRIPT_PROMPT_BUDGET)
+  const maxChars = Math.max(0, opts?.maxChars ?? TRANSCRIPT_PROMPT_BUDGET)
 
   if (words.length > 0) {
     const marked = markWords(words)
@@ -144,15 +192,15 @@ export function buildTimestampedTranscript(
       return { text: marked.text, markers: marked.markers, truncated: false, coverage: 'full' }
     }
     // over budget → deterministic block stride across the whole timeline
-    // (split on the marked text's whitespace, BLOCK_WORDS-word blocks)
+    // (split on the marked text's whitespace, BLOCK_WORDS-word blocks), then
+    // measured to fit: elision labels count against the budget.
     const tokens = marked.text.split(' ')
     const blocks: string[] = []
     for (let i = 0; i < tokens.length; i += BLOCK_WORDS) {
       blocks.push(tokens.slice(i, i + BLOCK_WORDS).join(' '))
     }
-    const avgBlock = marked.text.length / blocks.length
-    const keepCount = Math.max(2, Math.min(blocks.length, Math.floor(maxChars / avgBlock)))
-    const strided = strideBlocks(blocks, keepCount, (from, to) => ` [… transcript ${from * BLOCK_WORDS}–${(to + 1) * BLOCK_WORDS} words elided for length — never quote across this gap …] `)
+    const label = (from: number, to: number) => ` [… transcript ${from * BLOCK_WORDS}–${(to + 1) * BLOCK_WORDS} words elided for length — never quote across this gap …] `
+    const strided = hardCutToBudget(strideToFit(blocks, marked.text.length, maxChars, label), maxChars)
     return { text: strided, markers: marked.markers, truncated: true, coverage: 'strided' }
   }
 
@@ -165,8 +213,7 @@ export function buildTimestampedTranscript(
   for (let i = 0; i < tokens.length; i += BLOCK_WORDS) {
     blocks.push(tokens.slice(i, i + BLOCK_WORDS).join(' '))
   }
-  const avgBlock = transcript.length / blocks.length
-  const keepCount = Math.max(2, Math.min(blocks.length, Math.floor(maxChars / avgBlock)))
-  const strided = strideBlocks(blocks, keepCount, (from, to) => ` [… transcript blocks ${from + 1}–${to + 1} elided for length — never quote across this gap …] `)
+  const label = (from: number, to: number) => ` [… transcript blocks ${from + 1}–${to + 1} elided for length — never quote across this gap …] `
+  const strided = hardCutToBudget(strideToFit(blocks, transcript.length, maxChars, label), maxChars)
   return { text: strided, markers: 0, truncated: true, coverage: 'strided' }
 }
