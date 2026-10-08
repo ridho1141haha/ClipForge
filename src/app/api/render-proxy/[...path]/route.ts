@@ -390,6 +390,10 @@ export async function POST(
       method: 'POST',
       headers,
       body,
+      // propagate client disconnects as a CONTROLLED abort — without this,
+      // a mid-upload disconnect surfaces later as an undici socket error
+      // (unhandledRejection: TypeError: terminated)
+      signal: req.signal,
       // @ts-expect-error — undici duplex option for stream bodies
       duplex: 'half',
     })
@@ -452,7 +456,11 @@ export async function GET(
   const binaryArtifact = jobMatch?.[3] === 'download' || jobMatch?.[3] === 'cover'
 
   try {
-    const upstream = await fetch(targetUrl, { method: 'GET' })
+    // signal: client disconnect (closed EventSource / aborted download) must
+    // abort the upstream fetch deterministically — otherwise the runtime's
+    // cancellation of the passthrough body races undici's socket handling and
+    // surfaces as an unhandled socket-error rejection.
+    const upstream = await fetch(targetUrl, { method: 'GET', signal: req.signal })
     const ct = upstream.headers.get('content-type') ?? 'application/octet-stream'
     if (ct.includes('text/event-stream')) {
       // SSE: forward the upstream body DIRECTLY (byte-identical event format).

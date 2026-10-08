@@ -1087,6 +1087,12 @@ console.log('\n== SURGICAL HARDENING: no wildcard CORS; pull-based multipart; SS
   assert(getSect.includes('new NextResponse(upstream.body'), 'SSE/binary responses forward upstream.body directly')
   assert(!getSect.includes('getReader()'), 'SSE has NO manual reader pump (leaked upstream connections + unhandled rejections)')
 
+  // disconnect propagation: upstream fetches carry the request abort signal —
+  // a closed EventSource / aborted download aborts the upstream deterministically
+  // (no undici 'TypeError: terminated' unhandled rejections in the server log)
+  assert(proxy.includes('signal: req.signal,'), 'POST render upload propagates the client abort signal')
+  assert(getSect.includes("{ method: 'GET', signal: req.signal }"), 'GET poll/stream/download propagates the client abort signal')
+
   // ownership: recording failure is HONEST — cancel renderer job + 5xx, never a doomed job id
   assert(proxy.includes('recorded.ok'), 'ownership recording result is checked (no silent swallow)')
   assert(proxy.includes('/cancel`'), 'ownership recording failure cancels the renderer job (no orphan work)')
