@@ -21,6 +21,9 @@
  *   7. renderer's own durationOk flag true
  *   8. cover frame: recipe.cover @ output 3.5s → hasCover=true, /cover serves
  *      a real JPEG (magic bytes FFD8FF, non-trivial size)
+ *   9. DURATION REGRESSION: a 60fps source WITH a camera punch-in must still
+ *      render ≈ the recipe duration (zoompan fps normalization; the reported
+ *      45.2s-vs-23s bug was a 2× stretch from zoompan re-stamping frames)
  */
 
 import { execFile } from 'node:child_process'
@@ -32,6 +35,18 @@ import type { Word } from '../src/lib/subtitles'
 
 const execFileAsync = promisify(execFile)
 const RENDERER = 'http://localhost:3003'
+
+// Internal renderer auth (shared secret). The renderer rejects unauthenticated
+// requests BEFORE any expensive work; the proxy injects this same token.
+const RENDERER_TOKEN = process.env.CLIPFORGE_RENDERER_TOKEN
+if (!RENDERER_TOKEN) {
+  console.error('FATAL: CLIPFORGE_RENDERER_TOKEN is not set (see .env.example)')
+  process.exit(1)
+}
+/** Headers for DIRECT renderer calls (tests exercise the real internal contract). */
+function rh(extra: Record<string, string> = {}): Record<string, string> {
+  return { 'x-clipforge-internal-token': RENDERER_TOKEN!, ...extra }
+}
 
 const CLIP_START = 5
 const CLIP_END = 35
@@ -141,7 +156,7 @@ async function main() {
   const fileBuf = readFileSync(srcPath)
   form.append('video', new Blob([fileBuf], { type: 'video/mp4' }), 'src.mp4')
   form.append('recipe', recipeJson)
-  const startRes = await fetch(`${RENDERER}/render`, { method: 'POST', body: form })
+  const startRes = await fetch(`${RENDERER}/render`, { method: 'POST', body: form, headers: rh() })
   const startJson: any = await startRes.json()
   assert(startRes.ok && startJson.id, 'render job accepted', JSON.stringify(startJson))
 
@@ -150,7 +165,7 @@ async function main() {
   const deadline = Date.now() + 240_000
   while (Date.now() < deadline) {
     await new Promise((r) => setTimeout(r, 1200))
-    const r = await fetch(`${RENDERER}/jobs/${startJson.id}`)
+    const r = await fetch(`${RENDERER}/jobs/${startJson.id}`, { headers: rh() })
     job = await r.json()
     if (['done', 'error', 'cancelled'].includes(job.status)) break
   }
@@ -159,7 +174,7 @@ async function main() {
   assert(job?.hasCover === true, 'cover frame extracted (job.hasCover=true)', `hasCover=${job?.hasCover}`)
 
   console.log('\n== Golden E2E: output file validation (ffprobe / volumedetect) ==')
-  const dl = await fetch(`${RENDERER}/jobs/${startJson.id}/download`)
+  const dl = await fetch(`${RENDERER}/jobs/${startJson.id}/download`, { headers: rh() })
   assert(dl.ok, 'download endpoint returns 200', `status=${dl.status}`)
   const outPath = '/tmp/clipforge-e2e-out.mp4'
   writeFileSync(outPath, Buffer.from(await dl.arrayBuffer()))
@@ -177,7 +192,7 @@ async function main() {
   assert(mv > -60, 'audio is NOT silent (mean_volume > -60dB)', `mean_volume=${mv}dB`)
 
   console.log('\n== Golden E2E: cover-frame extraction (Shorts cover) ==')
-  const coverRes = await fetch(`${RENDERER}/jobs/${startJson.id}/cover`)
+  const coverRes = await fetch(`${RENDERER}/jobs/${startJson.id}/cover`, { headers: rh() })
   assert(coverRes.ok, 'cover endpoint returns 200', `status=${coverRes.status}`)
   assert((coverRes.headers.get('content-type') ?? '').includes('image/jpeg'), 'cover content-type = image/jpeg', coverRes.headers.get('content-type') ?? '')
   const coverBuf = Buffer.from(await coverRes.arrayBuffer())
@@ -188,6 +203,77 @@ async function main() {
   const coverStream = (coverProbe2?.streams ?? [])[0]
   assert(coverStream?.codec_name === 'mjpeg' || coverStream?.codec_name === 'jpeg' || coverStream?.codec_name === 'png', 'cover decodes as a real image', JSON.stringify(coverStream))
   assert(coverStream?.width === 1080 && coverStream?.height === 1920, 'cover is a 9:16 frame (1080x1920)', `${coverStream?.width}x${coverStream?.height}`)
+
+  // ---------------------------------------------------------------------
+  // DURATION SOURCE-OF-TRUTH REGRESSION (60fps source + camera punch-in)
+  // ---------------------------------------------------------------------
+  // Root cause of the reported 45.2s-output-vs-23s-UI discrepancy: zoompan
+  // re-stamps EVERY surviving frame at fps=30 (d=1), so a 60fps source was
+  // stretched to 2× duration (22.6s plan → 45.2s output) while 30fps sources
+  // (the original golden fixture) were unaffected. The renderer must normalize
+  // to CFR 30 BEFORE zoompan so the output duration equals the recipe duration
+  // for ANY source frame rate.
+  console.log('\n== Golden E2E: duration regression (60fps source + zoompan must NOT stretch output) ==')
+  {
+    const src60 = '/tmp/clipforge-e2e-src60.mp4'
+    await execFileAsync('ffmpeg', [
+      '-nostdin', '-y',
+      '-f', 'lavfi', '-i', 'testsrc2=size=1280x720:rate=60:duration=14',
+      '-f', 'lavfi', '-i', 'sine=frequency=440:sample_rate=44100:duration=14',
+      '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '28',
+      '-c:a', 'aac', '-b:a', '96k', '-shortest', src60,
+    ], { timeout: 120_000 })
+    assert(existsSync(src60), '60fps synthetic source generated (14s)')
+
+    // clip 2–12 (10s window), cut 5–7 (2s) → 8s expected output, WITH a punch-in
+    // so zoompan is actually in the filter chain (the buggy path)
+    const plan60: EditPlan = {
+      project: { title: 'sixty fps regression', style: 'podcast', platform: 'shorts', target_duration: 8, aspect_ratio: '9:16' },
+      analysis: { main_topic: 'fps', audience: 'qa', content_type: 'test', overall_summary: '60fps regression' },
+      selected_clip: {
+        id: 'fps60_01', start: 2, end: 12, duration: 10, title: '60fps regression clip',
+        generated_hook: 'FPS REGRESSION HOOK',
+        segments: [], cuts: [{ start: 5, end: 7, reason: 'fps regression cut' }],
+        camera: [{ start: 2, end: 8, scale_start: 1.0, scale_end: 1.15, reason: 'punch-in (activates zoompan)' }],
+        visuals: [], animations: [], sound_effects: [],
+        music: { recommended: false, style: 'none', intensity: 0, ducking_percent: 0 },
+        subtitles: [],
+      },
+    }
+    const recipe60 = buildRecipeJSON(buildRenderRecipe(plan60, 'fps60_test_id'))
+    const parsed60 = JSON.parse(recipe60)
+    const EXPECTED60 = 8
+    assert(eq(parsed60.output_duration, EXPECTED60), '60fps recipe output_duration = 8s', `got ${parsed60.output_duration}`)
+
+    const form60 = new FormData()
+    form60.append('video', new Blob([readFileSync(src60)], { type: 'video/mp4' }), 'src60.mp4')
+    form60.append('recipe', recipe60)
+    const start60 = await fetch(`${RENDERER}/render`, { method: 'POST', body: form60, headers: rh() })
+    const start60Json: any = await start60.json()
+    assert(start60.ok && start60Json.id, '60fps render job accepted', JSON.stringify(start60Json))
+
+    let job60: any = null
+    const deadline60 = Date.now() + 240_000
+    while (Date.now() < deadline60) {
+      await new Promise((r) => setTimeout(r, 1200))
+      const r = await fetch(`${RENDERER}/jobs/${start60Json.id}`, { headers: rh() })
+      job60 = await r.json()
+      if (['done', 'error', 'cancelled'].includes(job60.status)) break
+    }
+    assert(job60?.status === 'done', '60fps render completes', `status=${job60?.status} error=${job60?.error}`)
+    // THE regression assertion: output duration must equal the recipe duration
+    // (a 2× stretch here means zoompan consumed a non-30fps input)
+    assert(job60?.durationOk === true, '60fps render durationOk=true (no fps drift)', `duration=${job60?.duration} vs ${EXPECTED60}`)
+    const dl60 = await fetch(`${RENDERER}/jobs/${start60Json.id}/download`, { headers: rh() })
+    assert(dl60.ok, '60fps download returns 200', `status=${dl60.status}`)
+    const out60 = '/tmp/clipforge-e2e-out60.mp4'
+    writeFileSync(out60, Buffer.from(await dl60.arrayBuffer()))
+    const probe60 = await ffprobeJson(out60)
+    const dur60 = parseFloat(probe60.format?.duration ?? '0')
+    assert(Math.abs(dur60 - EXPECTED60) <= 0.75, `60fps output duration ≈ ${EXPECTED60}s (zoompan must not stretch)`, `got ${dur60}`)
+    const a60 = (probe60.streams ?? []).find((s: any) => s.codec_type === 'audio')
+    assert(a60?.codec_name === 'aac', '60fps output audio stream present (A/V stays in sync)', `got ${a60?.codec_name}`)
+  }
 
   console.log(`\n════════════════════════════════`)
   console.log(`GOLDEN E2E RESULT: ${passed} passed, ${failed} failed`)

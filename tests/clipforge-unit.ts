@@ -1091,12 +1091,124 @@ console.log('\n== SURGICAL HARDENING: no wildcard CORS; pull-based multipart; SS
   // a closed EventSource / aborted download aborts the upstream deterministically
   // (no undici 'TypeError: terminated' unhandled rejections in the server log)
   assert(proxy.includes('signal: req.signal,'), 'POST render upload propagates the client abort signal')
-  assert(getSect.includes("{ method: 'GET', signal: req.signal }"), 'GET poll/stream/download propagates the client abort signal')
+  assert(proxy.includes("method: 'GET'") && getSect.includes('signal: req.signal'), 'GET poll/stream/download propagates the client abort signal')
 
   // ownership: recording failure is HONEST — cancel renderer job + 5xx, never a doomed job id
   assert(proxy.includes('recorded.ok'), 'ownership recording result is checked (no silent swallow)')
   assert(proxy.includes('/cancel`'), 'ownership recording failure cancels the renderer job (no orphan work)')
   assert(proxy.includes('the render was cancelled'), 'client receives an honest error when ownership recording fails')
+}
+
+// ---------------------------------------------------------------------------
+// ROUND: internal renderer authentication (shared secret) — CORS is NOT
+// authentication: a malicious local page can POST to 127.0.0.1:3003 without a
+// preflight, so the renderer must verify a shared secret BEFORE any expensive
+// work, and the proxy must attach it to EVERY Next.js → renderer call.
+// ---------------------------------------------------------------------------
+console.log('\n== INTERNAL RENDERER AUTH: shared secret gate + proxy attach on every call ==')
+{
+  const { readFileSync: rf4 } = await import('node:fs')
+  const renderer = rf4('mini-services/ffmpeg-renderer/index.ts', 'utf-8')
+  const proxy = rf4('src/app/api/render-proxy/[...path]/route.ts', 'utf-8')
+
+  assert(renderer.includes('CLIPFORGE_RENDERER_TOKEN'), 'renderer reads CLIPFORGE_RENDERER_TOKEN from the environment')
+  assert(renderer.includes('process.exit(1)'), 'renderer FAILS CLOSED at startup when no token is configured')
+  assert(renderer.includes('timingSafeEqual'), 'token comparison is constant-time (timingSafeEqual)')
+  // the gate must be the FIRST thing in the fetch handler — before routing /
+  // formData parsing / job mutation / ffmpeg
+  const fetchIdx = renderer.indexOf('async fetch(req)')
+  const gateIdx = renderer.indexOf("if (!tokenOk(req.headers.get(TOKEN_HEADER))")
+  const formDataIdx = renderer.indexOf('req.formData()')
+  assert(fetchIdx !== -1 && gateIdx !== -1, 'renderer has the auth gate inside the fetch handler')
+  assert(gateIdx < formDataIdx, 'auth gate runs BEFORE body parsing / any expensive work')
+  assert(gateIdx < renderer.indexOf("url.pathname === '/render'"), 'auth gate runs BEFORE route dispatch (401, not 404 — no existence leak)')
+  assert(renderer.includes("json({ error: 'Unauthorized' }, 401)"), 'invalid token → 401 Unauthorized')
+  assert(!renderer.includes('console.log(`[clipforge-renderer] token'), 'renderer never logs the token')
+
+  assert(proxy.includes('rendererHeaders'), 'proxy centralizes the internal-token headers (rendererHeaders)')
+  // every Next.js → renderer fetch attaches the token: POST main call, GET
+  // main call, and the ownership-failure cancel
+  assert(proxy.includes('headers: rendererHeaders(headers)'), 'POST /render fetch attaches the internal token')
+  assert(proxy.includes('headers: rendererHeaders(),\n      signal: req.signal,'), 'GET poll/stream/download fetch attaches the internal token')
+  const recordedFail = proxy.slice(proxy.indexOf('if (!recorded.ok)'))
+  assert(recordedFail.includes('headers: rendererHeaders()'), 'ownership-failure cancel attaches the internal token (no stranded orphan)')
+  assert(proxy.includes('if (!RENDERER_TOKEN)'), 'proxy fails closed (honest 500) when the token is not configured')
+  // the token never reaches a browser-facing response body
+  assert(!proxy.includes('body: JSON.stringify({ error'), 'sanity: proxy error bodies checked (no token echo below)')
+  assert(!proxy.match(/JSON\.stringify\([^)]*RENDERER_TOKEN/), 'proxy never serializes the token into any response body')
+  assert(!renderer.match(/JSON\.stringify\([^)]*RENDERER_TOKEN/), 'renderer never serializes the token into any response body')
+}
+
+// ---------------------------------------------------------------------------
+// ROUND: OUTPUT DURATION SOURCE OF TRUTH — zoompan re-stamps every frame at
+// fps=30 (d=1); a 60fps input stretched 22.6s plans to 45.2s outputs (the
+// reported "output 45.2s vs UI 23s" bug). Both renderers must normalize to
+// CFR 30 BEFORE zoompan; the UI must label window vs output durations.
+// ---------------------------------------------------------------------------
+console.log('\n== DURATION SOURCE OF TRUTH: fps=30 before zoompan (renderer + script) + labeled UI ==')
+{
+  const { readFileSync: rf5 } = await import('node:fs')
+  const renderer = rf5('mini-services/ffmpeg-renderer/index.ts', 'utf-8')
+  const recipeLib = rf5('src/lib/render-recipe.ts', 'utf-8')
+  const uploadRender = rf5('src/components/clip-studio/upload-render.tsx', 'utf-8')
+
+  // renderer: fps=30 must be pushed immediately before zoompan (same branch)
+  const zoomIdx = renderer.indexOf("postParts.push('fps=30')")
+  const zoomPush = renderer.indexOf('postParts.push(zoom)')
+  assert(zoomIdx !== -1 && zoomPush !== -1 && zoomIdx < zoomPush, 'renderer normalizes to fps=30 BEFORE zoompan (60fps → no 2× stretch)')
+  assert(renderer.includes('DURATION SOURCE OF TRUTH'), 'renderer documents the duration contract at the fix site')
+  // shell-script generator keeps preview/render parity
+  const scriptSection = recipeLib.slice(recipeLib.indexOf('export function generateFFmpegScript'))
+  assert(scriptSection.includes("vfParts.push('fps=30', zoomFilter)"), 'generateFFmpegScript applies the same fps=30 normalization')
+  // UI labels BOTH durations honestly (selected window vs output after cuts)
+  assert(uploadRender.includes('outputDurationSec)} output'), 'UI labels the OUTPUT duration (after cuts) explicitly')
+  assert(uploadRender.includes('selected_clip.duration)} clip'), 'UI labels the selected CLIP window duration explicitly')
+}
+
+// ---------------------------------------------------------------------------
+// ROUND: duration consistency (unit level) — plan keep-range math, recipe JSON
+// and the preview mapping must agree for adversarial cut shapes.
+// ---------------------------------------------------------------------------
+console.log('\n== DURATION CONSISTENCY: recipe output_duration == keep-range sum == preview mapping ==')
+{
+  const { buildKeepRanges: bkr, outputDuration: outDur } = await import('../src/lib/subtitles')
+  const { buildRecipeJSON, buildRenderRecipe } = await import('../src/lib/render-recipe')
+  const { mapKeepRanges, keepRangesOutputDuration } = await import('../src/lib/keep-ranges')
+
+  const cases: { name: string; clipStart: number; clipEnd: number; cuts: { start: number; end: number }[] }[] = [
+    { name: 'no cuts', clipStart: 5, clipEnd: 35, cuts: [] },
+    { name: 'single cut', clipStart: 5, clipEnd: 35, cuts: [{ start: 15, end: 25 }] },
+    { name: 'OVERLAPPING cuts', clipStart: 5, clipEnd: 35, cuts: [{ start: 10, end: 20 }, { start: 15, end: 30 }] },
+    { name: 'cut extends past clip end', clipStart: 5, clipEnd: 35, cuts: [{ start: 25, end: 99 }] },
+    { name: 'cut before clip start', clipStart: 5, clipEnd: 35, cuts: [{ start: 0, end: 10 }] },
+    { name: 'duplicate cuts', clipStart: 5, clipEnd: 35, cuts: [{ start: 12, end: 18 }, { start: 12, end: 18 }] },
+    { name: 'full cut', clipStart: 5, clipEnd: 35, cuts: [{ start: 0, end: 99 }] },
+  ]
+  for (const c of cases) {
+    const plan: any = {
+      project: { title: 'consistency', style: 'podcast', platform: 'shorts', target_duration: 10, aspect_ratio: '9:16' },
+      analysis: { main_topic: 't', audience: 'qa', content_type: 'test', overall_summary: 't' },
+      selected_clip: {
+        id: 'c1', start: c.clipStart, end: c.clipEnd, duration: c.clipEnd - c.clipStart, title: 'c',
+        generated_hook: 'H', segments: [], cuts: c.cuts, camera: [], visuals: [], animations: [],
+        sound_effects: [], music: { recommended: false, style: 'none', intensity: 0, ducking_percent: 0 }, subtitles: [],
+      },
+    }
+    const recipe = buildRenderRecipe(plan, 'consistency_test')
+    const json = JSON.parse(buildRecipeJSON(recipe))
+    const krSum = bkr(c.clipStart, c.clipEnd, c.cuts).reduce((a, r) => a + (r.end - r.start), 0)
+    const previewDur = keepRangesOutputDuration(mapKeepRanges(c.clipStart, c.clipEnd, c.cuts))
+    const libDur = outDur(c.clipStart, c.clipEnd, c.cuts)
+    assert(
+      eq(json.output_duration, krSum, 0.001) && eq(json.duration, krSum, 0.001) && eq(previewDur, krSum, 0.001) && eq(libDur, krSum, 0.001),
+      `[${c.name}] recipe output_duration == keep-range sum == preview duration == outputDuration() (${krSum.toFixed(2)}s)`,
+      JSON.stringify({ json: json.output_duration, krSum, previewDur, libDur }),
+    )
+    // renderer contract: keep ranges are sorted, non-overlapping, inside the window
+    const okRanges = json.keep_ranges.every((r: any, i: number) =>
+      r.end > r.start && r.start >= c.clipStart - 1e-9 && r.end <= c.clipEnd + 1e-9 && (i === 0 || json.keep_ranges[i - 1].end <= r.start + 1e-9))
+    assert(okRanges, `[${c.name}] keep ranges sorted, disjoint, within [clipStart, clipEnd]`, JSON.stringify(json.keep_ranges))
+  }
 }
 
 // ---------------------------------------------------------------------------

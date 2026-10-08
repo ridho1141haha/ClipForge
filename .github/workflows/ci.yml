@@ -12,6 +12,10 @@ on:
 # for the generated client, which silently strands the runtime on a missing file).
 env:
   DATABASE_URL: file:${{ github.workspace }}/db/custom.db
+  # Shared secret between the Next.js proxy and the ffmpeg-renderer (see
+  # SECURITY.md — internal renderer authentication). A CI-local value is fine:
+  # the renderer is loopback-only, and both sides run in the same job.
+  CLIPFORGE_RENDERER_TOKEN: ci-test-internal-renderer-token
 
 jobs:
   check:
@@ -32,6 +36,8 @@ jobs:
         run: bun run lint
       - name: Unit tests
         run: bun run test:unit
+      - name: Ownership failure-injection tests (mocked db + renderer)
+        run: bun run test:ownership
 
   build:
     name: production build
@@ -76,16 +82,18 @@ jobs:
         run: |
           cd mini-services/ffmpeg-renderer
           nohup bun run index.ts > /tmp/renderer.log 2>&1 &
-          for i in $(seq 1 30); do curl -sf http://127.0.0.1:3003/ && break || sleep 1; done
-          curl -sf http://127.0.0.1:3003/ > /dev/null # fail fast if renderer never came up
+          for i in $(seq 1 30); do curl -sf -H "X-ClipForge-Internal-Token: $CLIPFORGE_RENDERER_TOKEN" http://127.0.0.1:3003/ && break || sleep 1; done
+          curl -sf -H "X-ClipForge-Internal-Token: $CLIPFORGE_RENDERER_TOKEN" http://127.0.0.1:3003/ > /dev/null # fail fast if renderer never came up
+      - name: Renderer-auth E2E (isolated instance: 401 matrix, fail-closed startup)
+        run: bun run test:renderer-auth
       - name: Start Next.js dev server
         run: |
           nohup bun run dev > /tmp/next.log 2>&1 &
           for i in $(seq 1 60); do curl -sf http://127.0.0.1:3000/ && break || sleep 2; done
           curl -sf http://127.0.0.1:3000/ > /dev/null # fail fast if server never came up
-      - name: Golden render E2E (frame-accurate cuts, 9:16, A/V sync)
+      - name: Golden render E2E (frame-accurate cuts, 9:16, A/V sync, 60fps duration regression)
         run: bun run test:e2e
-      - name: Render-security E2E (job ownership · recipe validation · full-cut rejection)
+      - name: Render-security E2E (internal auth · job ownership · recipe validation · full-cut rejection)
         run: bun run test:render-security
       - name: Dump service logs on failure
         if: failure()

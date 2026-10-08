@@ -32,6 +32,15 @@ import type { EditPlan } from '../src/lib/editplan'
 const execFileAsync = promisify(execFile)
 const PROXY = 'http://localhost:3000/api/render-proxy'
 
+// Internal renderer auth: direct renderer probes must carry the shared secret
+// (the proxy injects the same value for every Next.js → renderer call).
+const RENDERER_TOKEN = process.env.CLIPFORGE_RENDERER_TOKEN
+if (!RENDERER_TOKEN) {
+  console.error('FATAL: CLIPFORGE_RENDERER_TOKEN is not set (see .env.example)')
+  process.exit(1)
+}
+const rh = () => ({ 'x-clipforge-internal-token': RENDERER_TOKEN! })
+
 const OWNER = 'clipforge_sid=s-e2e-owner-session-000001'
 const FOREIGN = 'clipforge_sid=s-e2e-foreign-session-0001'
 
@@ -48,21 +57,29 @@ function assert(cond: boolean, name: string, detail = '') {
 }
 
 async function main() {
-  console.log('\n== Render-security E2E: renderer network boundary (loopback-only, no CORS) ==')
+  console.log('\n== Render-security E2E: renderer network boundary (loopback-only, no CORS, internal auth) ==')
   {
-    // The renderer is an internal trusted service whose ONLY supported client
-    // is the Next.js proxy (server-to-server). It must therefore:
+    // The renderer is an internal service whose ONLY supported client is the
+    // Next.js proxy (server-to-server). It must therefore:
     //   1. be bound to 127.0.0.1 (not reachable off-host)
-    //   2. emit NO wildcard CORS headers (CORS is browser-enforced; wildcard
-    //      ACAO would only ever authorize browser pages to read it)
+    //   2. emit NO wildcard CORS headers
+    //   3. REJECT requests without the shared internal token (a malicious
+    //      local page can POST to 127.0.0.1 without a preflight — CORS is not
+    //      authentication; the token is)
     const bind = await execFileAsync('sh', ['-c', "ss -tlnp 2>/dev/null | grep ':3003' || true"]).catch(() => ({ stdout: '' }))
     assert(/127\.0\.0\.1:3003/.test(bind.stdout), 'renderer LISTENs on 127.0.0.1:3003 (not 0.0.0.0/[::])', bind.stdout.trim())
-    const health = await fetch('http://127.0.0.1:3003/')
-    assert(health.ok, 'renderer health responds (proxy → renderer path alive)')
+    const health = await fetch('http://127.0.0.1:3003/', { headers: rh() })
+    assert(health.ok, 'renderer health responds with the internal token (proxy → renderer path alive)')
+    const healthNoToken = await fetch('http://127.0.0.1:3003/')
+    assert(healthNoToken.status === 401, 'renderer WITHOUT token → 401 (internal auth enforced)', `status=${healthNoToken.status}`)
+    const healthWrong = await fetch('http://127.0.0.1:3003/', { headers: { 'x-clipforge-internal-token': 'wrong-token' } })
+    assert(healthWrong.status === 401, 'renderer with WRONG token → 401', `status=${healthWrong.status}`)
+    const noTokenBody: any = await healthNoToken.json().catch(() => ({}))
+    assert(!noTokenBody.id && !noTokenBody.port, '401 body leaks no internal details', JSON.stringify(noTokenBody))
     assert(!health.headers.has('access-control-allow-origin'), 'renderer emits NO Access-Control-Allow-Origin header')
     assert(!health.headers.has('access-control-allow-methods'), 'renderer emits NO Access-Control-Allow-Methods header')
     assert(!health.headers.has('access-control-allow-headers'), 'renderer emits NO Access-Control-Allow-Headers header')
-    const preflight = await fetch('http://127.0.0.1:3003/render', { method: 'OPTIONS' })
+    const preflight = await fetch('http://127.0.0.1:3003/render', { method: 'OPTIONS', headers: rh() })
     assert(!preflight.headers.has('access-control-allow-origin'), 'OPTIONS is NOT treated as a CORS preflight by the renderer')
   }
 
