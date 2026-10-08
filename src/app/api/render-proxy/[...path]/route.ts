@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { statSync, existsSync, rmSync } from 'node:fs'
-import { open } from 'node:fs/promises'
+import { open, readFile, writeFile } from 'node:fs/promises'
 import { basename, join } from 'node:path'
 import { randomUUID } from 'node:crypto'
 import { db } from '@/lib/db'
@@ -20,6 +20,7 @@ import { ensureRenderer } from '@/lib/renderer-supervisor'
 // AUTHORIZED here against the RenderJob table BEFORE touching the renderer:
 //   POST /render  → records (jobId, ownerId, projectId) on success
 //   POST /jobs/:id/cancel   → 404 unless the row exists AND ownerId matches
+//   POST /jobs/:id/pin      → 404 unless owned (pin/unpin a DONE artifact)
 //   GET  /jobs/:id          → 404 unless owned
 //   GET  /jobs/:id/stream   → 404 unless owned
 //   GET  /jobs/:id/download → 404 unless owned
@@ -61,6 +62,9 @@ const JOB_PATH_RE = /^\/jobs\/([\w-]+)(\/(stream|download|cover|cancel))?$/
 // statuses that mean "the renderer should still know this job" — used by the
 // stale-row reconciliation (a 404 for an ACTIVE row = the job is lost)
 const ACTIVE_STATUSES = new Set(['QUEUED', 'EXTRACTING', 'RENDERING', 'FINALIZING'])
+// mirrors the renderer's SAFE_MP4_NAME — manifests are trusted, but the
+// direct-FS pin fallback validates anyway (defense in depth)
+const SAFE_MP4_NAME = /^clipforge_[A-Za-z0-9_-]{0,60}\.mp4$/
 
 /**
  * GET /api/render-proxy/jobs — render history for THIS session (owner-scoped).
@@ -140,12 +144,72 @@ async function sweepStaleActiveRows(): Promise<void> {
   }
 }
 
+/** Ancient-row prune (round-5 housekeeping): RenderJob rows accumulate forever
+ * for sessions that never return (closed browsers lose the cookie — the rows
+ * are invisible to every future owner). After 7 days:
+ *   - ERROR/CANCELLED rows have no artifacts by definition → delete outright
+ *   - DONE rows are deleted ONLY when the renderer confirms the artifact is
+ *     gone (404) — a pinned or still-within-cap artifact keeps its row (the
+ *     download link must keep working); an unreachable renderer keeps rows
+ *     (cannot verify — never delete on a guess)
+ * Bounded (take 10 per call), best-effort, all owners. */
+const ANCIENT_ROW_AGE_MS = 7 * 24 * 3600_000
+async function pruneAncientRows(): Promise<void> {
+  try {
+    const cutoff = new Date(Date.now() - ANCIENT_ROW_AGE_MS)
+    // terminal rows with no artifacts by definition
+    const dead = await db.renderJob.deleteMany({
+      where: { status: { in: ['ERROR', 'CANCELLED'] }, updatedAt: { lt: cutoff } },
+    })
+    // DONE rows — verify the artifact is really gone before dropping the row
+    const oldDone = await db.renderJob.findMany({
+      where: { status: 'DONE', updatedAt: { lt: cutoff } },
+      select: { id: true },
+      take: 10,
+    })
+    const gone: string[] = []
+    await Promise.all(
+      oldDone.map(async (row) => {
+        try {
+          const res = await fetch(`${RENDERER_BASE}/jobs/${row.id}`, {
+            signal: AbortSignal.timeout(4000),
+            cache: 'no-store',
+          })
+          if (res.status === 404) gone.push(row.id)
+          // ok → artifact alive (pinned or within cap) — keep the row
+          // network error → unverifiable — keep the row
+        } catch {
+          // unreachable — keep (never delete on a guess)
+        }
+      }),
+    )
+    let doneRemoved = 0
+    for (const id of gone) {
+      try {
+        await db.renderJob.delete({ where: { id } })
+        doneRemoved++
+      } catch {
+        // already gone — fine
+      }
+    }
+    if (dead.count > 0 || doneRemoved > 0) {
+      console.log(`[render-proxy] ancient-row prune: removed ${dead.count} terminal row(s) + ${doneRemoved} artifact-less DONE row(s)`)
+    }
+  } catch {
+    // best-effort housekeeping — never break the list response
+  }
+}
+
 async function listOwnedRenderJobs(): Promise<Response> {
   const ownerId = await getOrCreateSessionId()
   // global housekeeping first (bounded, best-effort): heal abandoned-session
   // ACTIVE rows — this is also the mechanism that eventually resolves rows
-  // like the observed "QUEUED forever after the owner's browser closed".
+  // like the observed "QUEUED forever after the owner's browser closed" —
+  // and prune 7-day-old rows whose artifacts are gone (session cookie loss
+  // makes them invisible to every future owner; disk is bounded by the
+  // renderer GC, the DB rows were the last unbounded accumulator).
   await sweepStaleActiveRows()
+  await pruneAncientRows()
   const rows = await db.renderJob.findMany({
     where: { ownerId },
     orderBy: { createdAt: 'desc' },
@@ -164,7 +228,7 @@ async function listOwnedRenderJobs(): Promise<Response> {
   // merge live artifact facts for DONE rows still known to the renderer —
   // bounded (top 10 done rows), timeout-guarded, fully optional
   const doneRows = rows.filter((r) => r.status === 'DONE').slice(0, 10)
-  const facts = new Map<string, { size?: number; duration?: number; hasCover?: boolean; width?: number; height?: number; quality?: string }>()
+  const facts = new Map<string, { size?: number; duration?: number; hasCover?: boolean; width?: number; height?: number; quality?: string; pinned?: boolean }>()
   await Promise.all(
     doneRows.map(async (row) => {
       try {
@@ -173,7 +237,7 @@ async function listOwnedRenderJobs(): Promise<Response> {
           cache: 'no-store',
         })
         if (res.ok) {
-          const j = (await res.json()) as { size?: unknown; duration?: unknown; hasCover?: unknown; width?: unknown; height?: unknown; quality?: unknown }
+          const j = (await res.json()) as { size?: unknown; duration?: unknown; hasCover?: unknown; width?: unknown; height?: unknown; quality?: unknown; pinned?: unknown }
           facts.set(row.id, {
             ...(typeof j.size === 'number' && Number.isFinite(j.size) ? { size: Math.round(j.size) } : {}),
             ...(typeof j.duration === 'number' && Number.isFinite(j.duration) ? { duration: j.duration } : {}),
@@ -181,6 +245,7 @@ async function listOwnedRenderJobs(): Promise<Response> {
             ...(typeof j.width === 'number' && Number.isFinite(j.width) ? { width: j.width } : {}),
             ...(typeof j.height === 'number' && Number.isFinite(j.height) ? { height: j.height } : {}),
             ...(typeof j.quality === 'string' ? { quality: j.quality } : {}),
+            pinned: j.pinned === true,
           })
         }
         // 404 = artifact past the renderer's retention window — the download
@@ -431,6 +496,83 @@ export async function POST(
 ) {
   const { path } = await ctx.params
   const targetPath = '/' + path.join('/')
+
+  // ---- POST /jobs/:id/pin — pin/unpin a DONE artifact (GC exemption) ----
+  // Handled BEFORE ensureRenderer: flipping a manifest flag must not revive a
+  // dead renderer (same economy as DELETE). Ownership gate → renderer relay
+  // (authoritative — validates + updates the in-memory echo) → direct-FS
+  // manifest edit when the renderer is down (the manifest on disk IS the
+  // durable source of truth; a revived renderer reads it back).
+  const pinMatch = targetPath.match(/^\/jobs\/([\w-]{8,64})\/pin$/)
+  if (pinMatch) {
+    const jobId = pinMatch[1]
+    const ok = await authorizeJob(jobId)
+    if (!ok) return NextResponse.json({ error: 'Job not found' }, { status: 404 })
+    // active rows refuse — matches the renderer's own semantics
+    const row = await db.renderJob.findUnique({ where: { id: jobId }, select: { status: true } })
+    if (row && ACTIVE_STATUSES.has(row.status)) {
+      return NextResponse.json(
+        { error: 'This render is still running — wait for it to finish before pinning.' },
+        { status: 409 },
+      )
+    }
+    let pinned = false
+    try {
+      const raw = await req.text()
+      if (raw.length > 256) return NextResponse.json({ error: 'Pin body too large' }, { status: 400 })
+      pinned = (JSON.parse(raw) as { pinned?: unknown }).pinned === true
+    } catch {
+      return NextResponse.json({ error: 'Invalid JSON body — expected { "pinned": boolean }' }, { status: 400 })
+    }
+    // renderer-first (no revive; 4s timeout)
+    try {
+      const res = await fetch(`${RENDERER_BASE}/jobs/${jobId}/pin`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ pinned }),
+        signal: AbortSignal.timeout(4000),
+      })
+      if (res.status === 409) {
+        const b = await res.text()
+        return new NextResponse(b, { status: 409, headers: { 'content-type': 'application/json' } })
+      }
+      if (res.ok) {
+        const data = (await res.json().catch(() => ({}))) as { pinned?: boolean }
+        return NextResponse.json({ id: jobId, pinned: data.pinned ?? pinned }, { headers: { 'cache-control': 'no-store' } })
+      }
+      if (res.status === 404) {
+        return NextResponse.json(
+          { error: 'No stored artifact to pin — it may have been cleaned or deleted.' },
+          { status: 404 },
+        )
+      }
+      return NextResponse.json({ error: 'Pin failed at the render service.' }, { status: 502 })
+    } catch {
+      // renderer unreachable → direct-FS manifest edit (same repo layout)
+      const rendersRoot = join(process.cwd(), 'upload', 'renders')
+      const manifestPath = join(rendersRoot, jobId, 'manifest.json')
+      try {
+        if (!existsSync(manifestPath) || !manifestPath.startsWith(rendersRoot)) {
+          return NextResponse.json(
+            { error: 'No stored artifact to pin — it may have been cleaned or deleted.' },
+            { status: 404 },
+          )
+        }
+        const m = JSON.parse(await readFile(manifestPath, 'utf8')) as Record<string, unknown>
+        if (m?.id !== jobId || m.status !== 'done' || typeof m.filename !== 'string' || !SAFE_MP4_NAME.test(m.filename)) {
+          return NextResponse.json({ error: 'Stored manifest failed validation.' }, { status: 500 })
+        }
+        m.pinned = pinned
+        await writeFile(manifestPath, JSON.stringify(m))
+        return NextResponse.json({ id: jobId, pinned }, { headers: { 'cache-control': 'no-store' } })
+      } catch {
+        return NextResponse.json(
+          { error: 'Could not update the pin — the render service is unreachable and the manifest could not be edited.' },
+          { status: 502 },
+        )
+      }
+    }
+  }
 
   // SELF-HEALING: if the renderer mini-service is down (sandbox process
   // reaping, crash, reboot), bring it back before proxying — render requests

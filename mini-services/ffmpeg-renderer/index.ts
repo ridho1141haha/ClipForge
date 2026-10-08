@@ -72,6 +72,8 @@ interface PersistedManifest {
   durationOk: boolean
   hasCover: boolean
   quality?: string
+  /** user-pinned: exempt from GC eviction (kept until explicitly deleted) */
+  pinned?: boolean
   completedAt: number
 }
 
@@ -98,6 +100,7 @@ async function readManifest(jobId: string): Promise<PersistedManifest | null> {
       durationOk: m.durationOk !== false,
       hasCover: m.hasCover === true,
       ...(typeof m.quality === 'string' ? { quality: m.quality } : {}),
+      pinned: m.pinned === true,
       completedAt: typeof m.completedAt === 'number' ? m.completedAt : 0,
     }
   } catch {
@@ -155,6 +158,7 @@ function persistArtifacts(job: RenderJob, outPath: string, coverPath: string | n
         durationOk: job.durationOk !== false,
         hasCover: job.hasCover === true,
         quality: job.quality ?? 'standard',
+        pinned: job.pinned === true,
         completedAt: Date.now(),
       }),
     )
@@ -183,23 +187,26 @@ function persistArtifacts(job: RenderJob, outPath: string, coverPath: string | n
 async function sweepPersistedStore(): Promise<void> {
   try {
     const dirs = readdirSync(PERSIST_DIR, { withFileTypes: true }).filter((d) => d.isDirectory())
-    type Item = { id: string; dir: string; completedAt: number; bytes: number; ok: boolean }
+    type Item = { id: string; dir: string; completedAt: number; bytes: number; ok: boolean; pinned: boolean }
     const items: Item[] = []
-    for (const d of dirs) {
-      if (!SAFE_JOB_ID.test(d.name)) {
-        try { rmSync(join(PERSIST_DIR, d.name), { recursive: true, force: true }) } catch {}
-        continue
-      }
-      const dir = join(PERSIST_DIR, d.name)
-      const m = await readManifest(d.name)
-      if (!m) {
-        items.push({ id: d.name, dir, completedAt: 0, bytes: 0, ok: false })
-        continue
-      }
-      let bytes = 0
-      try { bytes = statSync(join(dir, m.filename)).size } catch { /* MP4 missing → invalid */ }
-      items.push({ id: d.name, dir, completedAt: m.completedAt, bytes, ok: bytes > 0 })
-    }
+    // parallel manifest reads (bounded by the dir count itself, ≤ a few
+    // hundred): a sequential await loop measured ~4s over 216 manifests —
+    // harmless for correctness (the sweep is background) but pointlessly slow
+    const results = await Promise.all(
+      dirs.map(async (d) => {
+        if (!SAFE_JOB_ID.test(d.name)) {
+          try { rmSync(join(PERSIST_DIR, d.name), { recursive: true, force: true }) } catch {}
+          return null
+        }
+        const dir = join(PERSIST_DIR, d.name)
+        const m = await readManifest(d.name)
+        if (!m) return { id: d.name, dir, completedAt: 0, bytes: 0, ok: false, pinned: false }
+        let bytes = 0
+        try { bytes = statSync(join(dir, m.filename)).size } catch { /* MP4 missing → invalid */ }
+        return { id: d.name, dir, completedAt: m.completedAt, bytes, ok: bytes > 0, pinned: m.pinned === true }
+      }),
+    )
+    for (const r of results) if (r) items.push(r)
     const invalid = items.filter((x) => !x.ok)
     for (const i of invalid) {
       try { rmSync(i.dir, { recursive: true, force: true }) } catch {}
@@ -207,14 +214,22 @@ async function sweepPersistedStore(): Promise<void> {
     const ok = items.filter((x) => x.ok).sort((a, b) => a.completedAt - b.completedAt)
     let count = ok.length
     let total = ok.reduce((s, x) => s + x.bytes, 0)
+    // PIN EXEMPTION: pinned artifacts are NEVER evicted by the caps — the
+    // user explicitly asked to keep them (they can still DELETE explicitly).
+    // Pinned bytes stay in the accounting so the log is honest about overrun.
+    let keptPinned = 0
     for (const i of ok) {
       if (count <= MAX_PERSISTED_COUNT && total <= MAX_PERSISTED_BYTES) break
+      if (i.pinned) {
+        keptPinned++
+        continue
+      }
       try { rmSync(i.dir, { recursive: true, force: true }) } catch {}
       count--
       total -= i.bytes
     }
     if (invalid.length > 0 || count !== ok.length) {
-      console.log(`[persist] GC: removed ${invalid.length + (ok.length - count)} artifact dir(s), kept ${count}`)
+      console.log(`[persist] GC: removed ${invalid.length + (ok.length - count)} artifact dir(s), kept ${count}${keptPinned > 0 ? ` (${keptPinned} pinned, cap-exempt)` : ''}`)
     }
   } catch {
     // sweep is best-effort — never block a render on it
@@ -276,6 +291,10 @@ interface RenderJob {
   hasCover?: boolean
   /** quality preset this job renders with (recorded into the manifest) */
   quality?: RenderQuality
+  /** user-pinned: the persisted artifact is exempt from GC eviction. Tracked
+   *  in-memory during the 10-min registry window (echoed by publicJob) and —
+   *  durably — in the on-disk manifest (the source of truth across restarts). */
+  pinned?: boolean
   error?: string
   createdAt: number
   finishedAt?: number
@@ -899,6 +918,51 @@ serve({
       return new Response(stream, { headers: { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive' } })
     }
 
+    // POST /jobs/:id/pin — pin/unpin a TERMINAL job's persisted artifact.
+    // Pinning exempts the artifact from GC eviction (the storage-cap sweep
+    // skips pinned dirs); unpin restores normal oldest-first eligibility.
+    // The flag lives in the on-disk manifest (durable across renderer
+    // restarts); the in-memory registry entry is updated too so polls answer
+    // consistently during the 10-min window. ACTIVE jobs refuse with 409
+    // (pinning mid-render is meaningless); jobs with nothing persisted (GC'd
+    // or failed persistence) answer a honest 404.
+    const pinMatch = url.pathname.match(/^\/jobs\/([^/]+)\/pin$/)
+    if (req.method === 'POST' && pinMatch) {
+      const id = pinMatch[1] as string
+      if (!id || !SAFE_JOB_ID.test(id)) return json({ error: 'invalid job id' }, 400)
+      const job = jobs.get(id)
+      if (job && isActive(job.status)) {
+        return json({ error: 'job is still active — wait for it to finish before pinning' }, 409)
+      }
+      let pinned = false
+      try {
+        const raw = await req.text()
+        if (raw.length > 256) return json({ error: 'pin body too large' }, 400)
+        const b = JSON.parse(raw) as { pinned?: unknown }
+        pinned = b.pinned === true
+      } catch {
+        return json({ error: 'invalid JSON body — expected { "pinned": boolean }' }, 400)
+      }
+      // manifest rewrite — preserve every existing field, flip only `pinned`
+      const manifestPath = join(PERSIST_DIR, id, 'manifest.json')
+      if (!existsSync(manifestPath)) {
+        return json({ error: 'no persisted artifact to pin (expired, deleted, or persistence failed)' }, 404)
+      }
+      try {
+        const m = (await Bun.file(manifestPath).json()) as Record<string, unknown>
+        if (m?.id !== id || m.status !== 'done' || typeof m.filename !== 'string' || !SAFE_MP4_NAME.test(m.filename)) {
+          return json({ error: 'manifest failed validation — refusing to modify' }, 500)
+        }
+        m.pinned = pinned
+        writeFileSync(manifestPath, JSON.stringify(m))
+      } catch (err) {
+        return json({ error: 'failed to update the artifact manifest: ' + (err instanceof Error ? err.message : String(err)) }, 500)
+      }
+      if (job) job.pinned = pinned
+      console.log(`[pin] job ${id}: ${pinned ? 'pinned (GC-exempt)' : 'unpinned (normal GC eligibility)'}`)
+      return json({ id, pinned })
+    }
+
     // POST /jobs/:id/cancel — cancel a queued/running job (kills ffmpeg)
     const cancelMatch = url.pathname.match(/^\/jobs\/([^/]+)\/cancel$/)
     if (req.method === 'POST' && cancelMatch) {
@@ -972,6 +1036,7 @@ serve({
       'GET /jobs/:id/download': 'download MP4 (persisted beyond the in-memory LRU)',
       'GET /jobs/:id/cover': 'download cover-frame JPG (when recipe.cover was set)',
       'DELETE /jobs/:id': 'delete a TERMINAL job\'s artifacts + registry entry (409 while active)',
+      'POST /jobs/:id/pin': 'pin/unpin a DONE artifact (body {pinned:boolean}) — pinned artifacts are GC-exempt',
       'GET /stats': 'queue depth (waiting / busy / active)',
     } })
   },

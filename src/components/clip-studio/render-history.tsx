@@ -17,6 +17,8 @@ import {
   Image as ImageIcon,
   Server,
   Trash2,
+  Pin,
+  PinOff,
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { useToast } from '@/hooks/use-toast'
@@ -49,6 +51,9 @@ interface RenderJobRow {
   width?: number
   height?: number
   quality?: string
+  /** true when the artifact is pinned (GC-exempt) — merged from the renderer
+   *  manifest, so it survives restarts and registry reaping */
+  pinned?: boolean
   downloadable?: boolean
   createdAt: string
   updatedAt: string
@@ -118,6 +123,8 @@ export function RenderHistory({ refreshKey }: { refreshKey?: number }) {
   const [confirmId, setConfirmId] = React.useState<string | null>(null)
   const [deletingId, setDeletingId] = React.useState<string | null>(null)
   const confirmResetRef = React.useRef<number>(0)
+  // in-flight pin toggles (row id → target state) for per-row spinner/disabled
+  const [pinningId, setPinningId] = React.useState<string | null>(null)
 
   const load = React.useCallback(async () => {
     setLoading(true)
@@ -201,6 +208,44 @@ export function RenderHistory({ refreshKey }: { refreshKey?: number }) {
     confirmResetRef.current = window.setTimeout(() => {
       setConfirmId((c) => (c === id ? null : c))
     }, 4000)
+  }
+
+  // ---- pin/unpin a finished render (GC exemption) ----
+  // Pinned artifacts are never evicted by the storage-cap sweep; unpinning
+  // restores normal oldest-first eligibility. Optimistic toggle; a failure
+  // reverts and toasts.
+  const togglePin = async (id: string, next: boolean) => {
+    if (pinningId) return
+    setPinningId(id)
+    setJobs((prev) =>
+      prev ? prev.map((j) => (j.id === id ? { ...j, pinned: next } : j)) : prev,
+    )
+    try {
+      const res = await fetch(`/api/render-proxy/jobs/${id}/pin`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ pinned: next }),
+      })
+      const data = (await res.json().catch(() => ({}))) as { pinned?: boolean; error?: string }
+      if (!res.ok || data.pinned !== next) {
+        throw new Error(data.error ?? `Pin failed (HTTP ${res.status})`)
+      }
+      // server-confirmed state (also corrects an optimistic drift)
+      setJobs((prev) =>
+        prev ? prev.map((j) => (j.id === id ? { ...j, pinned: data.pinned } : j)) : prev,
+      )
+    } catch (e: unknown) {
+      setJobs((prev) =>
+        prev ? prev.map((j) => (j.id === id ? { ...j, pinned: !next } : j)) : prev,
+      )
+      toast({
+        title: next ? 'Could not pin render' : 'Could not unpin render',
+        description: e instanceof Error ? e.message : 'Unknown error',
+        variant: 'destructive',
+      })
+    } finally {
+      setPinningId(null)
+    }
   }
 
   React.useEffect(() => () => window.clearTimeout(confirmResetRef.current), [])
@@ -300,9 +345,11 @@ export function RenderHistory({ refreshKey }: { refreshKey?: number }) {
                   className={`group rounded-lg border p-3 transition-all hover:shadow-sm ${
                     active
                       ? 'border-amber-500/25 bg-amber-500/[0.04] hover:border-amber-500/40'
-                      : job.status === 'DONE'
-                        ? 'border-emerald-500/15 bg-emerald-500/[0.03] hover:border-emerald-500/30'
-                        : 'border-border/50 bg-background/40 hover:border-border'
+                      : job.status === 'DONE' && job.pinned
+                        ? 'border-amber-500/25 bg-amber-500/[0.04] hover:border-amber-500/45'
+                        : job.status === 'DONE'
+                          ? 'border-emerald-500/15 bg-emerald-500/[0.03] hover:border-emerald-500/30'
+                          : 'border-border/50 bg-background/40 hover:border-border'
                   }`}
                 >
                   <div className="flex items-center gap-2">
@@ -340,11 +387,42 @@ export function RenderHistory({ refreshKey }: { refreshKey?: number }) {
                       {fmtAgo(job.createdAt)}
                     </span>
 
+                    {/* pin — DONE + downloadable rows only (pinning a cleaned
+                        artifact is meaningless; active rows wait). Pinned rows
+                        get the amber treatment + filled pin. */}
+                    {job.status === 'DONE' && job.downloadable ? (
+                      <button
+                        type="button"
+                        onClick={() => void togglePin(job.id, !job.pinned)}
+                        disabled={pinningId === job.id}
+                        aria-pressed={job.pinned === true}
+                        aria-label={job.pinned ? `Unpin render ${job.filename ?? job.id.slice(0, 8)}` : `Pin render ${job.filename ?? job.id.slice(0, 8)}`}
+                        title={
+                          job.pinned
+                            ? 'Pinned — kept until you delete it (click to unpin)'
+                            : 'Pin — keep this render safe from automatic storage cleanup'
+                        }
+                        className={`relative inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-md border transition-all focus-visible:opacity-100 after:absolute after:-inset-2 after:content-[''] ${
+                          job.pinned
+                            ? 'border-amber-500/40 bg-amber-500/15 text-amber-600 hover:bg-amber-500/25 hover:shadow-sm dark:text-amber-400'
+                            : 'border-transparent text-muted-foreground/50 hover:border-amber-500/30 hover:bg-amber-500/10 hover:text-amber-500 sm:opacity-0 sm:group-hover:opacity-100'
+                        } ${pinningId === job.id ? 'sm:opacity-100' : ''}`}
+                      >
+                        {pinningId === job.id ? (
+                          <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                        ) : job.pinned ? (
+                          <Pin className="h-3.5 w-3.5" />
+                        ) : (
+                          <PinOff className="h-3.5 w-3.5" />
+                        )}
+                      </button>
+                    ) : null}
+
                     {/* cover download */}
                     {job.status === 'DONE' && job.downloadable && job.hasCover ? (
                       <a
                         href={`/api/render-proxy/jobs/${job.id}/cover`}
-                        className="inline-flex h-7 shrink-0 items-center gap-1 rounded-md border border-border/50 bg-background/60 px-2 text-[11px] font-semibold text-muted-foreground transition-all hover:border-primary/40 hover:text-primary"
+                        className="relative inline-flex h-7 shrink-0 items-center gap-1 rounded-md border border-border/50 bg-background/60 px-2 text-[11px] font-semibold text-muted-foreground transition-all after:absolute after:-inset-y-2 after:inset-x-0 after:content-[''] hover:border-primary/40 hover:text-primary"
                         title="Download the extracted cover-frame JPG"
                       >
                         <ImageIcon className="h-3 w-3" />
@@ -356,7 +434,7 @@ export function RenderHistory({ refreshKey }: { refreshKey?: number }) {
                     {job.status === 'DONE' && job.downloadable ? (
                       <a
                         href={`/api/render-proxy/jobs/${job.id}/download`}
-                        className="inline-flex h-7 shrink-0 items-center gap-1 rounded-md border border-emerald-500/30 bg-emerald-500/10 px-2 text-[11px] font-semibold text-emerald-600 transition-all hover:bg-emerald-500/20 hover:shadow-sm dark:text-emerald-400"
+                        className="relative inline-flex h-7 shrink-0 items-center gap-1 rounded-md border border-emerald-500/30 bg-emerald-500/10 px-2 text-[11px] font-semibold text-emerald-600 transition-all after:absolute after:-inset-y-2 after:inset-x-0 after:content-[''] hover:bg-emerald-500/20 hover:shadow-sm dark:text-emerald-400"
                         title="Download the rendered MP4 (stored on the server)"
                       >
                         <Download className="h-3 w-3" />
@@ -381,7 +459,7 @@ export function RenderHistory({ refreshKey }: { refreshKey?: number }) {
                             type="button"
                             onClick={() => void deleteJob(job.id)}
                             disabled={deletingId === job.id}
-                            className="inline-flex h-7 items-center gap-1 rounded-md border border-rose-500/40 bg-rose-500/10 px-2 text-[11px] font-semibold text-rose-600 transition-all hover:bg-rose-500/20 hover:shadow-sm dark:text-rose-400"
+                            className="relative inline-flex h-7 items-center gap-1 rounded-md border border-rose-500/40 bg-rose-500/10 px-2 text-[11px] font-semibold text-rose-600 transition-all after:absolute after:-inset-y-2 after:inset-x-0 after:content-[''] hover:bg-rose-500/20 hover:shadow-sm dark:text-rose-400"
                             title="Permanently delete this render and its stored files"
                           >
                             {deletingId === job.id ? (
@@ -397,7 +475,7 @@ export function RenderHistory({ refreshKey }: { refreshKey?: number }) {
                               window.clearTimeout(confirmResetRef.current)
                               setConfirmId(null)
                             }}
-                            className="inline-flex h-7 items-center rounded-md border border-border/50 px-2 text-[11px] font-medium text-muted-foreground transition-colors hover:text-foreground"
+                            className="relative inline-flex h-7 items-center rounded-md border border-border/50 px-2 text-[11px] font-medium text-muted-foreground transition-all after:absolute after:-inset-y-2 after:inset-x-0 after:content-[''] hover:text-foreground"
                             title="Keep this render"
                           >
                             Keep
@@ -408,7 +486,7 @@ export function RenderHistory({ refreshKey }: { refreshKey?: number }) {
                           type="button"
                           onClick={() => armConfirm(job.id)}
                           disabled={deletingId != null}
-                          className="inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-md border border-transparent text-muted-foreground/50 transition-all hover:border-rose-500/30 hover:bg-rose-500/10 hover:text-rose-500 focus-visible:opacity-100 sm:opacity-0 sm:group-hover:opacity-100"
+                          className="relative inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-md border border-transparent text-muted-foreground/50 transition-all after:absolute after:-inset-2 after:content-[''] hover:border-rose-500/30 hover:bg-rose-500/10 hover:text-rose-500 focus-visible:opacity-100 sm:opacity-0 sm:group-hover:opacity-100"
                           aria-label={`Delete render ${job.filename ?? job.id.slice(0, 8)}`}
                           title="Delete this render (files + history row)"
                         >
@@ -438,6 +516,15 @@ export function RenderHistory({ refreshKey }: { refreshKey?: number }) {
                       {job.quality && job.quality !== 'standard' ? (
                         <span className="rounded bg-primary/10 px-1 py-px text-[9px] font-semibold uppercase tracking-wide text-primary">
                           {job.quality}
+                        </span>
+                      ) : null}
+                      {job.pinned ? (
+                        <span
+                          className="inline-flex items-center gap-0.5 rounded bg-amber-500/10 px-1 py-px text-[9px] font-semibold uppercase tracking-wide text-amber-600 dark:text-amber-400"
+                          title="Pinned — kept until you delete it (exempt from automatic storage cleanup)"
+                        >
+                          <Pin className="h-2.5 w-2.5" />
+                          pinned
                         </span>
                       ) : null}
                     </p>
@@ -483,8 +570,10 @@ export function RenderHistory({ refreshKey }: { refreshKey?: number }) {
       {jobs && jobs.length > 0 ? (
         <p className="mt-2.5 flex items-center gap-1.5 text-[10px] leading-relaxed text-muted-foreground/70">
           <Server className="h-3 w-3 shrink-0" />
-          Rendered files are stored on the server — the oldest are auto-cleaned to stay under the storage cap.
-          {anyActive ? ' Live progress updates every few seconds.' : ''}
+          <span className="min-w-0 flex-1">
+            Pinned renders stay until you delete them — the oldest unpinned files auto-clean to stay under the storage cap.
+            {anyActive ? ' Live progress updates every few seconds.' : ''}
+          </span>
         </p>
       ) : null}
     </div>

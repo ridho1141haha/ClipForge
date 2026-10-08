@@ -43,6 +43,18 @@ export const RENDER_QUALITIES: { id: RenderQuality; label: string; dims: string;
   { id: 'standard', label: 'Standard', dims: '1080×1920', hint: 'Balanced default' },
   { id: 'high', label: 'High', dims: '1080×1920', hint: 'Max fidelity — larger files' },
 ]
+/** Full preset facts (the renderer's encoder settings per quality) — keep in
+ *  sync with mini-services/ffmpeg-renderer/recipe-validation.ts QUALITY_PRESETS.
+ *  Consumed by the export JSON so downstream tools see the real encoder
+ *  contract instead of a stale hardcoded row. */
+export const RENDER_QUALITY_PRESETS: Record<
+  RenderQuality,
+  { width: number; height: number; crf: number; videoPreset: string; audioBitrate: string }
+> = {
+  draft: { width: 720, height: 1280, crf: 26, videoPreset: 'veryfast', audioBitrate: '96k' },
+  standard: { width: 1080, height: 1920, crf: 20, videoPreset: 'veryfast', audioBitrate: '128k' },
+  high: { width: 1080, height: 1920, crf: 16, videoPreset: 'veryfast', audioBitrate: '192k' },
+}
 export function isRenderQuality(v: unknown): v is RenderQuality {
   return v === 'draft' || v === 'standard' || v === 'high'
 }

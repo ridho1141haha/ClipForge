@@ -176,7 +176,19 @@ export async function POST(req: NextRequest) {
                 analyzedAt: analysisMeta.analyzedAt,
               }
             : null,
-          renderSettings: { width: 1080, height: 1920, fps: 30, videoCodec: 'libx264 (H.264)', audioCodec: 'aac 128k', crf: 20 },
+          renderSettings: {
+            fps: 30,
+            videoCodec: 'libx264 (H.264)',
+            audioCodec: 'aac',
+            aspect: '9:16 vertical',
+            // real per-quality encoder settings (mirrors the renderer's
+            // QUALITY_PRESETS contract — render recipe "quality" field)
+            presets: {
+              draft: { width: 720, height: 1280, crf: 26, audioBitrate: '96k' },
+              standard: { width: 1080, height: 1920, crf: 20, audioBitrate: '128k' },
+              high: { width: 1080, height: 1920, crf: 16, audioBitrate: '192k' },
+            },
+          },
           rendererCapabilities: {
             rendered: ['cuts', 'subtitles_burn_in', 'camera_punch_in', '9:16_crop_scale', 'h264+aac_encode'],
             preview_only: ['broll_visuals', 'generated_images', 'animations', 'sound_effects', 'music'],

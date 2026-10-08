@@ -71,8 +71,9 @@ export function UploadRender({ plan, projectId, projectMedia, onJobStarted, onOp
   const [timing, setTiming] = React.useState<{ elapsedMs: number; etaMs: number | null }>({ elapsedMs: 0, etaMs: null })
   const [hasCover, setHasCover] = React.useState(false)
   const [coverUrl, setCoverUrl] = React.useState<string | null>(null)
-  // ---- render quality (session-wide preference; see useRenderQuality) ----
-  const [quality, selectQuality] = useRenderQuality()
+  // ---- render quality (per-project preference with a global fallback; see
+  // useRenderQuality) ----
+  const [quality, selectQuality] = useRenderQuality(projectId)
   // ---- cover-frame picker state ----
   // coverT is OUTPUT time (seconds into the RENDERED video). null = no custom
   // cover. The preview canvas maps output → source via the SAME keep-range

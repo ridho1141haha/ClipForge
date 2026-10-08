@@ -104,9 +104,9 @@ export function BatchRender({ clips, platform, style, targetDuration, projectId,
   const [errorMap, setErrorMap] = React.useState<Map<string, string>>(new Map())
   const [running, setRunning] = React.useState(false)
   const stopRef = React.useRef(false)
-  // batch renders use the session-wide quality preference (synced with the
+  // batch renders use the per-project quality preference (synced with the
   // single-render selector via useRenderQuality)
-  const [quality, selectQuality] = useRenderQuality()
+  const [quality, selectQuality] = useRenderQuality(projectId)
 
   const approved = React.useMemo(() => clips.filter((c) => c.status === 'approved'), [clips])
   const renderable = approved.filter((c) => c.hasPlan && c.segments)
