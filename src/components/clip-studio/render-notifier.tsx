@@ -14,6 +14,9 @@ import { useToast } from '@/hooks/use-toast'
 //     same session — cheap: one owner-scoped JSON round trip)
 //   • toast on active → DONE / ERROR transitions; NEVER on the first load
 //     (opening the page must not toast for already-old jobs)
+//   • polling PAUSES while the browser tab is hidden (document.hidden) —
+//     background-tab polling is pure waste; returning to the tab polls
+//     immediately, so a render that finished while hidden still toasts.
 // RenderHistory keeps its own display polling but no longer toasts — this is
 // the single toast source, so a transition is never double-notified.
 // ---------------------------------------------------------------------------
@@ -38,6 +41,9 @@ export function RenderNotifier() {
 
     const schedule = (ms: number) => {
       window.clearTimeout(timerRef.current)
+      // hidden tab → no timer at all; the visibilitychange handler below
+      // resumes polling (immediately) when the tab returns
+      if (typeof document !== 'undefined' && document.hidden) return
       timerRef.current = window.setTimeout(() => void poll(), ms)
     }
 
@@ -83,10 +89,21 @@ export function RenderNotifier() {
       }
     }
 
+    const onVisibility = () => {
+      if (cancelled) return
+      if (document.hidden) {
+        window.clearTimeout(timerRef.current)
+      } else {
+        void poll() // immediate refresh — catch up on what changed while hidden
+      }
+    }
+
     schedule(3000)
+    document.addEventListener('visibilitychange', onVisibility)
     return () => {
       cancelled = true
       window.clearTimeout(timerRef.current)
+      document.removeEventListener('visibilitychange', onVisibility)
     }
   }, [toast])
 

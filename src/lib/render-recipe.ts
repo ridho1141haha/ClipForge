@@ -30,6 +30,23 @@
 import type { EditPlan } from '@/lib/editplan'
 import { buildKeepRanges, isDroppedByCuts, outputToSourceTime, sourceToOutputTime } from '@/lib/subtitles'
 
+// ---- Render quality (client mirror of the renderer's recipe contract) ------
+// The recipe JSON may carry `quality: 'draft' | 'standard' | 'high'`; the
+// ffmpeg renderer maps it to dims/crf/audio-bitrate (see
+// mini-services/ffmpeg-renderer/recipe-validation.ts QUALITY_PRESETS — keep
+// the labels here in sync when presets change). Default 'standard' = the
+// historical 1080×1920 · crf 20 · 128k render, byte-identical behavior for
+// every existing recipe/test.
+export type RenderQuality = 'draft' | 'standard' | 'high'
+export const RENDER_QUALITIES: { id: RenderQuality; label: string; dims: string; hint: string }[] = [
+  { id: 'draft', label: 'Draft', dims: '720×1280', hint: 'Fastest — quick previews' },
+  { id: 'standard', label: 'Standard', dims: '1080×1920', hint: 'Balanced default' },
+  { id: 'high', label: 'High', dims: '1080×1920', hint: 'Max fidelity — larger files' },
+]
+export function isRenderQuality(v: unknown): v is RenderQuality {
+  return v === 'draft' || v === 'standard' || v === 'high'
+}
+
 export interface RenderRecipe {
   clipId: string
   clipStart: number
@@ -566,7 +583,11 @@ function sanitize(s: string): string {
 // options.coverTimestamp — optional OUTPUT-time second for the Short's cover
 // frame; the renderer extracts a JPG from the RENDERED output at that exact
 // time (the same frame the UI previews via the keep-range mapping).
-export function buildRecipeJSON(recipe: RenderRecipe, options: { coverTimestamp?: number | null } = {}): string {
+// options.quality — optional render preset (default 'standard').
+export function buildRecipeJSON(
+  recipe: RenderRecipe,
+  options: { coverTimestamp?: number | null; quality?: RenderQuality } = {},
+): string {
   const keep = buildKeepRanges(recipe.clipStart, recipe.clipEnd, recipe.cuts)
   // pre-map camera keyframes to output time for the renderer
   const cameraKeyframesOutput = recipe.cameraKeyframes
@@ -592,6 +613,7 @@ export function buildRecipeJSON(recipe: RenderRecipe, options: { coverTimestamp?
       music: recipe.music,
       segments: recipe.segments,
       cover,
+      quality: options.quality ?? 'standard',
       title: recipe.title,
       duration: outDur,
     },

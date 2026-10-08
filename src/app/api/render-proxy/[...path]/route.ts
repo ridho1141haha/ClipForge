@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server'
-import { statSync } from 'node:fs'
+import { statSync, existsSync, rmSync } from 'node:fs'
 import { open } from 'node:fs/promises'
-import { basename } from 'node:path'
+import { basename, join } from 'node:path'
 import { randomUUID } from 'node:crypto'
 import { db } from '@/lib/db'
 import { checkRateLimit } from '@/lib/validation'
@@ -66,7 +66,7 @@ const ACTIVE_STATUSES = new Set(['QUEUED', 'EXTRACTING', 'RENDERING', 'FINALIZIN
  * GET /api/render-proxy/jobs — render history for THIS session (owner-scoped).
  *
  * Lists the caller's RenderJob rows newest-first and RECONCILES them against
- * the live renderer before answering:
+ * the live renderer before answering (via reconcileActiveRow):
  *   - active row + renderer knows it → sync terminal/progress status into the row
  *   - active row + renderer 404      → the renderer restarted since the job
  *     started; its in-memory job is gone. The row is honestly marked ERROR
@@ -75,10 +75,77 @@ const ACTIVE_STATUSES = new Set(['QUEUED', 'EXTRACTING', 'RENDERING', 'FINALIZIN
  *     renderer's retention window — download is attempted live by the client).
  *
  * This is the data source for the UI Render History panel and doubles as the
- * stale-row reaper documented in the deployment worklog.
+ * stale-row reaper documented in the deployment worklog (plus the global
+ * sweepStaleActiveRows pass for abandoned sessions).
  */
+/** Reconcile an ACTIVE row against the live renderer (owner-agnostic).
+ * Used both by the owner-scoped history list AND by the global stale sweep —
+ * same rules: renderer knows the job → sync its real status; renderer 404 →
+ * the job is lost (restart) → honest ERROR. Never touches rows the renderer
+ * still considers active (another session's live render is NOT stale). */
+async function reconcileActiveRow(row: { id: string; status: string }): Promise<void> {
+  try {
+    const res = await fetch(`${RENDERER_BASE}/jobs/${row.id}`, {
+      signal: AbortSignal.timeout(4000),
+      cache: 'no-store',
+    })
+    if (res.ok) {
+      const j = (await res.json()) as { status?: unknown; stage?: unknown; filename?: unknown }
+      const status = canonicalStatus(j.status)
+      if (status && status !== row.status) {
+        await db.renderJob.update({
+          where: { id: row.id },
+          data: {
+            status,
+            ...(typeof j.stage === 'string' ? { stage: j.stage.slice(0, 300) } : {}),
+            ...(typeof j.filename === 'string' && j.filename ? { filename: j.filename.slice(0, 255) } : {}),
+          },
+        })
+      }
+    } else if (res.status === 404) {
+      await db.renderJob.update({
+        where: { id: row.id },
+        data: {
+          status: 'ERROR',
+          stage: 'Render job lost — the render service restarted. Please render again.',
+        },
+      })
+    }
+  } catch {
+    // renderer unreachable — keep the recorded status (supervisor revives on demand)
+  }
+}
+
+/** Global stale-row sweep: ACTIVE RenderJob rows abandoned by sessions that
+ * stopped polling (closed tab, dead browser) would otherwise sit QUEUED/
+ * RENDERING forever — reconciliation is owner-triggered and the owner is gone.
+ * Any history-list call sweeps a bounded window of rows older than 20 minutes
+ * (ALL owners — the renderer answers status for any job id, owner-free). */
+const STALE_ROW_AGE_MS = 20 * 60_000
+async function sweepStaleActiveRows(): Promise<void> {
+  try {
+    const stale = await db.renderJob.findMany({
+      where: {
+        status: { in: [...ACTIVE_STATUSES] },
+        updatedAt: { lt: new Date(Date.now() - STALE_ROW_AGE_MS) },
+      },
+      select: { id: true, status: true },
+      take: 10,
+    })
+    if (stale.length > 0) {
+      await Promise.all(stale.map((row) => reconcileActiveRow(row)))
+    }
+  } catch {
+    // sweep is best-effort observability — never break the list response
+  }
+}
+
 async function listOwnedRenderJobs(): Promise<Response> {
   const ownerId = await getOrCreateSessionId()
+  // global housekeeping first (bounded, best-effort): heal abandoned-session
+  // ACTIVE rows — this is also the mechanism that eventually resolves rows
+  // like the observed "QUEUED forever after the owner's browser closed".
+  await sweepStaleActiveRows()
   const rows = await db.renderJob.findMany({
     where: { ownerId },
     orderBy: { createdAt: 'desc' },
@@ -86,54 +153,18 @@ async function listOwnedRenderJobs(): Promise<Response> {
   })
 
   // reconcile only ACTIVE rows, bounded — never let history reads DoS the renderer.
-  // Live artifact facts (size / duration / hasCover) come from the renderer's
-  // in-memory state when it still knows the job — they are NOT persisted
-  // (the RenderJob table is the AUTHORIZATION record, by design; facts are
-  // merged into the response only while the renderer retains the artifact).
+  // Live artifact facts (size / duration / hasCover / dims) come from the
+  // renderer's in-memory state or persisted manifest when it still knows the
+  // job — they are NOT persisted (the RenderJob table is the AUTHORIZATION
+  // record, by design; facts are merged into the response only while the
+  // artifact survives on the renderer's disk).
   const active = rows.filter((r) => ACTIVE_STATUSES.has(r.status)).slice(0, 10)
-  await Promise.all(
-    active.map(async (row) => {
-      try {
-        const res = await fetch(`${RENDERER_BASE}/jobs/${row.id}`, {
-          signal: AbortSignal.timeout(4000),
-          cache: 'no-store',
-        })
-        if (res.ok) {
-          const j = (await res.json()) as { status?: unknown; stage?: unknown; filename?: unknown }
-          const status = canonicalStatus(j.status)
-          if (status && status !== row.status) {
-            await db.renderJob.update({
-              where: { id: row.id },
-              data: {
-                status,
-                ...(typeof j.stage === 'string' ? { stage: j.stage.slice(0, 300) } : {}),
-                ...(typeof j.filename === 'string' && j.filename && !row.filename ? { filename: j.filename.slice(0, 255) } : {}),
-              },
-            })
-          } else if (typeof j.stage === 'string' && j.stage !== row.stage) {
-            await db.renderJob.update({ where: { id: row.id }, data: { stage: j.stage.slice(0, 300) } })
-          }
-        } else if (res.status === 404) {
-          // renderer restarted since this job started — honest failure, not a hang
-          await db.renderJob.update({
-            where: { id: row.id },
-            data: {
-              status: 'ERROR',
-              stage: 'Render job lost — the render service restarted. Please render again.',
-            },
-          })
-        }
-      } catch {
-        // renderer unreachable mid-list → keep the recorded status (the
-        // supervisor will revive it on the next render request)
-      }
-    }),
-  )
+  await Promise.all(active.map((row) => reconcileActiveRow(row)))
 
   // merge live artifact facts for DONE rows still known to the renderer —
   // bounded (top 10 done rows), timeout-guarded, fully optional
   const doneRows = rows.filter((r) => r.status === 'DONE').slice(0, 10)
-  const facts = new Map<string, { size?: number; duration?: number; hasCover?: boolean }>()
+  const facts = new Map<string, { size?: number; duration?: number; hasCover?: boolean; width?: number; height?: number; quality?: string }>()
   await Promise.all(
     doneRows.map(async (row) => {
       try {
@@ -142,11 +173,14 @@ async function listOwnedRenderJobs(): Promise<Response> {
           cache: 'no-store',
         })
         if (res.ok) {
-          const j = (await res.json()) as { size?: unknown; duration?: unknown; hasCover?: unknown }
+          const j = (await res.json()) as { size?: unknown; duration?: unknown; hasCover?: unknown; width?: unknown; height?: unknown; quality?: unknown }
           facts.set(row.id, {
             ...(typeof j.size === 'number' && Number.isFinite(j.size) ? { size: Math.round(j.size) } : {}),
             ...(typeof j.duration === 'number' && Number.isFinite(j.duration) ? { duration: j.duration } : {}),
             hasCover: j.hasCover === true,
+            ...(typeof j.width === 'number' && Number.isFinite(j.width) ? { width: j.width } : {}),
+            ...(typeof j.height === 'number' && Number.isFinite(j.height) ? { height: j.height } : {}),
+            ...(typeof j.quality === 'string' ? { quality: j.quality } : {}),
           })
         }
         // 404 = artifact past the renderer's retention window — the download
@@ -716,4 +750,84 @@ export async function GET(
   } catch (e: any) {
     return NextResponse.json({ error: e?.message ?? 'proxy failed' }, { status: 502 })
   }
+}
+
+/**
+ * DELETE /api/render-proxy/jobs/:id — delete a render + its stored artifacts.
+ *
+ * User agency over the persisted store (the worklog's "delete affordance"):
+ *   1. ownership gate (the row must exist AND belong to this session)
+ *   2. ACTIVE rows refuse with 409 — cancel the render first
+ *   3. ask the renderer to drop everything it holds for the job (persisted
+ *      artifact dir + legacy jobDir + in-memory registry entry + spool)
+ *   4. renderer unreachable (NOT revived for a delete — wasteful) → direct
+ *      filesystem removal of upload/renders/<jobId> (same repo layout; the
+ *      job id is strictly [\w-]{8,64} so path traversal is impossible)
+ *   5. delete the authorization/history row itself — idempotent
+ * The renderer's DELETE is idempotent (200 { removed:false } for already-gone
+ * artifacts), so the DB row is removed whenever the gate passes.
+ */
+export async function DELETE(
+  req: NextRequest,
+  ctx: { params: Promise<{ path: string[] }> },
+) {
+  const { path } = await ctx.params
+  const targetPath = '/' + path.join('/')
+
+  // only bare /jobs/:id (no sub-action)
+  const jobMatch = targetPath.match(/^\/jobs\/([\w-]{8,64})$/)
+  if (!jobMatch) {
+    return NextResponse.json({ error: 'Unsupported delete path' }, { status: 404 })
+  }
+  const jobId = jobMatch[1]
+
+  // ---- ownership gate (same as every other job operation) ----
+  const ok = await authorizeJob(jobId)
+  if (!ok) return NextResponse.json({ error: 'Job not found' }, { status: 404 })
+
+  // ---- active rows must be cancelled first ----
+  const row = await db.renderJob.findUnique({ where: { id: jobId }, select: { status: true } })
+  if (row && ACTIVE_STATUSES.has(row.status)) {
+    return NextResponse.json(
+      { error: 'This render is still running — cancel it first, then delete.' },
+      { status: 409 },
+    )
+  }
+
+  // ---- renderer-side removal (artifacts + registry) ----
+  let rendererRemoved = false
+  try {
+    const res = await fetch(`${RENDERER_BASE}/jobs/${jobId}`, {
+      method: 'DELETE',
+      signal: AbortSignal.timeout(4000),
+    })
+    if (res.status === 409) {
+      // renderer still considers the job active (reconcile lag) — relay honestly
+      const body = await res.text()
+      return new NextResponse(body, { status: 409, headers: { 'content-type': 'application/json' } })
+    }
+    rendererRemoved = res.ok
+  } catch {
+    // renderer down — fall through to direct FS removal (no ensureRenderer:
+    // reviving a whole service just to unlink a directory is wasteful)
+  }
+  if (!rendererRemoved) {
+    try {
+      const persistDir = join(process.cwd(), 'upload', 'renders', jobId)
+      // defense-in-depth: never follow a path that escaped the renders root
+      if (existsSync(persistDir) && persistDir.startsWith(join(process.cwd(), 'upload', 'renders'))) {
+        rmSync(persistDir, { recursive: true, force: true })
+      }
+    } catch {
+      // best-effort — the renderer's GC covers leftovers on later sweeps
+    }
+  }
+
+  // ---- remove the authorization/history row (idempotent) ----
+  try {
+    await db.renderJob.delete({ where: { id: jobId } })
+  } catch {
+    // already deleted — idempotent success
+  }
+  return NextResponse.json({ deleted: true, id: jobId }, { headers: { 'cache-control': 'no-store' } })
 }

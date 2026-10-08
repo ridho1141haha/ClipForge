@@ -23,11 +23,13 @@ import {
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { type EditPlan } from '@/lib/editplan'
-import { buildRenderRecipe, buildRecipeJSON } from '@/lib/render-recipe'
+import { buildRenderRecipe, buildRecipeJSON, RENDER_QUALITIES } from '@/lib/render-recipe'
 import { outputDuration as planOutputDuration } from '@/lib/subtitles'
 import { mapKeepRanges, sourceTimeAtOutput } from '@/lib/keep-ranges'
 import { fmtTime, fmtDuration } from '@/lib/youtube'
 import type { Cut } from '@/lib/subtitles'
+import { useRenderQuality } from '@/hooks/use-render-quality'
+import { QualityField } from '@/components/clip-studio/quality-selector'
 
 /** ms → m:ss (clock for elapsed / ETA readouts). */
 function fmtClock(ms: number): string {
@@ -62,13 +64,15 @@ export function UploadRender({ plan, projectId, projectMedia, onJobStarted, onOp
   const [stage, setStage] = React.useState('')
   const [jobId, setJobId] = React.useState<string | null>(null)
   const [renderedUrl, setRenderedUrl] = React.useState<string | null>(null)
-  const [renderedInfo, setRenderedInfo] = React.useState<{ size: number; duration: number; width: number; height: number; durationOk: boolean } | null>(null)
+  const [renderedInfo, setRenderedInfo] = React.useState<{ size: number; duration: number; width: number; height: number; durationOk: boolean; quality?: string } | null>(null)
   const [notice, setNotice] = React.useState<string | null>(null)
   const [cancelling, setCancelling] = React.useState(false)
   const [error, setError] = React.useState<string | null>(null)
   const [timing, setTiming] = React.useState<{ elapsedMs: number; etaMs: number | null }>({ elapsedMs: 0, etaMs: null })
   const [hasCover, setHasCover] = React.useState(false)
   const [coverUrl, setCoverUrl] = React.useState<string | null>(null)
+  // ---- render quality (session-wide preference; see useRenderQuality) ----
+  const [quality, selectQuality] = useRenderQuality()
   // ---- cover-frame picker state ----
   // coverT is OUTPUT time (seconds into the RENDERED video). null = no custom
   // cover. The preview canvas maps output → source via the SAME keep-range
@@ -223,7 +227,7 @@ export function UploadRender({ plan, projectId, projectMedia, onJobStarted, onOp
       // OUTPUT-time camera keyframes + duration), NOT the raw RenderRecipe.
       // The raw object has none of those — the renderer would silently render
       // the full clip WITHOUT cuts and WITHOUT subtitles.
-      const recipeJson = buildRecipeJSON(recipe, { coverTimestamp: coverT })
+      const recipeJson = buildRecipeJSON(recipe, { coverTimestamp: coverT, quality })
       let res: Response
       if (sourceMode === 'local' && projectId && localReady) {
         // project-source render: the proxy streams the server-side media to the
@@ -311,6 +315,7 @@ export function UploadRender({ plan, projectId, projectMedia, onJobStarted, onOp
             width: job.width ?? 1080,
             height: job.height ?? 1920,
             durationOk: job.durationOk !== false,
+            quality: typeof job.quality === 'string' ? job.quality : undefined,
           })
           setHasCover(job.hasCover === true)
           // fetch the rendered file
@@ -616,7 +621,10 @@ export function UploadRender({ plan, projectId, projectMedia, onJobStarted, onOp
           <div className="mt-3 space-y-1.5 rounded-lg border border-sky-500/20 bg-sky-500/5 p-2.5 text-[10px] leading-relaxed">
             <p className="font-semibold text-sky-700 dark:text-sky-400">What the renderer actually applies to the MP4:</p>
             <p className="text-muted-foreground">
-              ✅ Cuts (removed sections) · ✅ Subtitle burn-in (transcript-grounded, output-time mapped) · ✅ Karaoke word-highlight (when word timestamps are available) · ✅ Camera punch-in/zoom · ✅ 9:16 crop + scale · ✅ H.264 + AAC 1080×1920
+              ✅ Cuts (removed sections) · ✅ Subtitle burn-in (transcript-grounded, output-time mapped) · ✅ Karaoke word-highlight (when word timestamps are available) · ✅ Camera punch-in/zoom · ✅ 9:16 crop + scale · ✅ H.264 + AAC ·{' '}
+              <span className="font-semibold text-foreground/80">
+                {RENDER_QUALITIES.find((r) => r.id === quality)?.dims} ({quality} quality)
+              </span>
             </p>
             <p className="font-semibold text-amber-600 dark:text-amber-400">Preview-only recommendations (NOT rendered into the MP4):</p>
             <p className="text-muted-foreground">
@@ -748,6 +756,11 @@ export function UploadRender({ plan, projectId, projectMedia, onJobStarted, onOp
         </div>
       )}
 
+      {/* render quality — sits with the render control so the tradeoff is
+          visible at the moment of decision (draft = iterate fast, high =
+          final export fidelity) */}
+      {plan && !emptyEdit && <QualityField quality={quality} onSelect={selectQuality} disabled={phase === 'rendering'} />}
+
       {/* render button */}
       {emptyEdit && (
         <div className="flex items-start gap-2 rounded-md border border-amber-500/30 bg-amber-500/10 p-2.5 text-xs text-amber-700 dark:text-amber-400">
@@ -832,7 +845,7 @@ export function UploadRender({ plan, projectId, projectMedia, onJobStarted, onOp
             initial={{ opacity: 0, height: 0 }}
             animate={{ opacity: 1, height: 'auto' }}
             exit={{ opacity: 0, height: 0 }}
-            className="space-y-2"
+            className="space-y-3"
           >
             <div className="flex items-center justify-between text-xs">
               <span className="flex items-center gap-1.5 text-primary">
@@ -841,7 +854,7 @@ export function UploadRender({ plan, projectId, projectMedia, onJobStarted, onOp
               </span>
               <span className="font-mono tabular-nums font-bold">{progress}%</span>
             </div>
-            <div className="relative h-2 overflow-hidden rounded-full bg-muted">
+            <div className="relative h-2 overflow-hidden rounded-full border border-border/40 bg-muted shadow-inner">
               <motion.div
                 animate={{ width: `${progress}%` }}
                 transition={{ duration: 0.3 }}
@@ -880,7 +893,7 @@ export function UploadRender({ plan, projectId, projectMedia, onJobStarted, onOp
                   <span
                     key={s.label}
                     className={`flex items-center gap-1 ${
-                      active ? 'text-primary' : 'text-muted-foreground/40'
+                      active ? 'text-primary' : 'text-muted-foreground/60'
                     }`}
                   >
                     {active && current ? (
@@ -914,7 +927,7 @@ export function UploadRender({ plan, projectId, projectMedia, onJobStarted, onOp
               <div>
                 <p className="text-sm font-semibold text-emerald-700 dark:text-emerald-400">Render complete!</p>
                 <p className="text-xs text-muted-foreground">
-                  {renderedInfo && `${renderedInfo.width}×${renderedInfo.height} · ${fmtDuration(renderedInfo.duration)} · ${(renderedInfo.size / 1024 / 1024).toFixed(2)} MB`}
+                  {renderedInfo && `${renderedInfo.width}×${renderedInfo.height}${renderedInfo.quality ? ` · ${renderedInfo.quality}` : ''} · ${fmtDuration(renderedInfo.duration)} · ${(renderedInfo.size / 1024 / 1024).toFixed(2)} MB`}
                   {timing.elapsedMs > 0 && ` · rendered in ${fmtClock(timing.elapsedMs)}`}
                 </p>
               </div>

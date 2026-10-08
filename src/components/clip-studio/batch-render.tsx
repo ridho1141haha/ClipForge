@@ -20,6 +20,8 @@ import { buildRenderRecipe, buildRecipeJSON } from '@/lib/render-recipe'
 import { outputDuration as planOutputDuration } from '@/lib/subtitles'
 import { type Cut } from '@/lib/subtitles'
 import { fmtDuration } from '@/lib/youtube'
+import { useRenderQuality } from '@/hooks/use-render-quality'
+import { QualitySelector } from '@/components/clip-studio/quality-selector'
 
 // ---------------------------------------------------------------------------
 // BatchRender — "render every approved clip" as a sequential pipeline.
@@ -102,6 +104,9 @@ export function BatchRender({ clips, platform, style, targetDuration, projectId,
   const [errorMap, setErrorMap] = React.useState<Map<string, string>>(new Map())
   const [running, setRunning] = React.useState(false)
   const stopRef = React.useRef(false)
+  // batch renders use the session-wide quality preference (synced with the
+  // single-render selector via useRenderQuality)
+  const [quality, selectQuality] = useRenderQuality()
 
   const approved = React.useMemo(() => clips.filter((c) => c.status === 'approved'), [clips])
   const renderable = approved.filter((c) => c.hasPlan && c.segments)
@@ -131,7 +136,7 @@ export function BatchRender({ clips, platform, style, targetDuration, projectId,
           break
         }
         const plan = planFromClip(c, platform, style, targetDuration)
-        const recipeJson = buildRecipeJSON(buildRenderRecipe(plan, 'server'), {})
+        const recipeJson = buildRecipeJSON(buildRenderRecipe(plan, 'server'), { quality })
         setStatusMap((m) => new Map(m).set(c.id, 'rendering'))
         setProgressMap((m) => new Map(m).set(c.id, 0))
         try {
@@ -269,6 +274,18 @@ export function BatchRender({ clips, platform, style, targetDuration, projectId,
             </Button>
           )}
         </div>
+      </div>
+
+      {/* quality selector — compact, applies to every render in this batch */}
+      <div className="mb-3">
+        <div className="mb-1.5 flex items-center gap-1.5 text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">
+          <Layers className="h-3 w-3 text-primary" />
+          Quality for this batch
+          <span className="ml-1 font-mono text-[9px] font-normal normal-case tracking-normal text-muted-foreground/70">
+            {quality === 'draft' ? '720p — fastest' : quality === 'high' ? '1080p — max fidelity' : '1080p — balanced'}
+          </span>
+        </div>
+        <QualitySelector quality={quality} onSelect={selectQuality} disabled={running} compact />
       </div>
 
       {/* prerequisite notice */}

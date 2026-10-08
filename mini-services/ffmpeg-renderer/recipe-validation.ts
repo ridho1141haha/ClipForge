@@ -38,7 +38,36 @@ export type RecipeValidationCode =
   | 'INVALID_ASS'
   | 'INVALID_SOURCE'
   | 'INVALID_COVER'
+  | 'INVALID_QUALITY'
   | 'LIMIT_EXCEEDED'
+
+// ---- Render quality presets --------------------------------------------------
+// The recipe may carry a quality hint; the renderer maps it to concrete ffmpeg
+// parameters. 'standard' is the historical default (1080x1920 · crf 20 · 128k)
+// so every existing recipe/test renders EXACTLY as before.
+//   draft    — 720x1280, crf 26, 96k audio: ~2-3x faster, ~4x smaller files
+//              (preview/iteration quality)
+//   standard — 1080x1920, crf 20, 128k audio (balanced default)
+//   high     — 1080x1920, crf 16, 192k audio: max fidelity, larger files
+// NOTE: keep src/lib/render-recipe.ts (client mirror: labels/copy) in sync when
+// changing these presets.
+export type RenderQuality = 'draft' | 'standard' | 'high'
+
+export const QUALITY_PRESETS: Record<RenderQuality, {
+  width: number
+  height: number
+  crf: number
+  videoPreset: 'veryfast'
+  audioBitrate: string
+}> = {
+  draft: { width: 720, height: 1280, crf: 26, videoPreset: 'veryfast', audioBitrate: '96k' },
+  standard: { width: 1080, height: 1920, crf: 20, videoPreset: 'veryfast', audioBitrate: '128k' },
+  high: { width: 1080, height: 1920, crf: 16, videoPreset: 'veryfast', audioBitrate: '192k' },
+}
+
+export function isRenderQuality(v: unknown): v is RenderQuality {
+  return v === 'draft' || v === 'standard' || v === 'high'
+}
 
 export interface ValidatedRecipe {
   source?: { youtube_id?: string; clip_start?: number; clip_end?: number }
@@ -50,6 +79,8 @@ export interface ValidatedRecipe {
   segments?: { type: string; start: number; end: number }[]
   /** optional cover-frame request — OUTPUT-time second to grab as the Short's cover JPG */
   cover?: { timestamp: number }
+  /** render quality preset — always set after validation (default 'standard') */
+  quality: RenderQuality
   title?: string
   duration: number
 }
@@ -236,6 +267,16 @@ export function validateRecipe(raw: unknown): ValidateResult {
     cover = { timestamp: raw.cover.timestamp }
   }
 
+  // ---- quality: optional enum, default 'standard' (historical behavior).
+  // Anything else is rejected — never silently coerced. ----
+  let quality: RenderQuality = 'standard'
+  if (raw.quality !== undefined && raw.quality !== null) {
+    if (!isRenderQuality(raw.quality)) {
+      return { ok: false, code: 'INVALID_QUALITY', error: `quality must be one of "draft", "standard", "high" (got ${String(raw.quality)})` }
+    }
+    quality = raw.quality
+  }
+
   // ---- title: bounded (it feeds the output filename via sanitize) ----
   let title: string | undefined
   if (raw.title !== undefined && raw.title !== null) {
@@ -254,6 +295,7 @@ export function validateRecipe(raw: unknown): ValidateResult {
       music: isPlainObject(raw.music) ? (raw.music as ValidatedRecipe['music']) : undefined,
       segments: Array.isArray(raw.segments) ? (raw.segments as ValidatedRecipe['segments']) : undefined,
       cover,
+      quality,
       title,
       duration: Math.round(duration * 1000) / 1000,
     },

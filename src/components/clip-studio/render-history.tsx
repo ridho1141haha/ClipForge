@@ -16,8 +16,10 @@ import {
   MonitorPlay,
   Image as ImageIcon,
   Server,
+  Trash2,
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
+import { useToast } from '@/hooks/use-toast'
 
 // ---------------------------------------------------------------------------
 // RenderHistory — owner-scoped list of past render jobs (RenderJob table),
@@ -44,6 +46,9 @@ interface RenderJobRow {
   size?: number
   duration?: number
   hasCover?: boolean
+  width?: number
+  height?: number
+  quality?: string
   downloadable?: boolean
   createdAt: string
   updatedAt: string
@@ -103,10 +108,16 @@ function fmtBytes(b: number): string {
 }
 
 export function RenderHistory({ refreshKey }: { refreshKey?: number }) {
+  const { toast } = useToast()
   const [jobs, setJobs] = React.useState<RenderJobRow[] | null>(null)
   const [queue, setQueue] = React.useState<QueueInfo | null>(null)
   const [loading, setLoading] = React.useState(false)
   const timerRef = React.useRef<number>(0)
+  // ---- per-row delete state: two-tap inline confirm (mobile-friendly, no
+  // modal). confirmId = row awaiting the second tap; deletingId = in-flight. ----
+  const [confirmId, setConfirmId] = React.useState<string | null>(null)
+  const [deletingId, setDeletingId] = React.useState<string | null>(null)
+  const confirmResetRef = React.useRef<number>(0)
 
   const load = React.useCallback(async () => {
     setLoading(true)
@@ -132,13 +143,67 @@ export function RenderHistory({ refreshKey }: { refreshKey?: number }) {
   }, [load, refreshKey])
 
   // live polling while ANY job is active (renderer progress is real);
-  // slow heartbeat otherwise just to catch reconciliation changes
+  // slow heartbeat otherwise just to catch reconciliation changes.
+  // PAUSED while the browser tab is hidden (document.visibilityState) —
+  // a hidden tab's 4s polls are pure waste; on return we reload at once.
   React.useEffect(() => {
     const anyActive = jobs?.some((j) => ACTIVE.includes(j.status)) ?? false
     window.clearTimeout(timerRef.current)
+    if (typeof document !== 'undefined' && document.hidden) return // resumed by the visibility listener
     timerRef.current = window.setTimeout(() => void load(), anyActive ? 4000 : 30_000)
     return () => window.clearTimeout(timerRef.current)
   }, [jobs, load])
+
+  // visibility-aware resume: immediate refresh when the tab comes back
+  React.useEffect(() => {
+    const onVis = () => {
+      if (!document.hidden) {
+        window.clearTimeout(timerRef.current)
+        void load()
+      }
+    }
+    document.addEventListener('visibilitychange', onVis)
+    return () => document.removeEventListener('visibilitychange', onVis)
+  }, [load])
+
+  // ---- delete a finished render + its stored artifacts ----
+  const deleteJob = async (id: string) => {
+    if (deletingId) return
+    setDeletingId(id)
+    try {
+      const res = await fetch(`/api/render-proxy/jobs/${id}`, { method: 'DELETE' })
+      const data = (await res.json().catch(() => ({}))) as { deleted?: boolean; error?: string }
+      if (!res.ok || !data.deleted) {
+        throw new Error(data.error ?? `Delete failed (HTTP ${res.status})`)
+      }
+      // optimistic removal — the row, its artifact, and its downloads are gone
+      setJobs((prev) => (prev ? prev.filter((j) => j.id !== id) : prev))
+      toast({
+        title: 'Render deleted',
+        description: 'The MP4, cover, and history row were removed from the server.',
+      })
+    } catch (e: unknown) {
+      toast({
+        title: 'Could not delete render',
+        description: e instanceof Error ? e.message : 'Unknown error',
+        variant: 'destructive',
+      })
+    } finally {
+      setDeletingId(null)
+      setConfirmId((c) => (c === id ? null : c))
+    }
+  }
+
+  const armConfirm = (id: string) => {
+    window.clearTimeout(confirmResetRef.current)
+    setConfirmId(id)
+    // auto-disarm after 4s so a stray click never leaves a row “armed”
+    confirmResetRef.current = window.setTimeout(() => {
+      setConfirmId((c) => (c === id ? null : c))
+    }, 4000)
+  }
+
+  React.useEffect(() => () => window.clearTimeout(confirmResetRef.current), [])
 
   const anyActive = jobs?.some((j) => ACTIVE.includes(j.status)) ?? false
   const doneCount = jobs?.filter((j) => j.status === 'DONE').length ?? 0
@@ -209,7 +274,7 @@ export function RenderHistory({ refreshKey }: { refreshKey?: number }) {
           Loading your renders…
         </div>
       ) : jobs.length === 0 ? (
-        <div className="flex flex-col items-center gap-2 py-8 text-center">
+        <div className="flex flex-col items-center gap-2.5 py-10 text-center">
           <div className="rounded-full border border-border/60 bg-muted/40 p-3">
             <MonitorPlay className="h-5 w-5 text-muted-foreground/70" />
           </div>
@@ -306,6 +371,55 @@ export function RenderHistory({ refreshKey }: { refreshKey?: number }) {
                         cleaned
                       </span>
                     ) : null}
+
+                    {/* delete — terminal rows only (active rows must cancel
+                        first). Two-tap inline confirm, auto-disarms after 4s. */}
+                    {!active ? (
+                      confirmId === job.id ? (
+                        <span className="inline-flex shrink-0 items-center gap-1" role="group" aria-label="Confirm delete">
+                          <button
+                            type="button"
+                            onClick={() => void deleteJob(job.id)}
+                            disabled={deletingId === job.id}
+                            className="inline-flex h-7 items-center gap-1 rounded-md border border-rose-500/40 bg-rose-500/10 px-2 text-[11px] font-semibold text-rose-600 transition-all hover:bg-rose-500/20 hover:shadow-sm dark:text-rose-400"
+                            title="Permanently delete this render and its stored files"
+                          >
+                            {deletingId === job.id ? (
+                              <Loader2 className="h-3 w-3 animate-spin" />
+                            ) : (
+                              <Trash2 className="h-3 w-3" />
+                            )}
+                            Delete
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              window.clearTimeout(confirmResetRef.current)
+                              setConfirmId(null)
+                            }}
+                            className="inline-flex h-7 items-center rounded-md border border-border/50 px-2 text-[11px] font-medium text-muted-foreground transition-colors hover:text-foreground"
+                            title="Keep this render"
+                          >
+                            Keep
+                          </button>
+                        </span>
+                      ) : (
+                        <button
+                          type="button"
+                          onClick={() => armConfirm(job.id)}
+                          disabled={deletingId != null}
+                          className="inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-md border border-transparent text-muted-foreground/50 transition-all hover:border-rose-500/30 hover:bg-rose-500/10 hover:text-rose-500 focus-visible:opacity-100 sm:opacity-0 sm:group-hover:opacity-100"
+                          aria-label={`Delete render ${job.filename ?? job.id.slice(0, 8)}`}
+                          title="Delete this render (files + history row)"
+                        >
+                          {deletingId === job.id ? (
+                            <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                          ) : (
+                            <Trash2 className="h-3.5 w-3.5" />
+                          )}
+                        </button>
+                      )
+                    ) : null}
                   </div>
 
                   {/* artifact facts */}
@@ -319,8 +433,13 @@ export function RenderHistory({ refreshKey }: { refreshKey?: number }) {
                       </span>
                       {job.size != null ? <span className="tabular-nums">{fmtBytes(job.size)}</span> : null}
                       <span className="rounded bg-emerald-500/10 px-1 py-px text-[9px] font-semibold uppercase tracking-wide text-emerald-600 dark:text-emerald-400">
-                        1080×1920 · H.264 + AAC
+                        {job.width != null && job.height != null ? `${job.width}×${job.height}` : '1080×1920'} · H.264 + AAC
                       </span>
+                      {job.quality && job.quality !== 'standard' ? (
+                        <span className="rounded bg-primary/10 px-1 py-px text-[9px] font-semibold uppercase tracking-wide text-primary">
+                          {job.quality}
+                        </span>
+                      ) : null}
                     </p>
                   ) : null}
 

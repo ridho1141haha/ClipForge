@@ -28,7 +28,7 @@ import { existsSync, mkdirSync, rmSync, writeFileSync, statSync, readdirSync, re
 import { join } from 'node:path'
 import { spawn } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
-import { validateRecipe, RECIPE_LIMITS, type ValidatedRecipe } from './recipe-validation'
+import { validateRecipe, RECIPE_LIMITS, QUALITY_PRESETS, type ValidatedRecipe, type RenderQuality } from './recipe-validation'
 
 const PORT = 3003
 // Job artifact workspace. RENDERER_WORKDIR overrides; default is repo-relative
@@ -71,6 +71,7 @@ interface PersistedManifest {
   height?: number
   durationOk: boolean
   hasCover: boolean
+  quality?: string
   completedAt: number
 }
 
@@ -96,6 +97,7 @@ async function readManifest(jobId: string): Promise<PersistedManifest | null> {
       ...(typeof m.height === 'number' ? { height: m.height } : {}),
       durationOk: m.durationOk !== false,
       hasCover: m.hasCover === true,
+      ...(typeof m.quality === 'string' ? { quality: m.quality } : {}),
       completedAt: typeof m.completedAt === 'number' ? m.completedAt : 0,
     }
   } catch {
@@ -152,6 +154,7 @@ function persistArtifacts(job: RenderJob, outPath: string, coverPath: string | n
         height: job.height,
         durationOk: job.durationOk !== false,
         hasCover: job.hasCover === true,
+        quality: job.quality ?? 'standard',
         completedAt: Date.now(),
       }),
     )
@@ -271,6 +274,8 @@ interface RenderJob {
   durationOk?: boolean
   /** true when a cover-frame JPG was extracted from the OUTPUT at recipe.cover.timestamp */
   hasCover?: boolean
+  /** quality preset this job renders with (recorded into the manifest) */
+  quality?: RenderQuality
   error?: string
   createdAt: number
   finishedAt?: number
@@ -300,6 +305,9 @@ function sanitize(s: string): string {
 function buildZoompanFilter(recipe: ValidatedRecipe, fps = 30): string | null {
   const kfs = recipe.camera_keyframes ?? []
   if (!kfs || kfs.length < 2) return null
+  // output resolution follows the recipe's quality preset — zoompan punches
+  // into the already-scaled frame, so its s= must match the scale filter
+  const q = QUALITY_PRESETS[recipe.quality ?? 'standard']
   const rawFrames = Math.round((recipe.duration ?? 10) * fps)
   // NaN/absurd-duration guard: recipe.duration is validated finite, but this
   // filter must never emit a broken zoompan expression regardless.
@@ -323,7 +331,7 @@ function buildZoompanFilter(recipe: ValidatedRecipe, fps = 30): string | null {
   for (let i = samples.length - 2; i >= 0; i--) {
     expr = `if(lt(on,${samples[i].frame}),${samples[i].scale.toFixed(3)},${expr})`
   }
-  return `zoompan=z='${expr}':d=1:s=1080x1920:fps=${fps}`
+  return `zoompan=z='${expr}':d=1:s=${q.width}x${q.height}:fps=${fps}`
 }
 
 function scaleAtTime(time: number, sorted: { time: number; scale: number }[]): number {
@@ -450,6 +458,7 @@ function broadcast(job: RenderJob) {
     height: job.height,
     durationOk: job.durationOk,
     hasCover: job.hasCover,
+    quality: job.quality ?? 'standard',
   })
   for (const send of job.subscribers) {
     try { send(`data: ${payload}\n\n`) } catch {}
@@ -541,6 +550,8 @@ async function processJob(jobId: string, spoolPath: string, originalName: string
     // (The old fallback rendered the FULL window when keep_ranges was empty,
     // turning a fully-cut edit into a phantom full video.)
     const ranges = recipe.keep_ranges
+    // quality preset → concrete ffmpeg parameters (dims, crf, audio bitrate)
+    const q = QUALITY_PRESETS[recipe.quality ?? 'standard']
 
     // Probe the input ONCE: does it have audio? This decides the render path —
     // we NEVER mask a failed render with a silent-audio retry (that produced
@@ -592,7 +603,7 @@ async function processJob(jobId: string, spoolPath: string, originalName: string
     // graph parser) — handles both wide (crop sides) and tall (crop top/bottom)
     // sources dynamically via iw/ih expressions
     postParts.push("crop=w='trunc(min(iw\\,ih*9/16)/2)*2':h='trunc(min(ih\\,iw*16/9)/2)*2'")
-    postParts.push('scale=1080:1920')
+    postParts.push(`scale=${q.width}:${q.height}`)
     const zoom = buildZoompanFilter(recipe)
     if (zoom) postParts.push(zoom)
     if (recipe.subtitles_ass) postParts.push(`ass='${join(jobDir, 'subs.ass')}'`)
@@ -601,7 +612,7 @@ async function processJob(jobId: string, spoolPath: string, originalName: string
     stageTiming(job, 'prepare', extractingStart)
     if (!transition(job, 'rendering')) return // cancelled during prep
     const renderingStart = Date.now()
-    job.stage = `Rendering: trim+concat+${postParts.length} filters (single pass)…`
+    job.stage = `Rendering ${q.width}×${q.height} (quality: ${recipe.quality ?? 'standard'}): trim+concat+${postParts.length} filters…`
     job.progress = 25
     broadcast(job)
 
@@ -611,7 +622,7 @@ async function processJob(jobId: string, spoolPath: string, originalName: string
     let finalRes: { code: number; stdout: string; stderr: string }
     if (job.status === 'cancelled') return // cancelled before render started
     if (inputHasAudio) {
-      const args = ['ffmpeg', '-nostdin', '-y', '-i', inputPath, '-filter_complex', fcParts.join(';'), '-map', '[vf]', '-map', '[ac]', '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20', '-c:a', 'aac', '-b:a', '128k', '-r', '30', outPath]
+      const args = ['ffmpeg', '-nostdin', '-y', '-i', inputPath, '-filter_complex', fcParts.join(';'), '-map', '[vf]', '-map', '[ac]', '-c:v', 'libx264', '-preset', q.videoPreset, '-crf', String(q.crf), '-c:a', 'aac', '-b:a', q.audioBitrate, '-r', '30', outPath]
       finalRes = await run(args, jobDir, job, 'Encoding H.264 + burning subtitles + zoom', 25, 92, 15 * 60_000, { progressPipe: true })
       if (job.status === 'cancelled') return
       if (finalRes.code !== 0) {
@@ -626,7 +637,7 @@ async function processJob(jobId: string, spoolPath: string, originalName: string
         '-f', 'lavfi', '-i', 'anullsrc=channel_layout=stereo:sample_rate=44100',
         '-filter_complex', fcParts.join(';'),
         '-map', '[vf]', '-map', '[ac]',
-        '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20', '-c:a', 'aac', '-b:a', '128k', '-r', '30',
+        '-c:v', 'libx264', '-preset', q.videoPreset, '-crf', String(q.crf), '-c:a', 'aac', '-b:a', q.audioBitrate, '-r', '30',
         '-shortest', outPath,
       ]
       finalRes = await run(silentArgs, jobDir, job, 'Encoding (silent audio — source has no audio)', 25, 92, 15 * 60_000, { progressPipe: true })
@@ -662,8 +673,8 @@ async function processJob(jobId: string, spoolPath: string, originalName: string
     if (!has264 || !hasAac) {
       throw new Error(`codec check failed: h264=${has264} aac=${hasAac}`)
     }
-    if (job.width !== 1080 || job.height !== 1920) {
-      throw new Error(`resolution check failed: got ${job.width}x${job.height}, want 1080x1920`)
+    if (job.width !== q.width || job.height !== q.height) {
+      throw new Error(`resolution check failed: got ${job.width}x${job.height}, want ${q.width}x${q.height} (quality: ${recipe.quality ?? 'standard'})`)
     }
     // duration sanity vs recipe (tolerance 1.5s) — reported, surfaced to UI/tests
     const expected = recipe.duration ?? (recipe.source ? recipe.source.clip_end! - recipe.source.clip_start! : 0)
@@ -708,7 +719,7 @@ async function processJob(jobId: string, spoolPath: string, originalName: string
     // keeps the MP4 + cover downloadable indefinitely (bounded by GC). Served
     // through the manifest fallback in poll/download/cover after reaping.
     persistArtifacts(job, outPath, job.hasCover && existsSync(join(jobDir, 'cover.jpg')) ? join(jobDir, 'cover.jpg') : null)
-    console.log(`[${jobId}] done: ${outName} (${job.size} bytes, ${job.duration}s, ${job.width}x${job.height}) total=${((Date.now() - jobStart) / 1000).toFixed(1)}s`)
+    console.log(`[${jobId}] done: ${outName} (${job.size} bytes, ${job.duration}s, ${job.width}x${job.height}, quality=${recipe.quality ?? 'standard'}) total=${((Date.now() - jobStart) / 1000).toFixed(1)}s`)
   } catch (e: any) {
     if (job.status === 'cancelled') return // cancellation already broadcast — do not overwrite
     job.status = 'error'
@@ -777,7 +788,7 @@ serve({
       }
       const id = randomUUID()
       const job: RenderJob = {
-        id, status: 'queued', progress: 0, stage: 'Queued', createdAt: Date.now(), recipeDuration: 10, subscribers: new Set(),
+        id, status: 'queued', progress: 0, stage: 'Queued', createdAt: Date.now(), recipeDuration: 10, subscribers: new Set(), quality: v.recipe.quality,
       }
       // ---- DISK-BACKED INTAKE: spool the upload now so the serial queue holds
       // PATHS, not Blobs (N queued uploads used to pin N × upload-size in the
@@ -816,6 +827,40 @@ serve({
     // facts merge — keep answering with real artifact facts. ACTIVE rows have
     // no manifest, so the proxy's "job lost" reconciliation is unaffected.
     const jobMatch = url.pathname.match(/^\/jobs\/([^/]+)$/)
+
+    // DELETE /jobs/:id — remove a TERMINAL job's artifacts + registry entry.
+    // Gives users direct agency over the persisted store (the worklog's
+    // "delete affordance"): the persisted dir, the legacy jobDir, the registry
+    // entry, and any spool remnant all go. Idempotent — a job with nothing
+    // left on disk still answers 200 { removed: false } so the proxy can
+    // delete the DB row unconditionally. ACTIVE jobs refuse with 409 (cancel
+    // first — deletion mid-render would orphan the running ffmpeg child).
+    if (req.method === 'DELETE' && jobMatch) {
+      const id = jobMatch[1]
+      if (!SAFE_JOB_ID.test(id)) return json({ error: 'invalid job id' }, 400)
+      const job = jobs.get(id)
+      if (job && isActive(job.status)) {
+        return json({ error: 'job is still active — cancel it before deleting' }, 409)
+      }
+      let removed = false
+      const persistDir = join(PERSIST_DIR, id)
+      if (existsSync(persistDir)) {
+        try { rmSync(persistDir, { recursive: true, force: true }); removed = true } catch {}
+      }
+      const legacyDir = join(WORKDIR, id)
+      if (existsSync(legacyDir)) {
+        try { rmSync(legacyDir, { recursive: true, force: true }); removed = true } catch {}
+      }
+      try { rmSync(join(SPOOL_DIR, `${id}.bin`), { force: true }) } catch {}
+      if (job) {
+        jobs.delete(id)
+        removed = true
+        job.subscribers.clear()
+      }
+      console.log(`[delete] job ${id}: artifacts ${removed ? 'removed' : 'already gone'}`)
+      return json({ id, removed })
+    }
+
     if (req.method === 'GET' && jobMatch) {
       const job = jobs.get(jobMatch[1])
       if (job) return json(publicJob(job))
@@ -921,11 +966,12 @@ serve({
 
     // GET / — health
     return json({ service: 'ClipForge ffmpeg renderer', port: PORT, endpoints: {
-      'POST /render': 'multipart (video, recipe) → {id}',
+      'POST /render': 'multipart (video, recipe) → {id} — recipe.quality: draft|standard|high (default standard)',
       'GET /jobs/:id': 'poll status (live registry, or persisted manifest for DONE jobs)',
       'GET /jobs/:id/stream': 'SSE progress',
       'GET /jobs/:id/download': 'download MP4 (persisted beyond the in-memory LRU)',
       'GET /jobs/:id/cover': 'download cover-frame JPG (when recipe.cover was set)',
+      'DELETE /jobs/:id': 'delete a TERMINAL job\'s artifacts + registry entry (409 while active)',
       'GET /stats': 'queue depth (waiting / busy / active)',
     } })
   },
