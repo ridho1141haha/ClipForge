@@ -31,7 +31,11 @@ import { randomUUID } from 'node:crypto'
 import { validateRecipe, RECIPE_LIMITS, type ValidatedRecipe } from './recipe-validation'
 
 const PORT = 3003
-const WORKDIR = '/home/z/my-project/upload/ffmpeg-render'
+// Job artifact workspace. RENDERER_WORKDIR overrides; default is repo-relative
+// (<repo>/upload/ffmpeg-render). A hardcoded machine path (/home/z/...) made the
+// renderer EACCES-crash on any other host — incl. the CI runner (E2E job red).
+const WORKDIR =
+  process.env.RENDERER_WORKDIR ?? join(import.meta.dir, '..', '..', 'upload', 'ffmpeg-render')
 if (!existsSync(WORKDIR)) mkdirSync(WORKDIR, { recursive: true })
 
 // ---- Job state machine (deterministic transitions; mission Phase 6) ----

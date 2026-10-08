@@ -1093,6 +1093,20 @@ console.log('\n== SURGICAL HARDENING: no wildcard CORS; pull-based multipart; SS
   assert(proxy.includes('the render was cancelled'), 'client receives an honest error when ownership recording fails')
 }
 
+// ---------------------------------------------------------------------------
+// ROUND: CI portability — renderer workdir must not be a machine-specific path
+// (a hardcoded /home/z/... made the renderer EACCES-crash on the CI runner
+// before any E2E could run; the sandbox path must keep working unchanged)
+// ---------------------------------------------------------------------------
+console.log('\n== CI PORTABILITY: renderer workdir is env-or-repo-relative, never machine-specific ==')
+{
+  const { readFileSync: rf3 } = await import('node:fs')
+  const renderer = rf3('mini-services/ffmpeg-renderer/index.ts', 'utf-8')
+  assert(renderer.includes('RENDERER_WORKDIR'), 'renderer WORKDIR overridable via RENDERER_WORKDIR env')
+  assert(!/const WORKDIR = ['"`]\//.test(renderer), 'renderer WORKDIR default is not an absolute machine path')
+  assert(renderer.includes("join(import.meta.dir, '..', '..', 'upload', 'ffmpeg-render')"), 'renderer WORKDIR default resolves repo-relative (<repo>/upload/ffmpeg-render)')
+}
+
 console.log(`\n════════════════════════════════`)
 console.log(`RESULT: ${passed} passed, ${failed} failed`)
 process.exit(failed > 0 ? 1 : 0)
