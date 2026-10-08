@@ -24,7 +24,7 @@
 // read a trusted internal service. Browsers must go through Next.js.
 
 import { serve } from 'bun'
-import { existsSync, mkdirSync, rmSync, writeFileSync, statSync } from 'node:fs'
+import { existsSync, mkdirSync, rmSync, writeFileSync, statSync, readdirSync, renameSync } from 'node:fs'
 import { join } from 'node:path'
 import { spawn } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
@@ -37,6 +37,199 @@ const PORT = 3003
 const WORKDIR =
   process.env.RENDERER_WORKDIR ?? join(import.meta.dir, '..', '..', 'upload', 'ffmpeg-render')
 if (!existsSync(WORKDIR)) mkdirSync(WORKDIR, { recursive: true })
+
+// ---- Persisted artifact store + disk-backed upload spool --------------------
+// Two disk areas NEXT to WORKDIR (same repo-relative resolution discipline):
+//   <repo>/upload/renders        — DONE artifacts moved here at completion with
+//                                  a manifest.json; job endpoints fall back to
+//                                  the manifest after the in-memory registry is
+//                                  reaped, so downloads outlive the ~10-min
+//                                  LRU window. Bounded by GC (count + bytes).
+//   <repo>/upload/render-spool   — uploads spooled to disk at intake so the
+//                                  serial queue never holds large Files in the
+//                                  JS heap while waiting for its turn.
+const PERSIST_DIR = process.env.RENDERER_PERSIST_DIR ?? join(WORKDIR, '..', 'renders')
+if (!existsSync(PERSIST_DIR)) mkdirSync(PERSIST_DIR, { recursive: true })
+const SPOOL_DIR = process.env.RENDERER_SPOOL_DIR ?? join(WORKDIR, '..', 'render-spool')
+if (!existsSync(SPOOL_DIR)) mkdirSync(SPOOL_DIR, { recursive: true })
+
+const MAX_PERSISTED_COUNT = 200
+const MAX_PERSISTED_BYTES = 2 * 1024 * 1024 * 1024 // 2 GB
+const SPOOL_MAX_AGE_MS = 2 * 3600_000 // orphaned spool files older than 2h are junk
+const SAFE_JOB_ID = /^[\w-]{8,64}$/ // path-safety: job ids come from the proxy, but never trust blindly
+const SAFE_MP4_NAME = /^clipforge_[A-Za-z0-9_-]{0,60}\.mp4$/ // manifests are trusted, defense-in-depth anyway
+
+interface PersistedManifest {
+  id: string
+  status: 'done'
+  progress: 100
+  stage: string
+  filename: string
+  size?: number
+  duration?: number
+  width?: number
+  height?: number
+  durationOk: boolean
+  hasCover: boolean
+  completedAt: number
+}
+
+/** Read + validate a persisted job manifest (async — Bun.file streams; the
+ * unit suite forbids sync file reads of artifacts). Returns null for anything
+ * malformed, foreign, or absent. */
+async function readManifest(jobId: string): Promise<PersistedManifest | null> {
+  if (!SAFE_JOB_ID.test(jobId)) return null
+  try {
+    const p = join(PERSIST_DIR, jobId, 'manifest.json')
+    if (!existsSync(p)) return null
+    const m = (await Bun.file(p).json()) as Partial<PersistedManifest>
+    if (m?.id !== jobId || m.status !== 'done' || typeof m.filename !== 'string' || !SAFE_MP4_NAME.test(m.filename)) return null
+    return {
+      id: m.id,
+      status: 'done',
+      progress: 100,
+      stage: 'Render complete',
+      filename: m.filename,
+      ...(typeof m.size === 'number' && Number.isFinite(m.size) ? { size: m.size } : {}),
+      ...(typeof m.duration === 'number' && Number.isFinite(m.duration) ? { duration: m.duration } : {}),
+      ...(typeof m.width === 'number' ? { width: m.width } : {}),
+      ...(typeof m.height === 'number' ? { height: m.height } : {}),
+      durationOk: m.durationOk !== false,
+      hasCover: m.hasCover === true,
+      completedAt: typeof m.completedAt === 'number' ? m.completedAt : 0,
+    }
+  } catch {
+    return null
+  }
+}
+
+/** Resolve an artifact ('mp4' | 'cover') for a job: live registry first, then
+ * the persisted manifest (covers reaped registry entries AND renderer
+ * restarts), then the pre-persist jobDir as a fallback. Streams are opened by
+ * the caller via Bun.file — this only stats. */
+async function artifactPath(
+  jobId: string,
+  kind: 'mp4' | 'cover',
+): Promise<{ path: string; size: number; filename: string } | null> {
+  if (!SAFE_JOB_ID.test(jobId)) return null
+  const job = jobs.get(jobId)
+  const manifest = job ? null : await readManifest(jobId)
+  const name = job?.filename ?? manifest?.filename
+  if (!name || !SAFE_MP4_NAME.test(name)) return null
+  if (kind === 'cover' && !((job?.hasCover ?? manifest?.hasCover) === true)) return null
+  const wanted = kind === 'mp4' ? name : 'cover.jpg'
+  const candidates = [join(PERSIST_DIR, jobId, wanted), join(WORKDIR, jobId, wanted)]
+  for (const p of candidates) {
+    try {
+      const st = statSync(p)
+      if (st.size > 0) return { path: p, size: st.size, filename: name }
+    } catch { /* not there — next candidate */ }
+  }
+  return null
+}
+
+/** Move a finished job's MP4 + cover into the persisted store and write its
+ * manifest. On failure, restore whatever was already moved so the legacy
+ * 10-min jobDir window still applies (honest degradation, never a lost file). */
+function persistArtifacts(job: RenderJob, outPath: string, coverPath: string | null): boolean {
+  if (!SAFE_JOB_ID.test(job.id) || !job.filename || !SAFE_MP4_NAME.test(job.filename)) return false
+  const dest = join(PERSIST_DIR, job.id)
+  try {
+    mkdirSync(dest, { recursive: true })
+    if (existsSync(outPath)) renameSync(outPath, join(dest, job.filename))
+    if (coverPath && existsSync(coverPath)) renameSync(coverPath, join(dest, 'cover.jpg'))
+    writeFileSync(
+      join(dest, 'manifest.json'),
+      JSON.stringify({
+        id: job.id,
+        status: 'done',
+        progress: 100,
+        stage: 'Render complete',
+        filename: job.filename,
+        size: job.size,
+        duration: job.duration,
+        width: job.width,
+        height: job.height,
+        durationOk: job.durationOk !== false,
+        hasCover: job.hasCover === true,
+        completedAt: Date.now(),
+      }),
+    )
+    console.log(`[${job.id}] artifacts persisted beyond the in-memory LRU (upload/renders/${job.id})`)
+    return true
+  } catch (err) {
+    console.warn(`[${job.id}] persistence failed — the 10-min jobDir window applies:`, err)
+    try {
+      const moved = join(dest, job.filename)
+      if (existsSync(moved)) renameSync(moved, outPath)
+    } catch { /* best-effort restore */ }
+    try {
+      if (coverPath) {
+        const c = join(dest, 'cover.jpg')
+        if (existsSync(c)) renameSync(c, coverPath)
+      }
+    } catch { /* best-effort restore */ }
+    try { rmSync(dest, { recursive: true, force: true }) } catch {}
+    return false
+  }
+}
+
+/** GC the persisted store: drop corrupt/manifest-less dirs, then oldest-first
+ * until under the count/byte caps. Best-effort, runs in the background after
+ * a render is accepted. */
+async function sweepPersistedStore(): Promise<void> {
+  try {
+    const dirs = readdirSync(PERSIST_DIR, { withFileTypes: true }).filter((d) => d.isDirectory())
+    type Item = { id: string; dir: string; completedAt: number; bytes: number; ok: boolean }
+    const items: Item[] = []
+    for (const d of dirs) {
+      if (!SAFE_JOB_ID.test(d.name)) {
+        try { rmSync(join(PERSIST_DIR, d.name), { recursive: true, force: true }) } catch {}
+        continue
+      }
+      const dir = join(PERSIST_DIR, d.name)
+      const m = await readManifest(d.name)
+      if (!m) {
+        items.push({ id: d.name, dir, completedAt: 0, bytes: 0, ok: false })
+        continue
+      }
+      let bytes = 0
+      try { bytes = statSync(join(dir, m.filename)).size } catch { /* MP4 missing → invalid */ }
+      items.push({ id: d.name, dir, completedAt: m.completedAt, bytes, ok: bytes > 0 })
+    }
+    const invalid = items.filter((x) => !x.ok)
+    for (const i of invalid) {
+      try { rmSync(i.dir, { recursive: true, force: true }) } catch {}
+    }
+    const ok = items.filter((x) => x.ok).sort((a, b) => a.completedAt - b.completedAt)
+    let count = ok.length
+    let total = ok.reduce((s, x) => s + x.bytes, 0)
+    for (const i of ok) {
+      if (count <= MAX_PERSISTED_COUNT && total <= MAX_PERSISTED_BYTES) break
+      try { rmSync(i.dir, { recursive: true, force: true }) } catch {}
+      count--
+      total -= i.bytes
+    }
+    if (invalid.length > 0 || count !== ok.length) {
+      console.log(`[persist] GC: removed ${invalid.length + (ok.length - count)} artifact dir(s), kept ${count}`)
+    }
+  } catch {
+    // sweep is best-effort — never block a render on it
+  }
+}
+
+/** Delete orphaned spool files (uploads whose job never ran / crashed). */
+function sweepSpoolDir(): void {
+  try {
+    for (const f of readdirSync(SPOOL_DIR)) {
+      if (!f.endsWith('.bin')) continue
+      const p = join(SPOOL_DIR, f)
+      try {
+        if (Date.now() - statSync(p).mtimeMs > SPOOL_MAX_AGE_MS) rmSync(p, { force: true })
+      } catch { /* raced with a claim — leave it */ }
+    }
+  } catch { /* spool gone — recreate on demand */ }
+}
 
 // ---- Job state machine (deterministic transitions; mission Phase 6) ----
 //   QUEUED → EXTRACTING → RENDERING → FINALIZING → DONE
@@ -274,13 +467,14 @@ function publicJob(job: RenderJob) {
 // the ffmpeg -progress pipe became meaningless. A serial FIFO queue gives each
 // job the whole machine, keeps ETA/progress honest, and is the foundation the
 // UI batch-render ("render all approved clips") builds on.
-// The queue stores the ACCEPTED File object (in-memory Blob) — same lifetime as
-// the old fire-and-forget handoff, bounded by the existing upload caps.
-const renderQueue: { jobId: string; file: File; recipe: ValidatedRecipe }[] = []
+// The queue references SPOOLED PATHS, not Files — uploads are written to
+// <repo>/upload/render-spool/<id>.bin at intake, so N queued 1.5 GB sources
+// pin disk, not N × 1.5 GB of JS heap.
+const renderQueue: { jobId: string; spoolPath: string; originalName: string; recipe: ValidatedRecipe }[] = []
 let queueBusy = false
 
-function enqueueRender(jobId: string, file: File, recipe: ValidatedRecipe) {
-  renderQueue.push({ jobId, file, recipe })
+function enqueueRender(jobId: string, spoolPath: string, originalName: string, recipe: ValidatedRecipe) {
+  renderQueue.push({ jobId, spoolPath, originalName, recipe })
   if (renderQueue.length > 1) {
     const job = jobs.get(jobId)
     if (job) {
@@ -297,11 +491,14 @@ async function drainRenderQueue() {
   try {
     while (renderQueue.length > 0) {
       const next = renderQueue.shift()!
-      // skip jobs cancelled while waiting in line
+      // skip jobs cancelled while waiting in line — their spool file is junk
       const j = jobs.get(next.jobId)
-      if (!j || j.status === 'cancelled') continue
+      if (!j || j.status === 'cancelled') {
+        try { rmSync(next.spoolPath, { force: true }) } catch {}
+        continue
+      }
       try {
-        await processJob(next.jobId, next.file, next.recipe)
+        await processJob(next.jobId, next.spoolPath, next.originalName, next.recipe)
       } catch (err) {
         // processJob reports its own errors into the job row; this is a
         // belt-and-braces guard so one crashed job never stalls the queue
@@ -319,7 +516,7 @@ async function drainRenderQueue() {
   }
 }
 
-async function processJob(jobId: string, file: File, recipe: ValidatedRecipe) {
+async function processJob(jobId: string, spoolPath: string, originalName: string, recipe: ValidatedRecipe) {
   const job = jobs.get(jobId)!
   const jobStart = Date.now()
   // job dir lives in the OUTER scope so the finally-cleanup covers every
@@ -327,12 +524,17 @@ async function processJob(jobId: string, file: File, recipe: ValidatedRecipe) {
   const jobDir = join(WORKDIR, jobId)
   try {
     mkdirSync(jobDir, { recursive: true })
-    const inputPath = join(jobDir, 'input' + (file.name.match(/\.[a-z0-9]+$/)?.[0] ?? '.mp4'))
-    // Bun.write streams the Blob to disk without materializing it a second time
-    // in the JS heap (the old arrayBuffer() path held up to 1.5 GB in RAM).
-    await Bun.write(inputPath, file)
+    const inputPath = join(jobDir, 'input' + (originalName.match(/\.[a-z0-9]+$/)?.[0] ?? '.mp4'))
+    // Claim the intake-spooled upload with a rename (same filesystem — instant,
+    // no re-copy). A vanished spool file (over-aggressive sweep / disk issue)
+    // fails honestly instead of hanging the queue.
+    try {
+      renameSync(spoolPath, inputPath)
+    } catch (e: any) {
+      throw new Error('spooled source file vanished before render: ' + (e?.message ?? String(e)))
+    }
     const inSize = statSync(inputPath).size
-    console.log(`[${jobId}] received ${file.name} (${inSize} bytes)`)
+    console.log(`[${jobId}] claimed ${originalName} from spool (${inSize} bytes)`)
     job.recipeDuration = recipe.duration
 
     // keep_ranges are REQUIRED and validated — no silent full-clip fallback.
@@ -501,6 +703,11 @@ async function processJob(jobId: string, file: File, recipe: ValidatedRecipe) {
     job.progress = 100
     job.finishedAt = Date.now()
     broadcast(job)
+    // ---- PERSIST ARTIFACTS BEYOND THE IN-MEMORY LRU ----
+    // The registry entry + jobDir are reaped after 10 min; the persisted store
+    // keeps the MP4 + cover downloadable indefinitely (bounded by GC). Served
+    // through the manifest fallback in poll/download/cover after reaping.
+    persistArtifacts(job, outPath, job.hasCover && existsSync(join(jobDir, 'cover.jpg')) ? join(jobDir, 'cover.jpg') : null)
     console.log(`[${jobId}] done: ${outName} (${job.size} bytes, ${job.duration}s, ${job.width}x${job.height}) total=${((Date.now() - jobStart) / 1000).toFixed(1)}s`)
   } catch (e: any) {
     if (job.status === 'cancelled') return // cancellation already broadcast — do not overwrite
@@ -514,8 +721,11 @@ async function processJob(jobId: string, file: File, recipe: ValidatedRecipe) {
     // CLEANUP FOR EVERY TERMINAL OUTCOME (done / error / cancelled):
     // the old code only scheduled cleanup on the success path, so a cancelled
     // or failed job leaked its input (up to 1.5 GB) and its registry entry
-    // forever. The output stays downloadable for the same 10-minute window as
-    // before; after that the job dir and registry entry are gone.
+    // forever. The output stays downloadable: from the persisted store for
+    // DONE jobs, or from the jobDir for the same 10-minute window as before
+    // (failed persistence / pre-persist edge); after that the job dir and
+    // registry entry are gone.
+    try { rmSync(spoolPath, { force: true }) } catch { /* already claimed or never written */ }
     setTimeout(() => {
       try { rmSync(jobDir, { recursive: true, force: true }) } catch {}
       jobs.delete(jobId)
@@ -569,18 +779,51 @@ serve({
       const job: RenderJob = {
         id, status: 'queued', progress: 0, stage: 'Queued', createdAt: Date.now(), recipeDuration: 10, subscribers: new Set(),
       }
+      // ---- DISK-BACKED INTAKE: spool the upload now so the serial queue holds
+      // PATHS, not Blobs (N queued uploads used to pin N × upload-size in the
+      // JS heap while waiting; now they pin disk). Bun.write streams the Blob
+      // without a second in-heap materialization.
+      const spoolPath = join(SPOOL_DIR, `${id}.bin`)
+      try {
+        await Bun.write(spoolPath, file)
+      } catch (err) {
+        return json({ error: 'failed to store the uploaded video on disk: ' + (err instanceof Error ? err.message : String(err)) }, 500)
+      }
       jobs.set(id, job)
       // start async processing (serial FIFO — one ffmpeg at a time)
-      enqueueRender(id, file, v.recipe)
+      enqueueRender(id, spoolPath, file.name, v.recipe)
+      // background housekeeping: bound the persisted artifact store, clear orphan spools
+      setTimeout(() => { void sweepPersistedStore(); sweepSpoolDir() }, 100)
       return json({ id, status: 'queued', progress: 0, queuePosition: renderQueue.length })
     }
 
-    // GET /jobs/:id — poll status
+    // GET /stats — queue depth (aggregate service info; no per-job data). The
+    // proxy relays this so the UI can show "N rendering · M in line" honestly.
+    if (req.method === 'GET' && url.pathname === '/stats') {
+      let active: { id: string; progress: number; stage: string } | null = null
+      for (const j of jobs.values()) {
+        if (isActive(j.status)) {
+          active = { id: j.id, progress: j.progress, stage: j.stage }
+          break
+        }
+      }
+      return json({ waiting: renderQueue.length, busy: queueBusy, active })
+    }
+
+    // GET /jobs/:id — poll status. Live registry first; for DONE jobs whose
+    // registry entry was reaped (10-min LRU) or lost to a renderer restart,
+    // fall back to the PERSISTED manifest so polls — and the ownership proxy's
+    // facts merge — keep answering with real artifact facts. ACTIVE rows have
+    // no manifest, so the proxy's "job lost" reconciliation is unaffected.
     const jobMatch = url.pathname.match(/^\/jobs\/([^/]+)$/)
     if (req.method === 'GET' && jobMatch) {
       const job = jobs.get(jobMatch[1])
-      if (!job) return json({ error: 'job not found' }, 404)
-      return json(publicJob(job))
+      if (job) return json(publicJob(job))
+      const m = await readManifest(jobMatch[1])
+      if (m && existsSync(join(PERSIST_DIR, jobMatch[1], m.filename))) {
+        return json(m)
+      }
+      return json({ error: 'job not found' }, 404)
     }
 
     // GET /jobs/:id/stream — SSE progress
@@ -628,44 +871,48 @@ serve({
       return json({ id: job.id, status: 'cancelled', progress: job.progress })
     }
 
-    // GET /jobs/:id/download — download rendered MP4
+    // GET /jobs/:id/download — download rendered MP4 (persisted store first;
+    // artifacts survive the in-memory registry's 10-min window and renderer
+    // restarts. jobDir fallback covers the failed-persistence degradation.)
     const dlMatch = url.pathname.match(/^\/jobs\/([^/]+)\/download$/)
     if (req.method === 'GET' && dlMatch) {
       const job = jobs.get(dlMatch[1])
-      if (!job || job.status !== 'done') return json({ error: 'render not ready' }, 404)
-      const jobDir = join(WORKDIR, job.id)
-      const outPath = join(jobDir, job.filename!)
-      if (!existsSync(outPath)) return json({ error: 'file expired' }, 410)
+      if (job && job.status !== 'done') return json({ error: 'render not ready' }, 404)
+      const art = await artifactPath(dlMatch[1], 'mp4')
+      if (!art) return json({ error: 'render artifact not found (expired or never completed)' }, 404)
       // MEMORY SAFETY: stream the file from disk (Bun.file is a streaming blob
       // source) — a 500 MB MP4 must never be materialized in the JS heap.
-      const size = statSync(outPath).size
+      const outPath = art.path
       const res = new Response(Bun.file(outPath), {
         status: 200,
         headers: {
           'Content-Type': 'video/mp4',
-          'Content-Disposition': `attachment; filename="${job.filename}"`,
-          'Content-Length': String(size),
+          'Content-Disposition': `attachment; filename="${art.filename}"`,
+          'Content-Length': String(art.size),
         },
       })
       return res
     }
 
-    // GET /jobs/:id/cover — download the extracted cover-frame JPG (when requested)
+    // GET /jobs/:id/cover — download the extracted cover-frame JPG (when
+    // requested) — same persistence fallback as the MP4 download.
     const coverMatch = url.pathname.match(/^\/jobs\/([^/]+)\/cover$/)
     if (req.method === 'GET' && coverMatch) {
       const job = jobs.get(coverMatch[1])
-      if (!job || job.status !== 'done') return json({ error: 'render not ready' }, 404)
-      if (!job.hasCover) return json({ error: 'no cover was requested for this render' }, 404)
-      const coverPath = join(WORKDIR, job.id, 'cover.jpg')
-      if (!existsSync(coverPath)) return json({ error: 'file expired' }, 410)
-      const coverSize = statSync(coverPath).size
-      const base = sanitize(job.filename?.replace(/\.mp4$/i, '') ?? 'clip')
-      const res = new Response(Bun.file(coverPath), {
+      if (job && job.status !== 'done') return json({ error: 'render not ready' }, 404)
+      const art = await artifactPath(coverMatch[1], 'cover')
+      if (!art) return json({ error: 'no cover available for this render' }, 404)
+      const base = sanitize(art.filename.replace(/\.mp4$/i, '') ?? 'clip')
+      // ?inline=1 → Content-Disposition: inline — required for <img> rendering
+      // in the render-history thumbnails (browsers refuse to display images
+      // served with an attachment disposition). Direct links keep attachment.
+      const inline = url.searchParams.get('inline') === '1'
+      const res = new Response(Bun.file(art.path), {
         status: 200,
         headers: {
           'Content-Type': 'image/jpeg',
-          'Content-Disposition': `attachment; filename="cover_${base}.jpg"`,
-          'Content-Length': String(coverSize),
+          'Content-Disposition': `${inline ? 'inline' : 'attachment'}; filename="cover_${base}.jpg"`,
+          'Content-Length': String(art.size),
           'Cache-Control': 'private, max-age=300',
         },
       })
@@ -675,10 +922,11 @@ serve({
     // GET / — health
     return json({ service: 'ClipForge ffmpeg renderer', port: PORT, endpoints: {
       'POST /render': 'multipart (video, recipe) → {id}',
-      'GET /jobs/:id': 'poll status',
+      'GET /jobs/:id': 'poll status (live registry, or persisted manifest for DONE jobs)',
       'GET /jobs/:id/stream': 'SSE progress',
-      'GET /jobs/:id/download': 'download MP4',
+      'GET /jobs/:id/download': 'download MP4 (persisted beyond the in-memory LRU)',
       'GET /jobs/:id/cover': 'download cover-frame JPG (when recipe.cover was set)',
+      'GET /stats': 'queue depth (waiting / busy / active)',
     } })
   },
 })

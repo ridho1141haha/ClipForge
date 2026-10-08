@@ -2,7 +2,6 @@
 
 import * as React from 'react'
 import { motion, AnimatePresence } from 'framer-motion'
-import { useToast } from '@/hooks/use-toast'
 import {
   History,
   RefreshCw,
@@ -16,6 +15,7 @@ import {
   RotateCcw,
   MonitorPlay,
   Image as ImageIcon,
+  Server,
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 
@@ -24,9 +24,12 @@ import { Button } from '@/components/ui/button'
 // reconciled against the live renderer by the proxy on every fetch:
 //   • live progress for ACTIVE jobs (poll while any is running)
 //   • honest "job lost" rows after a renderer restart (re-render hint)
-//   • download links for DONE jobs (subject to the renderer's 10-min retention)
+//   • download links for DONE jobs (artifacts live in the persisted store —
+//     upload/renders — until the oldest are GC'd under the storage cap)
 //   • finished-artifact facts (filename · size · duration · cover availability)
-//   • toast notifications when a background render finishes or fails
+//   • queue-depth chip ("1 rendering · N in line") from the renderer /stats
+// Completion TOASTS are handled by the page-level RenderNotifier — this panel
+// is display + polling only (no double-notification).
 // ---------------------------------------------------------------------------
 
 interface RenderJobRow {
@@ -35,14 +38,20 @@ interface RenderJobRow {
   stage: string | null
   filename: string | null
   projectId: string | null
-  // live facts merged by the proxy from the renderer while it retains the
-  // artifact (response-only — absent once past the ~10-min retention window)
+  // live/persisted facts merged by the proxy from the renderer (manifest
+  // fallback keeps these answered after the in-memory registry is reaped;
+  // absent only once the artifact is GC'd or the renderer is unreachable)
   size?: number
   duration?: number
   hasCover?: boolean
   downloadable?: boolean
   createdAt: string
   updatedAt: string
+}
+
+interface QueueInfo {
+  waiting: number
+  busy: boolean
 }
 
 const ACTIVE: string[] = ['QUEUED', 'EXTRACTING', 'RENDERING', 'FINALIZING']
@@ -94,45 +103,19 @@ function fmtBytes(b: number): string {
 }
 
 export function RenderHistory({ refreshKey }: { refreshKey?: number }) {
-  const { toast } = useToast()
   const [jobs, setJobs] = React.useState<RenderJobRow[] | null>(null)
+  const [queue, setQueue] = React.useState<QueueInfo | null>(null)
   const [loading, setLoading] = React.useState(false)
   const timerRef = React.useRef<number>(0)
-  // last status seen per job — powers the background-completion toasts
-  const seenRef = React.useRef<Map<string, string>>(new Map())
-  const initializedRef = React.useRef(false)
 
   const load = React.useCallback(async () => {
     setLoading(true)
     try {
       const res = await fetch('/api/render-proxy/jobs', { cache: 'no-store' })
       if (res.ok) {
-        const data = (await res.json()) as { jobs?: RenderJobRow[] }
-        const next = data.jobs ?? []
-        // toast on transitions active → terminal, but only AFTER the first
-        // load (so opening the panel doesn't toast for already-old jobs)
-        if (initializedRef.current) {
-          for (const j of next) {
-            const prev = seenRef.current.get(j.id)
-            if (prev && ACTIVE.includes(prev)) {
-              if (j.status === 'DONE') {
-                toast({
-                  title: 'Render complete',
-                  description: `${j.filename ?? 'Your clip'} is ready to download (kept ~10 minutes).`,
-                })
-              } else if (j.status === 'ERROR') {
-                toast({
-                  title: 'Render failed',
-                  description: j.stage ?? 'The render ended with an error.',
-                  variant: 'destructive',
-                })
-              }
-            }
-          }
-        }
-        for (const j of next) seenRef.current.set(j.id, j.status)
-        initializedRef.current = true
-        setJobs(next)
+        const data = (await res.json()) as { jobs?: RenderJobRow[]; queue?: QueueInfo | null }
+        setJobs(data.jobs ?? [])
+        setQueue(data.queue ?? null)
       } else {
         setJobs([])
       }
@@ -159,6 +142,7 @@ export function RenderHistory({ refreshKey }: { refreshKey?: number }) {
 
   const anyActive = jobs?.some((j) => ACTIVE.includes(j.status)) ?? false
   const doneCount = jobs?.filter((j) => j.status === 'DONE').length ?? 0
+  const queueBusy = queue != null && (queue.busy || queue.waiting > 0)
 
   return (
     <div className="relative overflow-hidden rounded-xl border border-border/60 bg-card/50 p-4 sm:p-5">
@@ -181,6 +165,17 @@ export function RenderHistory({ refreshKey }: { refreshKey?: number }) {
               <span className="relative inline-flex h-1.5 w-1.5 rounded-full bg-amber-500" />
             </span>
             live
+          </span>
+        ) : null}
+        {/* queue depth — includes OTHER sessions' jobs (single serial queue) */}
+        {queueBusy && queue ? (
+          <span
+            className="inline-flex items-center gap-1 rounded-full border border-primary/25 bg-primary/10 px-2 py-0.5 text-[9px] font-semibold uppercase tracking-wide text-primary"
+            title={`The render queue runs one job at a time — ${queue.busy ? '1 rendering' : 'idle'}${queue.waiting > 0 ? ` · ${queue.waiting} waiting` : ''}`}
+          >
+            <Server className="h-2.5 w-2.5" />
+            {queue.busy ? '1 rendering' : 'busy'}
+            {queue.waiting > 0 ? ` · ${queue.waiting} in line` : ''}
           </span>
         ) : null}
         <span className="ml-auto hidden items-center gap-1 text-[10px] font-medium text-muted-foreground sm:inline-flex">
@@ -246,6 +241,21 @@ export function RenderHistory({ refreshKey }: { refreshKey?: number }) {
                   }`}
                 >
                   <div className="flex items-center gap-2">
+                    {/* cover thumbnail — the exact frame picked in the cover
+                        selector, streamed through the ownership-gated proxy
+                        (?inline=1: browsers refuse <img> with attachment
+                        disposition) */}
+                    {job.status === 'DONE' && job.downloadable && job.hasCover ? (
+                      <img
+                        src={`/api/render-proxy/jobs/${job.id}/cover?inline=1`}
+                        alt=""
+                        loading="lazy"
+                        width={24}
+                        height={42}
+                        className="h-[42px] w-6 shrink-0 rounded-[3px] border border-border/60 bg-muted object-cover"
+                      />
+                    ) : null}
+
                     {/* status chip */}
                     <span
                       className={`inline-flex shrink-0 items-center gap-1 rounded-md border px-1.5 py-0.5 text-[10px] font-semibold ${v.cls}`}
@@ -282,7 +292,7 @@ export function RenderHistory({ refreshKey }: { refreshKey?: number }) {
                       <a
                         href={`/api/render-proxy/jobs/${job.id}/download`}
                         className="inline-flex h-7 shrink-0 items-center gap-1 rounded-md border border-emerald-500/30 bg-emerald-500/10 px-2 text-[11px] font-semibold text-emerald-600 transition-all hover:bg-emerald-500/20 hover:shadow-sm dark:text-emerald-400"
-                        title="Download the rendered MP4 (kept ~10 minutes after finishing)"
+                        title="Download the rendered MP4 (stored on the server)"
                       >
                         <Download className="h-3 w-3" />
                         <span className="hidden sm:inline">MP4</span>
@@ -290,10 +300,10 @@ export function RenderHistory({ refreshKey }: { refreshKey?: number }) {
                     ) : job.status === 'DONE' && !job.downloadable ? (
                       <span
                         className="inline-flex h-7 shrink-0 items-center gap-1 rounded-md border border-border/40 px-2 text-[10px] font-medium text-muted-foreground/60"
-                        title="The rendered file is past the server's ~10-minute retention window — render again to produce a fresh copy"
+                        title="The rendered file was cleaned from the server's storage cap — render again to produce a fresh copy"
                       >
                         <Clock3 className="h-3 w-3" />
-                        expired
+                        cleaned
                       </span>
                     ) : null}
                   </div>
@@ -353,8 +363,8 @@ export function RenderHistory({ refreshKey }: { refreshKey?: number }) {
 
       {jobs && jobs.length > 0 ? (
         <p className="mt-2.5 flex items-center gap-1.5 text-[10px] leading-relaxed text-muted-foreground/70">
-          <Clock3 className="h-3 w-3 shrink-0" />
-          Rendered files are kept on the server for ~10 minutes — download promptly.
+          <Server className="h-3 w-3 shrink-0" />
+          Rendered files are stored on the server — the oldest are auto-cleaned to stay under the storage cap.
           {anyActive ? ' Live progress updates every few seconds.' : ''}
         </p>
       ) : null}

@@ -18,6 +18,7 @@ import {
   CloudDownload,
   HardDriveUpload,
   Image as ImageIcon,
+  ArrowRight,
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
@@ -43,13 +44,15 @@ interface Props {
   projectMedia?: { state?: string | null; size?: number | null; error?: string | null } | null
   /** fired when a render job is accepted — lets the render-history panel live-track it */
   onJobStarted?: (jobId: string) => void
+  /** scroll the studio into view ("generate a plan" shortcut from the no-plan notice) */
+  onOpenStudio?: () => void
   // optional: when invoked from library with a stored clip plan
 }
 
 type Phase = 'idle' | 'uploading' | 'rendering' | 'done' | 'error'
 type SourceMode = 'local' | 'upload'
 
-export function UploadRender({ plan, projectId, projectMedia, onJobStarted }: Props) {
+export function UploadRender({ plan, projectId, projectMedia, onJobStarted, onOpenStudio }: Props) {
   const localReady = Boolean(projectId && projectMedia?.state === 'ready')
   const [sourceMode, setSourceMode] = React.useState<SourceMode>(localReady ? 'local' : 'upload')
   const [file, setFile] = React.useState<File | null>(null)
@@ -336,7 +339,7 @@ export function UploadRender({ plan, projectId, projectMedia, onJobStarted }: Pr
         // Surface it instead of polling forever.
         if (res.status === 404) {
           setPhase('error')
-          setError('Render job not found — it may have expired (results are kept for 10 minutes) or belongs to another session.')
+          setError('Render job not found — its artifact may have been cleaned from the server storage cap, or it belongs to another session.')
           return
         }
         if (job.status === 'cancelled') {
@@ -420,16 +423,28 @@ export function UploadRender({ plan, projectId, projectMedia, onJobStarted }: Pr
         </div>
       </div>
 
-      {/* plan requirement notice */}
+      {/* plan requirement notice — softened amber, grouped copy, one clear action */}
       {!plan && (
-        <div className="flex items-start gap-2 rounded-lg border border-amber-500/30 bg-amber-500/5 p-3">
-          <AlertCircle className="mt-0.5 h-4 w-4 shrink-0 text-amber-500" />
-          <div className="text-xs">
+        <div className="flex items-start gap-2.5 rounded-lg border border-amber-500/25 bg-amber-500/[0.07] p-3.5">
+          <AlertCircle className="mt-0.5 h-4 w-4 shrink-0 text-amber-500/90" />
+          <div className="min-w-0 flex-1 text-xs leading-relaxed">
             <p className="font-medium text-amber-700 dark:text-amber-400">No edit plan selected</p>
-            <p className="mt-0.5 text-muted-foreground">
-              Generate an AI edit plan on any clip first, then come back here to render. The plan tells the renderer which cuts to make, subtitles to burn, and zoom to apply.
+            <p className="mt-1 text-muted-foreground">
+              Generate an AI edit plan on any clip first — it tells the renderer which cuts to
+              make, subtitles to burn, and zoom to apply.
             </p>
           </div>
+          {onOpenStudio ? (
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={onOpenStudio}
+              className="h-7 shrink-0 gap-1 border-amber-500/30 bg-transparent px-2.5 text-[11px] font-semibold text-amber-700 hover:bg-amber-500/10 hover:text-amber-600 dark:text-amber-400 dark:hover:text-amber-300"
+            >
+              Open studio
+              <ArrowRight className="h-3 w-3" />
+            </Button>
+          ) : null}
         </div>
       )}
 

@@ -38,8 +38,8 @@ interface ClipPlanSource {
   title: string
   startTime: number
   endTime: number
-  status: string
-  hasPlan: boolean
+  status?: string
+  hasPlan?: boolean
   generatedHook?: string | null
   segments?: unknown
   cuts?: unknown
@@ -78,7 +78,13 @@ function planFromClip(c: ClipPlanSource, platform: string, style: string, target
       title: c.title,
       generated_hook: c.generatedHook ?? '',
       segments: c.segments as EditPlan['selected_clip']['segments'],
-      cuts: c.cuts as Cut[],
+      // Clip.cuts is persisted JSON (optional reason per stored cut); the
+      // EditPlan recipe path expects a reason — normalize honestly per cut
+      cuts: ((c.cuts as Cut[] | undefined) ?? []).map((cut) => ({
+        start: cut.start,
+        end: cut.end,
+        reason: cut.reason ?? '',
+      })) as EditPlan['selected_clip']['cuts'],
       camera: c.camera as EditPlan['selected_clip']['camera'],
       visuals: c.visuals as EditPlan['selected_clip']['visuals'],
       animations: c.animations as EditPlan['selected_clip']['animations'],
@@ -354,7 +360,7 @@ export function BatchRender({ clips, platform, style, targetDuration, projectId,
 
       <p className="mt-2.5 flex items-center gap-1.5 text-[10px] leading-relaxed text-muted-foreground/70">
         <Clock3 className="h-3 w-3 shrink-0" />
-        Renders run one at a time from the server source. Finished MP4s land in the render history below (kept ~10 minutes each).
+        Renders run one at a time from the server source. Finished MP4s land in the render history below (stored on the server; oldest auto-cleaned under the storage cap).
       </p>
     </div>
   )

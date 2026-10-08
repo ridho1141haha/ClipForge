@@ -216,7 +216,7 @@ export function UrlInput({ onAnalyze, loading, error }: Props) {
           initial={{ opacity: 0, y: 8 }}
           animate={{ opacity: 1, y: 0 }}
           transition={{ duration: 0.4 }}
-          className="group relative rounded-2xl border border-border/80 bg-card/60 p-1.5 shadow-xl shadow-black/5 backdrop-blur-xl"
+          className="group relative rounded-2xl border border-border/80 bg-card/80 p-1.5 shadow-xl shadow-black/5 backdrop-blur-xl transition-colors focus-within:border-primary/40"
         >
           <div className="absolute -inset-px -z-10 rounded-2xl bg-gradient-to-r from-primary/0 via-primary/20 to-primary/0 opacity-0 blur transition-opacity group-focus-within:opacity-100" />
           <div className="flex flex-col gap-2 sm:flex-row sm:items-center">

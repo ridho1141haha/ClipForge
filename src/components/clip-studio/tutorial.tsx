@@ -372,7 +372,7 @@ function RenderTutorial() {
         </Step>
       </div>
       <Callout type="info">
-        Rendered files are kept on the server for 10 minutes after completion — download within that window. After that the job is cleaned up.
+        Rendered files are stored on the server (Render history) — the oldest are auto-cleaned to stay under the storage cap, so download the ones you want to keep.
       </Callout>
     </div>
   )

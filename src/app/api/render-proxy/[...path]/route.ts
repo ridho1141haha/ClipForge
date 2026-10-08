@@ -178,8 +178,25 @@ async function listOwnedRenderJobs(): Promise<Response> {
     ...(facts.has(r.id) ? facts.get(r.id) : {}),
     downloadable: r.status === 'DONE' && facts.has(r.id),
   }))
+  // queue depth (aggregate — relays the renderer's /stats so the UI can show
+  // "1 rendering · N in line" honestly, incl. OTHER sessions' queued jobs)
+  let queue: { waiting: number; busy: boolean } | null = null
+  try {
+    const res = await fetch(`${RENDERER_BASE}/stats`, {
+      signal: AbortSignal.timeout(2000),
+      cache: 'no-store',
+    })
+    if (res.ok) {
+      const s = (await res.json()) as { waiting?: unknown; busy?: unknown }
+      if (typeof s.waiting === 'number' && Number.isFinite(s.waiting) && typeof s.busy === 'boolean') {
+        queue = { waiting: Math.max(0, Math.trunc(s.waiting)), busy: s.busy }
+      }
+    }
+  } catch {
+    // stats are optional observability — the list still answers without them
+  }
   return NextResponse.json(
-    { jobs },
+    { jobs, queue },
     { headers: { 'cache-control': 'no-store' } },
   )
 }

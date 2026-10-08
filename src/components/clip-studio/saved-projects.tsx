@@ -113,38 +113,38 @@ export function SavedProjects({ projects, loading, onSelect, onDelete, onRefresh
 
   return (
     <div>
-      {/* summary header */}
-      <div className="mb-4 flex flex-wrap items-center gap-3">
-        <div className="flex items-center gap-2 rounded-lg border border-border/60 bg-card/40 px-3 py-1.5">
-          <FilmIcon className="h-3.5 w-3.5 text-primary" />
-          <span className="text-sm font-semibold tabular-nums">{projects.length}</span>
-          <span className="text-xs text-muted-foreground">project{projects.length === 1 ? '' : 's'}</span>
+      {/* summary header — numbers lead, labels whisper (visual hierarchy) */}
+      <div className="mb-4 flex flex-wrap items-center gap-2.5">
+        <div className="flex items-baseline gap-1.5 rounded-lg border border-border/60 bg-card/40 px-3 py-1.5">
+          <FilmIcon className="h-3.5 w-3.5 self-center text-primary" />
+          <span className="text-base font-bold tabular-nums leading-none">{projects.length}</span>
+          <span className="text-[10px] font-medium uppercase tracking-wide text-muted-foreground/70">project{projects.length === 1 ? '' : 's'}</span>
         </div>
-        <div className="flex items-center gap-2 rounded-lg border border-border/60 bg-card/40 px-3 py-1.5">
-          <Scissors className="h-3.5 w-3.5 text-violet-500" />
-          <span className="text-sm font-semibold tabular-nums">{totalClips}</span>
-          <span className="text-xs text-muted-foreground">clips</span>
+        <div className="flex items-baseline gap-1.5 rounded-lg border border-border/60 bg-card/40 px-3 py-1.5">
+          <Scissors className="h-3.5 w-3.5 self-center text-violet-500" />
+          <span className="text-base font-bold tabular-nums leading-none">{totalClips}</span>
+          <span className="text-[10px] font-medium uppercase tracking-wide text-muted-foreground/70">clips</span>
         </div>
-        <div className="flex items-center gap-2 rounded-lg border border-border/60 bg-card/40 px-3 py-1.5">
-          <Clock className="h-3.5 w-3.5 text-sky-500" />
-          <span className="text-sm font-semibold tabular-nums">{fmtDuration(totalDuration)}</span>
-          <span className="text-xs text-muted-foreground">total</span>
+        <div className="flex items-baseline gap-1.5 rounded-lg border border-border/60 bg-card/40 px-3 py-1.5">
+          <Clock className="h-3.5 w-3.5 self-center text-sky-500" />
+          <span className="text-base font-bold tabular-nums leading-none">{fmtDuration(totalDuration)}</span>
+          <span className="text-[10px] font-medium uppercase tracking-wide text-muted-foreground/70">total</span>
         </div>
         {analyzedCount > 0 && (
-          <div className="flex items-center gap-2 rounded-lg border border-emerald-500/20 bg-emerald-500/5 px-3 py-1.5">
-            <Sparkles className="h-3.5 w-3.5 text-emerald-500" />
-            <span className="text-sm font-semibold tabular-nums">{analyzedCount}</span>
-            <span className="text-xs text-muted-foreground">analyzed</span>
+          <div className="flex items-baseline gap-1.5 rounded-lg border border-emerald-500/20 bg-emerald-500/5 px-3 py-1.5">
+            <Sparkles className="h-3.5 w-3.5 self-center text-emerald-500" />
+            <span className="text-base font-bold tabular-nums leading-none">{analyzedCount}</span>
+            <span className="text-[10px] font-medium uppercase tracking-wide text-muted-foreground/70">analyzed</span>
           </div>
         )}
         {renderReadyCount > 0 && (
           <div
-            className="flex items-center gap-2 rounded-lg border border-sky-500/20 bg-sky-500/5 px-3 py-1.5"
+            className="flex items-baseline gap-1.5 rounded-lg border border-sky-500/20 bg-sky-500/5 px-3 py-1.5"
             title="These projects have the source video saved on the server — clips render without re-uploading it"
           >
-            <CloudDownload className="h-3.5 w-3.5 text-sky-500" />
-            <span className="text-sm font-semibold tabular-nums">{renderReadyCount}</span>
-            <span className="text-xs text-muted-foreground">render-ready</span>
+            <CloudDownload className="h-3.5 w-3.5 self-center text-sky-500" />
+            <span className="text-base font-bold tabular-nums leading-none">{renderReadyCount}</span>
+            <span className="text-[10px] font-medium uppercase tracking-wide text-muted-foreground/70">render-ready</span>
           </div>
         )}
         <UsagePanel />
@@ -157,7 +157,7 @@ export function SavedProjects({ projects, loading, onSelect, onDelete, onRefresh
               value={query}
               onChange={(e) => setQuery(e.target.value)}
               placeholder="Search title or channel…"
-              className="h-9 w-48 pl-8 pr-8 text-xs sm:w-56"
+              className="h-8 w-48 rounded-lg pl-8 pr-8 text-xs sm:w-56"
             />
             {query && (
               <button
@@ -168,7 +168,8 @@ export function SavedProjects({ projects, loading, onSelect, onDelete, onRefresh
               </button>
             )}
           </div>
-          <div className="flex items-center gap-0.5 rounded-lg border border-border/60 bg-card/40 p-0.5">
+          {/* sort — matches the search input's height/radius for a unified toolbar row */}
+          <div className="flex h-8 items-center gap-0.5 rounded-lg border border-border/60 bg-card/40 p-0.5">
             {(['recent', 'clips', 'duration'] as const).map((s) => (
               <button
                 key={s}
@@ -185,7 +186,7 @@ export function SavedProjects({ projects, loading, onSelect, onDelete, onRefresh
             size="sm"
             variant="ghost"
             onClick={onRefresh}
-            className="h-9 w-9 px-0"
+            className="h-8 w-8 px-0"
             title="Refresh"
           >
             <RefreshCw className="h-3.5 w-3.5" />

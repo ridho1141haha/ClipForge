@@ -52,6 +52,7 @@ import { Tutorial } from '@/components/clip-studio/tutorial'
 import { UploadRender } from '@/components/clip-studio/upload-render'
 import { RenderHistory } from '@/components/clip-studio/render-history'
 import { BatchRender } from '@/components/clip-studio/batch-render'
+import { RenderNotifier } from '@/components/clip-studio/render-notifier'
 import { RemotionPlayer } from '@/components/clip-studio/remotion-player'
 
 import { Button } from '@/components/ui/button'
@@ -1259,7 +1260,7 @@ export default function Home() {
                 Turn any YouTube video into{' '}
                 <span className="text-gradient-rose">viral clips</span> in seconds
               </h1>
-              <p className="mx-auto mt-4 max-w-2xl text-pretty text-base text-muted-foreground sm:text-lg">
+              <p className="mx-auto mt-4 max-w-2xl text-pretty text-base leading-relaxed text-muted-foreground sm:text-lg">
                 Paste a link. ClipForge AI reads the content, predicts the most
                 shareable moments, and gives you timestamped clips with hooks,
                 virality scores, and tags — ready for Shorts, Reels, and TikTok.
@@ -1743,34 +1744,37 @@ export default function Home() {
                 <h2 className="text-2xl font-bold tracking-tight sm:text-3xl">
                   Library & Render
                 </h2>
-                <p className="mt-1 text-sm text-muted-foreground">
+                <p className="mt-1 max-w-2xl text-sm leading-relaxed text-muted-foreground">
                   Browse saved projects, or upload your own video and render a 9:16 vertical clip with the AI edit plan applied.
                 </p>
               </div>
-              {/* tab switcher */}
-              <div className="flex items-center gap-0.5 rounded-lg border border-border/60 bg-card/40 p-0.5">
-                <button
-                  onClick={() => setLibraryTab('library')}
-                  className={`inline-flex items-center gap-1.5 rounded-md px-3 py-1.5 text-xs font-medium transition-colors ${
-                    libraryTab === 'library'
-                      ? 'bg-primary text-primary-foreground'
-                      : 'text-muted-foreground hover:text-foreground'
-                  }`}
-                >
-                  <Film className="h-3.5 w-3.5" />
-                  Library
-                </button>
-                <button
-                  onClick={() => setLibraryTab('render')}
-                  className={`inline-flex items-center gap-1.5 rounded-md px-3 py-1.5 text-xs font-medium transition-colors ${
-                    libraryTab === 'render'
-                      ? 'bg-primary text-primary-foreground'
-                      : 'text-muted-foreground hover:text-foreground'
-                  }`}
-                >
-                  <Wand2 className="h-3.5 w-3.5" />
-                  Render
-                </button>
+              {/* tab switcher — segmented control with a sliding active pill */}
+              <div className="flex items-center gap-0.5 rounded-lg border border-border/60 bg-muted/60 p-1 shadow-inner">
+                {(['library', 'render'] as const).map((tab) => {
+                  const active = libraryTab === tab
+                  return (
+                    <button
+                      key={tab}
+                      onClick={() => setLibraryTab(tab)}
+                      className={`relative inline-flex items-center rounded-md px-3.5 py-1.5 text-xs font-medium transition-colors duration-200 ${
+                        active ? 'text-primary-foreground' : 'text-muted-foreground hover:text-foreground'
+                      }`}
+                      aria-pressed={active}
+                    >
+                      {active ? (
+                        <motion.span
+                          layoutId="libraryTabPill"
+                          className="absolute inset-0 rounded-md bg-primary shadow-sm"
+                          transition={{ type: 'spring', stiffness: 420, damping: 34 }}
+                        />
+                      ) : null}
+                      <span className="relative z-10 inline-flex items-center gap-1.5">
+                        {tab === 'library' ? <Film className="h-3.5 w-3.5" /> : <Wand2 className="h-3.5 w-3.5" />}
+                        {tab === 'library' ? 'Library' : 'Render'}
+                      </span>
+                    </button>
+                  )
+                })}
               </div>
             </div>
 
@@ -1789,10 +1793,12 @@ export default function Home() {
                   projectId={projectId}
                   projectMedia={projectMedia}
                   onJobStarted={() => setRenderHistoryKey((k) => k + 1)}
+                  onOpenStudio={() => studioRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' })}
                 />
                 {phase === 'done' ? (
                   <BatchRender
-                    clips={clips}
+                    // batch renders need persisted clips — id-less drafts can't be approved
+                    clips={clips.filter((c): c is typeof c & { id: string } => Boolean(c.id))}
                     platform={currentPlatform}
                     style={currentStyle}
                     targetDuration={currentTargetDuration}
@@ -1811,6 +1817,10 @@ export default function Home() {
         {/* ===== TUTORIAL ===== */}
         <Tutorial />
       </main>
+
+      {/* page-level render watcher: completion toasts regardless of the active
+          tab (RenderHistory only polls while the Render tab is mounted) */}
+      <RenderNotifier />
 
       <Footer />
 
