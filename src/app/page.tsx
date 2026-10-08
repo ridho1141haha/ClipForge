@@ -50,6 +50,7 @@ import { LivePreviewCard } from '@/components/clip-studio/live-preview-card'
 import { FeaturesGrid } from '@/components/clip-studio/features-grid'
 import { Tutorial } from '@/components/clip-studio/tutorial'
 import { UploadRender } from '@/components/clip-studio/upload-render'
+import { RenderHistory } from '@/components/clip-studio/render-history'
 import { RemotionPlayer } from '@/components/clip-studio/remotion-player'
 
 import { Button } from '@/components/ui/button'
@@ -129,6 +130,8 @@ export default function Home() {
 
   // library tab: 'library' or 'render'
   const [libraryTab, setLibraryTab] = React.useState<'library' | 'render'>('library')
+  // bump → RenderHistory reloads (fired when a new render job is accepted)
+  const [renderHistoryKey, setRenderHistoryKey] = React.useState(0)
 
   // library state
   const [savedProjects, setSavedProjects] = React.useState<Project[]>([])
@@ -1779,8 +1782,14 @@ export default function Home() {
                 onRefresh={refreshProjects}
               />
             ) : (
-              <div className="mx-auto max-w-2xl">
-                <UploadRender plan={currentPlan} projectId={projectId} projectMedia={projectMedia} />
+              <div className="mx-auto max-w-2xl space-y-5">
+                <UploadRender
+                  plan={currentPlan}
+                  projectId={projectId}
+                  projectMedia={projectMedia}
+                  onJobStarted={() => setRenderHistoryKey((k) => k + 1)}
+                />
+                <RenderHistory refreshKey={renderHistoryKey} />
               </div>
             )}
           </div>

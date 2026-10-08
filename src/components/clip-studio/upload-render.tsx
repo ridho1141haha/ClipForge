@@ -41,13 +41,15 @@ interface Props {
   projectId?: string | null
   /** server-side source media state for the project (downloaded YouTube source or persisted upload) */
   projectMedia?: { state?: string | null; size?: number | null; error?: string | null } | null
+  /** fired when a render job is accepted — lets the render-history panel live-track it */
+  onJobStarted?: (jobId: string) => void
   // optional: when invoked from library with a stored clip plan
 }
 
 type Phase = 'idle' | 'uploading' | 'rendering' | 'done' | 'error'
 type SourceMode = 'local' | 'upload'
 
-export function UploadRender({ plan, projectId, projectMedia }: Props) {
+export function UploadRender({ plan, projectId, projectMedia, onJobStarted }: Props) {
   const localReady = Boolean(projectId && projectMedia?.state === 'ready')
   const [sourceMode, setSourceMode] = React.useState<SourceMode>(localReady ? 'local' : 'upload')
   const [file, setFile] = React.useState<File | null>(null)
@@ -245,6 +247,7 @@ export function UploadRender({ plan, projectId, projectMedia }: Props) {
       if (!res.ok) throw new Error(data.error ?? 'Upload failed')
       setJobId(data.id)
       setStage('Queued…')
+      onJobStarted?.(data.id)
       pollJob(data.id)
     } catch (e: any) {
       setPhase('error')
@@ -573,7 +576,12 @@ export function UploadRender({ plan, projectId, projectMedia }: Props) {
 
       {/* plan summary */}
       {plan && (
-        <div className="rounded-lg border border-border/60 bg-card/40 p-3">
+        <div className="relative overflow-hidden rounded-xl border border-border/60 bg-card/40 p-4">
+          {/* subtle gradient accent rail */}
+          <div
+            aria-hidden
+            className="pointer-events-none absolute inset-y-0 left-0 w-[3px] bg-gradient-to-b from-primary/60 via-primary/20 to-transparent"
+          />
           <div className="mb-2 flex items-center gap-1.5 text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">
             <Sparkles className="h-3 w-3 text-primary" />
             Edit plan to apply
@@ -582,7 +590,7 @@ export function UploadRender({ plan, projectId, projectMedia }: Props) {
           <p className="mt-0.5 font-mono text-xs text-muted-foreground">
             {fmtTime(plan.selected_clip.start)} → {fmtTime(plan.selected_clip.end)} · {fmtDuration(plan.selected_clip.duration)}
           </p>
-          <div className="mt-2 grid grid-cols-2 gap-1.5 text-[11px] sm:grid-cols-4">
+          <div className="mt-2.5 grid grid-cols-2 gap-1.5 text-[11px] sm:grid-cols-4">
             <PlanStat icon={<Scissors className="h-3 w-3" />} label="Cuts" value={plan.selected_clip.cuts.length} />
             <PlanStat icon={<Check className="h-3 w-3" />} label="Subtitles" value={plan.selected_clip.subtitles.length} />
             <PlanStat icon={<Wand2 className="h-3 w-3" />} label="Camera" value={plan.selected_clip.camera.length} />
@@ -590,7 +598,7 @@ export function UploadRender({ plan, projectId, projectMedia }: Props) {
           </div>
 
           {/* Honest capability labeling (Phase 14) */}
-          <div className="mt-3 space-y-1.5 rounded-md border border-sky-500/20 bg-sky-500/5 p-2.5 text-[10px] leading-relaxed">
+          <div className="mt-3 space-y-1.5 rounded-lg border border-sky-500/20 bg-sky-500/5 p-2.5 text-[10px] leading-relaxed">
             <p className="font-semibold text-sky-700 dark:text-sky-400">What the renderer actually applies to the MP4:</p>
             <p className="text-muted-foreground">
               ✅ Cuts (removed sections) · ✅ Subtitle burn-in (transcript-grounded, output-time mapped) · ✅ Karaoke word-highlight (when word timestamps are available) · ✅ Camera punch-in/zoom · ✅ 9:16 crop + scale · ✅ H.264 + AAC 1080×1920
@@ -950,10 +958,13 @@ export function UploadRender({ plan, projectId, projectMedia }: Props) {
 
 function PlanStat({ icon, label, value }: { icon: React.ReactNode; label: string; value: number }) {
   return (
-    <div className="flex items-center gap-1.5 rounded-md bg-muted/30 px-2 py-1">
-      <span className="text-muted-foreground">{icon}</span>
-      <span className="font-semibold tabular-nums">{value}</span>
-      <span className="text-muted-foreground">{label}</span>
+    <div
+      className="group flex items-center gap-1.5 rounded-md border border-border/40 bg-muted/30 px-2 py-1.5 transition-colors hover:border-primary/30 hover:bg-primary/5"
+      title={`${value} ${label.toLowerCase()} in this edit plan`}
+    >
+      <span className="text-primary/80 transition-colors group-hover:text-primary">{icon}</span>
+      <span className="text-sm font-bold tabular-nums leading-none">{value}</span>
+      <span className="text-[9px] font-semibold uppercase tracking-wide text-muted-foreground/80">{label}</span>
     </div>
   )
 }

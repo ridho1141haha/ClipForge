@@ -58,6 +58,131 @@ export const runtime = 'nodejs'
 export const maxDuration = 300
 
 const JOB_PATH_RE = /^\/jobs\/([\w-]+)(\/(stream|download|cover|cancel))?$/
+// statuses that mean "the renderer should still know this job" — used by the
+// stale-row reconciliation (a 404 for an ACTIVE row = the job is lost)
+const ACTIVE_STATUSES = new Set(['QUEUED', 'EXTRACTING', 'RENDERING', 'FINALIZING'])
+
+/**
+ * GET /api/render-proxy/jobs — render history for THIS session (owner-scoped).
+ *
+ * Lists the caller's RenderJob rows newest-first and RECONCILES them against
+ * the live renderer before answering:
+ *   - active row + renderer knows it → sync terminal/progress status into the row
+ *   - active row + renderer 404      → the renderer restarted since the job
+ *     started; its in-memory job is gone. The row is honestly marked ERROR
+ *     ("render lost — render again") instead of staying stuck active forever.
+ *   - DONE rows keep their recorded state (artifacts may still be within the
+ *     renderer's retention window — download is attempted live by the client).
+ *
+ * This is the data source for the UI Render History panel and doubles as the
+ * stale-row reaper documented in the deployment worklog.
+ */
+async function listOwnedRenderJobs(): Promise<Response> {
+  const ownerId = await getOrCreateSessionId()
+  const rows = await db.renderJob.findMany({
+    where: { ownerId },
+    orderBy: { createdAt: 'desc' },
+    take: 20,
+  })
+
+  // reconcile only ACTIVE rows, bounded — never let history reads DoS the renderer.
+  // Live artifact facts (size / duration / hasCover) come from the renderer's
+  // in-memory state when it still knows the job — they are NOT persisted
+  // (the RenderJob table is the AUTHORIZATION record, by design; facts are
+  // merged into the response only while the renderer retains the artifact).
+  const active = rows.filter((r) => ACTIVE_STATUSES.has(r.status)).slice(0, 10)
+  await Promise.all(
+    active.map(async (row) => {
+      try {
+        const res = await fetch(`${RENDERER_BASE}/jobs/${row.id}`, {
+          signal: AbortSignal.timeout(4000),
+          cache: 'no-store',
+        })
+        if (res.ok) {
+          const j = (await res.json()) as { status?: unknown; stage?: unknown; filename?: unknown }
+          const status = canonicalStatus(j.status)
+          if (status && status !== row.status) {
+            await db.renderJob.update({
+              where: { id: row.id },
+              data: {
+                status,
+                ...(typeof j.stage === 'string' ? { stage: j.stage.slice(0, 300) } : {}),
+                ...(typeof j.filename === 'string' && j.filename && !row.filename ? { filename: j.filename.slice(0, 255) } : {}),
+              },
+            })
+          } else if (typeof j.stage === 'string' && j.stage !== row.stage) {
+            await db.renderJob.update({ where: { id: row.id }, data: { stage: j.stage.slice(0, 300) } })
+          }
+        } else if (res.status === 404) {
+          // renderer restarted since this job started — honest failure, not a hang
+          await db.renderJob.update({
+            where: { id: row.id },
+            data: {
+              status: 'ERROR',
+              stage: 'Render job lost — the render service restarted. Please render again.',
+            },
+          })
+        }
+      } catch {
+        // renderer unreachable mid-list → keep the recorded status (the
+        // supervisor will revive it on the next render request)
+      }
+    }),
+  )
+
+  // merge live artifact facts for DONE rows still known to the renderer —
+  // bounded (top 10 done rows), timeout-guarded, fully optional
+  const doneRows = rows.filter((r) => r.status === 'DONE').slice(0, 10)
+  const facts = new Map<string, { size?: number; duration?: number; hasCover?: boolean }>()
+  await Promise.all(
+    doneRows.map(async (row) => {
+      try {
+        const res = await fetch(`${RENDERER_BASE}/jobs/${row.id}`, {
+          signal: AbortSignal.timeout(4000),
+          cache: 'no-store',
+        })
+        if (res.ok) {
+          const j = (await res.json()) as { size?: unknown; duration?: unknown; hasCover?: unknown }
+          facts.set(row.id, {
+            ...(typeof j.size === 'number' && Number.isFinite(j.size) ? { size: Math.round(j.size) } : {}),
+            ...(typeof j.duration === 'number' && Number.isFinite(j.duration) ? { duration: j.duration } : {}),
+            hasCover: j.hasCover === true,
+          })
+        }
+        // 404 = artifact past the renderer's retention window — the download
+        // link will fail; facts stay absent (honest degradation)
+      } catch {
+        // unreachable — facts simply omitted
+      }
+    }),
+  )
+
+  // re-read after reconciliation so the response reflects the synced truth
+  const finalRows = await db.renderJob.findMany({
+    where: { ownerId },
+    orderBy: { createdAt: 'desc' },
+    take: 20,
+    select: {
+      id: true,
+      status: true,
+      stage: true,
+      filename: true,
+      projectId: true,
+      createdAt: true,
+      updatedAt: true,
+    },
+  })
+  // attach availability flags + live facts (response-only, not persisted)
+  const jobs = finalRows.map((r) => ({
+    ...r,
+    ...(facts.has(r.id) ? facts.get(r.id) : {}),
+    downloadable: r.status === 'DONE' && facts.has(r.id),
+  }))
+  return NextResponse.json(
+    { jobs },
+    { headers: { 'cache-control': 'no-store' } },
+  )
+}
 
 /**
  * Wrap an incoming request stream with a hard byte cap so chunked uploads
@@ -107,15 +232,31 @@ async function authorizeJob(jobId: string): Promise<boolean> {
 }
 
 /** Opportunistically sync terminal/progress status into the DB row (cheap, only on change). */
-async function syncJobStatus(jobId: string, upstreamStatus: unknown, upstreamStage: unknown) {
+async function syncJobStatus(
+  jobId: string,
+  upstreamStatus: unknown,
+  upstreamStage: unknown,
+  upstreamFilename?: unknown,
+) {
   try {
     const status = canonicalStatus(upstreamStatus)
     if (!status) return
-    const row = await db.renderJob.findUnique({ where: { id: jobId }, select: { status: true, stage: true } })
+    const row = await db.renderJob.findUnique({ where: { id: jobId }, select: { status: true, stage: true, filename: true } })
     if (!row) return
     const stage = typeof upstreamStage === 'string' ? upstreamStage : null
-    if (row.status !== status || (stage && row.stage !== stage)) {
-      await db.renderJob.update({ where: { id: jobId }, data: { status, ...(stage ? { stage: stage.slice(0, 300) } : {}) } })
+    // renderer reports the finished MP4's filename — persist it once (used by
+    // the render-history UI) without overwriting an existing value
+    const filename = typeof upstreamFilename === 'string' && upstreamFilename ? upstreamFilename.slice(0, 255) : null
+    const needsFile = filename && !row.filename
+    if (row.status !== status || (stage && row.stage !== stage) || needsFile) {
+      await db.renderJob.update({
+        where: { id: jobId },
+        data: {
+          status,
+          ...(stage ? { stage: stage.slice(0, 300) } : {}),
+          ...(needsFile ? { filename } : {}),
+        },
+      })
     }
   } catch {
     // sync is best-effort observability — never break the poll
@@ -460,6 +601,12 @@ export async function GET(
     )
   }
 
+  // GET /api/render-proxy/jobs — owned render history (reconciled). Handled
+  // BEFORE the per-job gate because '/jobs' (bare) does not match JOB_PATH_RE.
+  if (targetPath === '/jobs') {
+    return listOwnedRenderJobs()
+  }
+
   // ---- ownership gate: poll / stream / download are ALL owner-scoped ----
   const jobMatch = targetPath.match(JOB_PATH_RE)
   if (jobMatch) {
@@ -521,9 +668,29 @@ export async function GET(
     // opportunistic DB status sync (observability) on plain job polls
     if (jobMatch && !jobMatch[3] && upstream.ok) {
       try {
-        const j = JSON.parse(Buffer.from(respBody).toString('utf8')) as { status?: unknown; stage?: unknown }
-        void syncJobStatus(jobMatch[1], j.status, j.stage)
+        const j = JSON.parse(Buffer.from(respBody).toString('utf8')) as { status?: unknown; stage?: unknown; filename?: unknown }
+        void syncJobStatus(jobMatch[1], j.status, j.stage, j.filename)
       } catch { /* best-effort */ }
+    }
+    // HONEST STALE-ROW RECONCILIATION: the renderer returned 404 for a job the
+    // DB still considers ACTIVE. That happens when the renderer restarted
+    // (supervisor respawn) — its job state is in-memory and gone. Instead of
+    // relaying a bare 404 that the client would read as "expired", mark the
+    // owned row ERROR with an honest, actionable message. The user sees
+    // "render lost, re-render" instead of a poll that never terminates.
+    if (jobMatch && !jobMatch[3] && upstream.status === 404) {
+      try {
+        const row = await db.renderJob.findUnique({ where: { id: jobMatch[1] }, select: { status: true } })
+        if (row && ACTIVE_STATUSES.has(row.status)) {
+          await db.renderJob.update({
+            where: { id: jobMatch[1] },
+            data: {
+              status: 'ERROR',
+              stage: 'Render job lost — the render service restarted. Please render again.',
+            },
+          })
+        }
+      } catch { /* reconciliation is best-effort; the 404 still relays */ }
     }
     return new NextResponse(respBody, {
       status: upstream.status,
